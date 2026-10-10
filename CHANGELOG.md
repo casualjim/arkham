@@ -1,8 +1,18 @@
+## [0.3.9] - 2026-10-10
+
+### 🚜 Refactor
+
+- *(compose)* Split stack.rs by concern
 ## [0.3.8] - 2026-10-10
 
 ### 🐛 Bug Fixes
 
 - *(compose)* Correct stack yaml, stop tool mounts in repo
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.8 [ci skip]
+- Release
 ## [0.3.7] - 2026-10-10
 
 ### 🚀 Features
