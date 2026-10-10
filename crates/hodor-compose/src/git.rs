@@ -42,9 +42,9 @@ use hodor_pki::ssh::SshKey;
 use url::Url;
 
 use crate::adapt::{DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
+use crate::decoys::Decoy;
 use crate::error::Error;
 use crate::ssh::{host_identity_path, mirror_container_path};
-use crate::stack::Decoy;
 
 /// One forge endpoint a remote or credential scope names.
 #[derive(Debug, Clone, PartialEq, Eq)]

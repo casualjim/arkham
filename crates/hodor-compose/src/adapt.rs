@@ -17,7 +17,7 @@ use hodor_config::config::RewriteFormat;
 use serde::Serialize;
 
 use crate::error::Error;
-use crate::stack::workspace_slug;
+use crate::workspace::slug;
 
 /// Container path the grant layer mounts at in the hodor service. Fragments
 /// name blobs under it; host and container serve resolve the same entries
@@ -158,8 +158,8 @@ pub(crate) fn rewrite_label(source: &Path, name: &str) -> Result<String, Error> 
     .file_stem()
     .map(|stem| stem.to_string_lossy())
     .ok_or_else(|| invalid("has no file name".to_string()))?;
-  let path_slug = workspace_slug(parent);
-  let slug = |text: &str| {
+  let path_slug = slug(parent);
+  let clean = |text: &str| {
     let cleaned: String = text
       .to_lowercase()
       .chars()
@@ -167,10 +167,10 @@ pub(crate) fn rewrite_label(source: &Path, name: &str) -> Result<String, Error> 
       .collect();
     cleaned.trim_matches('-').to_string()
   };
-  if path_slug.is_empty() || slug(&stem).is_empty() || slug(name).is_empty() {
+  if path_slug.is_empty() || clean(&stem).is_empty() || clean(name).is_empty() {
     return Err(invalid("path or context sluggifies to nothing".to_string()));
   }
-  Ok(format!("{}-{}-{}", path_slug, slug(&stem), slug(name)))
+  Ok(format!("{}-{}-{}", path_slug, clean(&stem), clean(name)))
 }
 
 /// Write the grant layer: the grant fragments concatenated into the marker

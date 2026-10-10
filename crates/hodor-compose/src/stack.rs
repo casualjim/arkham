@@ -1,34 +1,27 @@
-//! Compose stack generation: decoy selection, mount resolution, and YAML.
+//! Compose stack generation: mount resolution, rewrites, and YAML.
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::env;
+use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use dirs::{config_dir as dirs_config_dir, home_dir, state_dir};
-use hodor_config::cli::{Cli, ProxyBackend};
-use hodor_config::config::{
-  AppConfig, ExposeMap, FileRewrite, HostTlsCfg, RewriteFormat, RuleCfg, SHARED_PROFILE, ToolCfg, WorkspaceBuild, config_dir, load,
-  project_config_file, project_config_write_path, project_rules_dir, rules_dir, valid_profile,
-};
+use dirs::home_dir;
+use hodor_config::cli::ProxyBackend;
+use hodor_config::config::{AppConfig, ExposeMap, config_dir, project_profiles_dir};
 use hodor_config::grants::GuestTlsMode;
-use hodor_config::registry::Registry;
-use hodor_fnox::{FNOX_ENV, FnoxSource, selected_envs};
-use hodor_pki::ca::{CertAuthority, load_or_generate, load_or_generate_client_pair};
+use hodor_pki::ca::{CertAuthority, load_or_generate};
 use libc::getuid;
 use xpanda::Xpanda;
 
-use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted, sniff};
+use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted};
+use crate::ambient::{DeriveInputs, derive_sources};
+use crate::decoys::{Decoy, Selection, validate_passthrough};
 use crate::error::Error;
-use crate::expand::{apply_rewrites, block_on, build_expander, expand_path, expand_value, resolution_env, rewrite_file_name};
-use crate::git;
-use crate::jj;
-use crate::kube;
-use crate::paths::{Mount, covering, expand, translate};
-use crate::ssh;
-use crate::talos;
+use crate::expand::{block_on, build_expander, expand_path, expand_value, resolution_env};
+use crate::mounts::{BYPASS_CONTAINER_PATH, FnoxBinds, Layout};
+use crate::paths::{Mount, translate};
+use crate::profiles::{ProfileRoots, profile_mounts};
+use crate::rewrites::{RewriteInputs, write_rewrites};
+use crate::workspace::Workspace;
 
 /// Revision of the generated stack's shape, written into the compose file's
 /// `# stack shape:` marker line and read back by [`stack_shape_in`] to tell a
@@ -38,6 +31,11 @@ use crate::talos;
 /// `hodor init` and `hodor agent` regenerate instead of leaving the old
 /// wiring behind. What each shape changed is git history, not this comment.
 pub(crate) const STACK_SHAPE: u32 = 14;
+
+/// Fixed port the generated stack renders as `HODOR_LISTEN` instead of the
+/// `127.0.0.1:8080` default: the explicit proxy is loopback-bound in the
+/// shared netns, and 8080 is the port dev servers default to — squatted on.
+pub(crate) const EXPLICIT_LISTEN: &str = "127.0.0.1:8099";
 
 /// The shape revision a generated stack carries, from its `# stack shape:`
 /// marker line; `None` for a file without a readable one, which is a stack
@@ -49,321 +47,6 @@ pub(crate) fn stack_shape_in(compose: &str) -> Option<u32> {
     .and_then(|shape| shape.trim().parse().ok())
 }
 
-/// One selected env var with its decoy value.
-pub(crate) struct Decoy {
-  /// Env var name as the rule declares it.
-  pub env: String,
-  /// Decoy value for the agent environment.
-  pub value: String,
-}
-
-/// Select every fnox-declared name the registry knows, with its decoy.
-pub(crate) fn select(fnox: Option<&FnoxSource>, registry: &Registry) -> Vec<Decoy> {
-  selected_envs(fnox, registry)
-    .into_iter()
-    .map(|env| {
-      let value = registry.decoy(&env, None);
-      Decoy { env, value }
-    })
-    .collect()
-}
-
-/// Reshape a selection with each rule's own pattern. Serve-time substitution
-/// derives its fake from `rule.pattern`, so a decoy built from the registry
-/// default instead would never match and the swap would silently not happen.
-pub(crate) fn with_rule_patterns(decoys: Vec<Decoy>, registry: &Registry, rules: &BTreeMap<String, RuleCfg>) -> Vec<Decoy> {
-  decoys
-    .into_iter()
-    .map(|decoy| {
-      let pattern = rules
-        .values()
-        .find(|rule| rule.env == decoy.env)
-        .and_then(|rule| rule.pattern.as_deref());
-      Decoy {
-        value: registry.decoy(&decoy.env, pattern),
-        ..decoy
-      }
-    })
-    .collect()
-}
-
-/// Split a selection by whether the registry states hosts for the name.
-/// Active rules come first, names with no endpoint second.
-pub(crate) fn by_hosts(registry: &Registry, decoys: Vec<Decoy>) -> (Vec<Decoy>, Vec<Decoy>) {
-  decoys
-    .into_iter()
-    .partition(|decoy| registry.lookup(&decoy.env).is_some_and(|known| !known.hosts.is_empty()))
-}
-/// Env names serve-time derivation turns into rules: fnox-declared,
-/// registry-known, with hosts.
-pub(crate) fn derivable_envs(fnox: Option<&FnoxSource>, registry: &Registry) -> Vec<String> {
-  by_hosts(registry, select(fnox, registry))
-    .0
-    .into_iter()
-    .map(|decoy| decoy.env)
-    .collect()
-}
-
-/// A passthrough name that is also a rule env or a selected decoy is a
-/// generation-time error: one name takes one path, never both.
-///
-/// # Errors
-///
-/// Returns an error naming the offending name when it overlaps.
-pub(crate) fn validate_passthrough(rules: &BTreeMap<String, RuleCfg>, decoys: &[Decoy], passthrough: &[String]) -> Result<(), Error> {
-  for name in passthrough {
-    if rules.values().any(|rule| &rule.env == name) {
-      return Err(Error::PassthroughOverlapRule { name: name.clone() });
-    }
-    if decoys.iter().any(|decoy| &decoy.env == name) {
-      return Err(Error::PassthroughOverlapDecoy { name: name.clone() });
-    }
-  }
-  Ok(())
-}
-
-/// fnox-declared names nothing covers, sorted: not registry-selected, not
-/// passthrough, and not fnox's own provider wiring (which the proxy forwards
-/// itself).
-pub(crate) fn uncovered_names(declared: &BTreeSet<String>, selected: &[String], passthrough: &[String]) -> Vec<String> {
-  declared
-    .iter()
-    .filter(|name| !selected.contains(name) && !passthrough.contains(name) && !FNOX_ENV.contains(&name.as_str()))
-    .cloned()
-    .collect()
-}
-
-/// One sorted warning naming uncovered names and the fix; `None` when every
-/// declared name is covered.
-pub(crate) fn uncovered_warning(names: &[String]) -> Option<String> {
-  if names.is_empty() {
-    return None;
-  }
-  let mut sorted = names.to_vec();
-  sorted.sort();
-  Some(format!(
-    "warning: fnox declares {} with no rule or passthrough ({}); add [rules.*] entries or [workspace] passthrough names, or remove them from fnox if unused",
-    if sorted.len() == 1 { "a secret" } else { "secrets" },
-    sorted.join(", ")
-  ))
-}
-
-/// `hodor rules`: env-only rules for the secrets this workspace can get, plus
-/// a note naming the fnox declarations no registry entry covers. One
-/// `[rules.<label>]` block per env var fnox declares that the registry knows
-/// how to swap; `hodor init` writes the same blocks into a fresh workspace
-/// config.
-///
-/// `root` adds the workspace's own `rules.d` overrides, so the printed rules
-/// match the ones generation derives decoys from.
-///
-/// # Errors
-///
-/// Returns an error when the registry or the fnox source cannot be opened.
-pub fn rules_command(root: Option<&Path>) -> Result<String, Error> {
-  let registry = generation_registry(root)?;
-  let fnox = open_fnox()?;
-  let (with_hosts, hostless) = by_hosts(&registry, select(fnox.as_ref(), &registry));
-  let known = selected_envs(fnox.as_ref(), &registry);
-  let unknown = fnox
-    .as_ref()
-    .map(|fnox| {
-      fnox
-        .declared()
-        .iter()
-        .filter(|name| !known.contains(name))
-        .cloned()
-        .collect::<Vec<_>>()
-    })
-    .unwrap_or_default();
-  Ok(rules_toml(&with_hosts, &hostless, &unknown))
-}
-
-/// Split a trailing `:ro` or `:rw` off an include entry; bare paths are rw.
-pub(crate) fn split_mode(entry: &Path) -> (PathBuf, bool) {
-  let text = entry.as_os_str().to_str().unwrap_or_default();
-  if let Some(rest) = text.strip_suffix(":ro") {
-    return (PathBuf::from(rest), true);
-  }
-  if let Some(rest) = text.strip_suffix(":rw") {
-    return (PathBuf::from(rest), false);
-  }
-  (entry.to_path_buf(), false)
-}
-
-/// The agent-side mounts carrying each mtls rule's guest identity: one pair
-/// minted per rule (`<guests-dir>/<label>.pem` plus `.key`, load-or-generate),
-/// mounted read-only at the container paths the rule's entries declare, or
-/// `{home}/.config/hodor/guest/<label>.pem` and `.key` when an entry states
-/// none. Compose is a placement consumer only: hodor-proxy reads the mode, the
-/// agent holds the identity files.
-///
-/// # Errors
-///
-/// Returns an error when a pair cannot be minted or written.
-pub(crate) fn guest_identity_mounts(
-  rules: &BTreeMap<String, RuleCfg>,
-  ca: &CertAuthority,
-  guests_dir: &Path,
-  home: &str,
-) -> Result<Vec<Mount>, Error> {
-  let mut mounts = Vec::new();
-  for (label, rule) in rules {
-    let mtls: Vec<&HostTlsCfg> = rule.tls.values().filter(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls).collect();
-    if mtls.is_empty() {
-      continue;
-    }
-    let (cert, key) = load_or_generate_client_pair(ca, guests_dir, label)?;
-    for tls in mtls {
-      let cert_container = tls
-        .guest_cert
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{home}/.config/hodor/guest/{label}.pem")));
-      let key_container = tls
-        .guest_key
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{home}/.config/hodor/guest/{label}.key")));
-      mounts.push(Mount {
-        host: cert.clone(),
-        container: cert_container,
-        ro: true,
-      });
-      mounts.push(Mount {
-        host: key.clone(),
-        container: key_container,
-        ro: true,
-      });
-    }
-  }
-  Ok(mounts)
-}
-
-/// Fixed port the generated stack renders as `HODOR_LISTEN` instead of the
-/// `127.0.0.1:8080` default: the explicit proxy is loopback-bound in the
-/// shared netns, and 8080 is the port dev servers default to — squatted on
-pub(crate) const EXPLICIT_LISTEN: &str = "127.0.0.1:8099";
-
-/// Container path both services mount the runtime bypass file at: the agent
-/// entrypoint rewrites it from `podman network inspect`, and hodor's eBPF
-/// loader reloads it live into the programs' bypass list. The host side is
-/// `<workspace-state>/ebpf-bypass`, created at generation and never
-/// overwritten — the agent owns its contents at runtime.
-pub(crate) const BYPASS_CONTAINER_PATH: &str = "/hodor/ebpf-bypass";
-
-/// The shared bypass-file mount for ebpf stacks, rendered into both
-/// services: the agent entrypoint writes it, hodor only reads, and one
-/// read-write entry serves both because the `mounts` vec renders as-is in
-/// each service.
-pub(crate) fn bypass_mount(root: &Path) -> Mount {
-  Mount {
-    host: workspace_state_dir(root).join("ebpf-bypass"),
-    container: PathBuf::from(BYPASS_CONTAINER_PATH),
-    ro: false,
-  }
-}
-
-/// What the hodor service mounts and forwards so the container's fnox resolves
-/// what the host's does: its config directory (identity, providers, config),
-/// hodor's own fnox level.
-#[derive(Default)]
-pub(crate) struct FnoxBinds {
-  pub(crate) mounts: Vec<Mount>,
-}
-
-/// The fnox config directory fnox itself resolves: `FNOX_CONFIG_DIR`, else
-/// `<config-dir>/fnox`.
-pub(crate) fn fnox_config_dir(host_home: Option<&Path>) -> Option<PathBuf> {
-  if let Some(dir) = env::var_os("FNOX_CONFIG_DIR") {
-    return Some(PathBuf::from(dir));
-  }
-  dirs_config_dir()
-    .or_else(|| host_home.map(|home| home.join(".config")))
-    .map(|dir| dir.join("fnox"))
-}
-
-/// Bind mounts and environment the hodor service needs to act like fnox does.
-/// Every mount is conditional on the host path existing: docker turns a bind of
-/// a missing path into a directory, which is never what we want. Container paths
-/// are what fnox and hodor look at inside, where the home is `/root`.
-pub(crate) fn fnox_binds(fnox_dir: Option<&Path>, config_dir: Option<&Path>) -> FnoxBinds {
-  let mut binds = FnoxBinds { mounts: Vec::new() };
-  if let Some(dir) = fnox_dir.filter(|dir| dir.is_dir()) {
-    binds.mounts.push(Mount {
-      host: dir.to_path_buf(),
-      container: PathBuf::from("/root/.config/fnox"),
-      ro: true,
-    });
-  }
-  let mut levels = config_dir
-    .and_then(|dir| std::fs::read_dir(dir).ok())
-    .into_iter()
-    .flatten()
-    .flatten()
-    .map(|entry| entry.path())
-    .filter(|path| {
-      path.is_file()
-        && path.file_name().is_some_and(|name| {
-          let name = name.to_string_lossy();
-          name.starts_with("fnox") && name.ends_with(".toml")
-        })
-    })
-    .collect::<Vec<_>>();
-  levels.sort();
-  for path in levels {
-    binds.mounts.push(Mount {
-      container: Path::new("/root/.config/hodor").join(path.file_name().unwrap_or_default()),
-      host: path,
-      ro: true,
-    });
-  }
-  let rules_d = config_dir.map(|dir| dir.join("rules.d")).filter(|dir| dir.is_dir());
-  if let Some(dir) = rules_d {
-    binds.mounts.push(Mount {
-      host: dir,
-      container: PathBuf::from("/root/.config/hodor/rules.d"),
-      ro: true,
-    });
-  }
-  binds
-}
-
-/// Mount entries for the workspace root and `[workspace] include`, ordered the
-/// way `covering` wants them: parents first, so a covering mount wins and
-/// covered paths drop out. A path that is not there is an error rather than a
-/// warning, because docker mounts an empty directory in its place.
-pub(crate) fn include_entries(root: &Path, includes: &[PathBuf], host_home: Option<&Path>) -> Result<Vec<(PathBuf, bool)>, Error> {
-  let mut entries = vec![(root.to_path_buf(), false)];
-  for entry in includes {
-    let (path, ro) = split_mode(entry);
-    let host = expand(&path, root, host_home);
-    if !host.exists() {
-      return Err(Error::IncludeMissing { entry: entry.clone() });
-    }
-    entries.push((host, ro));
-  }
-  entries.sort_by_key(|(path, _)| Reverse(path.components().count()));
-  Ok(entries)
-}
-
-/// Resolve `[workspace.build]` to absolute host paths for compose, failing
-/// loudly on a missing dockerfile or context: compose would fail without
-/// naming the setting.
-pub(crate) fn resolve_build(root: &Path, build: &WorkspaceBuild, host_home: Option<&Path>) -> Result<(PathBuf, PathBuf), Error> {
-  let dockerfile = expand(&build.dockerfile, root, host_home);
-  if !dockerfile.is_file() {
-    return Err(Error::BuildDockerfileMissing {
-      path: build.dockerfile.clone(),
-    });
-  }
-  let context = expand(&build.context, root, host_home);
-  if !context.is_dir() {
-    return Err(Error::BuildContextMissing {
-      path: build.context.clone(),
-    });
-  }
-  Ok((context, dockerfile))
-}
-
 /// Builder of the generated [`Stack`]: owns the resolved workspace context
 /// and every intermediate the steps produce, and each method resolves one
 /// concern, in the order the story reads — resolve the context, select the
@@ -371,26 +54,21 @@ pub(crate) fn resolve_build(root: &Path, build: &WorkspaceBuild, host_home: Opti
 /// the grants, mount the tool profiles, mint the guest identities, then
 /// assemble the agent and the stack. [`generate_stack`] is that chain.
 struct StackBuilder<'a> {
-  /// Workspace root, absolute.
-  root: &'a Path,
+  /// Mount layout: root, container home, and host home every mount resolves
+  /// against.
+  layout: Layout,
+  /// Secret selection: fnox discovery joined against the registry.
+  selection: Selection,
   /// Capture backend the serve command runs.
   backend: ProxyBackend,
   /// Hodor image tag: the binary's version, threaded from the face.
   version: &'a str,
   /// The workspace's merged config.
   config: AppConfig,
-  /// Host-known registry joined with fnox names.
-  registry: Registry,
-  /// The secret source, when one is configured.
-  fnox: Option<FnoxSource>,
   /// Expansion environment: the process env plus fnox-resolved names.
   env: HashMap<String, String>,
   /// Xpanda expander built over `env`.
   expander: Xpanda,
-  /// The expanded container home.
-  home: String,
-  /// The host home, when resolvable.
-  host_home: Option<PathBuf>,
   /// Compose project name: the configured name or the workspace slug.
   project: String,
   /// Include-derived mounts, deepest path first.
@@ -421,44 +99,31 @@ impl<'a> StackBuilder<'a> {
   /// Returns an error when the registry or config fails to load, when value
   /// resolution fails, or when a path fails to expand.
   fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str) -> Result<Self, Error> {
-    let registry = generation_registry(Some(root))?;
-    let config = workspace_config(root)?;
+    let workspace = Workspace::new(root);
+    let config = workspace.config()?;
+    let selection = workspace.selection()?;
     let raw_home = config.workspace.container_home().to_string();
-    let fnox = open_fnox()?;
     let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
-    let env = block_on(resolution_env(&registry, fnox.as_ref(), &referenced))??;
+    let env = block_on(resolution_env(&selection.registry, selection.fnox.as_ref(), &referenced))??;
     let expander = build_expander(env.clone());
     let home = expand_value(&expander, &raw_home)?;
-    let host_home = home_dir();
+    let layout = Layout::new(root, home, home_dir());
     let includes: Vec<PathBuf> = config
       .workspace
       .include
       .iter()
       .map(|entry| expand_path(&expander, &entry.to_string_lossy()).map(PathBuf::from))
       .collect::<Result<_, Error>>()?;
-    let entries = include_entries(root, &includes, host_home.as_deref())?;
-    let mounts = covering(
-      entries
-        .into_iter()
-        .map(|(host, ro)| Mount {
-          container: translate(&host, host_home.as_deref(), &home),
-          host,
-          ro,
-        })
-        .collect(),
-    );
-    let project = config.workspace.name.clone().unwrap_or_else(|| workspace_slug(root));
+    let mounts = layout.include_mounts(&includes)?;
+    let project = config.workspace.name.clone().unwrap_or_else(|| workspace.slug());
     Ok(Self {
-      root,
+      layout,
+      selection,
       backend,
       version,
       config,
-      registry,
-      fnox,
       env,
       expander,
-      home,
-      host_home,
       project,
       mounts,
       decoys: Vec::new(),
@@ -480,7 +145,7 @@ impl<'a> StackBuilder<'a> {
   /// Returns an error when a passthrough name overlaps a rule env or a
   /// selected decoy.
   fn secrets(mut self) -> Result<Self, Error> {
-    self.decoys = with_rule_patterns(select(self.fnox.as_ref(), &self.registry), &self.registry, &self.config.rules);
+    self.decoys = self.selection.apply_rule_patterns(self.selection.select(), &self.config.rules);
     validate_passthrough(&self.config.rules, &self.decoys, &self.config.workspace.passthrough)?;
     Ok(self)
   }
@@ -495,17 +160,19 @@ impl<'a> StackBuilder<'a> {
   /// decoy, or its dest does not expand to an absolute container path.
   fn rewrites(mut self) -> Result<Self, Error> {
     let kube_ca = self.rewrite_ca()?;
+    let files_dir = self.layout.files_dir();
+    let guests_dir = self.layout.guests_dir();
     let rewritten = write_rewrites(&RewriteInputs {
-      files_dir: &workspace_state_dir(self.root).join("files"),
-      root: self.root,
+      files_dir: &files_dir,
+      root: self.layout.root(),
       rewrites: &self.config.workspace.file_rewrite,
       decoys: &self.decoys,
       env: &self.env,
       expander: &self.expander,
-      home: &self.home,
-      host_home: self.host_home.as_deref(),
+      home: self.layout.home(),
+      host_home: self.layout.host_home(),
       kube_ca: kube_ca.as_ref(),
-      guests_dir: &workspace_state_dir(self.root).join("guests"),
+      guests_dir: &guests_dir,
     })?;
     self.grants = rewritten.grants;
     self.file_mounts = rewritten.mounts;
@@ -544,15 +211,17 @@ impl<'a> StackBuilder<'a> {
   /// Returns an error when a source does not map onto grants or a decoy
   /// twin.
   fn ambient(mut self) -> Result<Self, Error> {
+    let files_dir = self.layout.files_dir();
+    let guests_dir = self.layout.guests_dir();
     let derived = derive_sources(&DeriveInputs {
-      files_dir: &workspace_state_dir(self.root).join("files"),
-      root: self.root,
-      registry: &self.registry,
+      files_dir: &files_dir,
+      root: self.layout.root(),
+      registry: &self.selection.registry,
       decoys: &self.decoys,
       expander: &self.expander,
-      home: &self.home,
-      host_home: self.host_home.as_deref(),
-      guests_dir: &workspace_state_dir(self.root).join("guests"),
+      home: self.layout.home(),
+      host_home: self.layout.host_home(),
+      guests_dir: &guests_dir,
       rewrites: &self.config.workspace.file_rewrite,
     })?;
     self.grants.extend(derived.grants);
@@ -568,7 +237,7 @@ impl<'a> StackBuilder<'a> {
   /// Returns an error when the state cannot be written.
   fn grants(mut self) -> Result<Self, Error> {
     if !self.grants.is_empty() {
-      let grants_state = workspace_state_dir(self.root).join("grants");
+      let grants_state = self.layout.state_dir().join("grants");
       adapt::write_state(&grants_state, &self.grants)?;
       self.grants_mounts = vec![Mount {
         host: grants_state,
@@ -587,12 +256,12 @@ impl<'a> StackBuilder<'a> {
   /// a profile directory cannot be created.
   fn profiles(mut self) -> Result<Self, Error> {
     let global_profiles = config_dir().map(|dir| dir.join("profiles"));
-    let project_profiles = hodor_config::config::project_profiles_dir(self.root);
+    let project_profiles = project_profiles_dir(self.layout.root());
     let roots = ProfileRoots {
       project: Some(project_profiles.as_path()),
       global: global_profiles.as_deref(),
     };
-    self.tool_mounts = profile_mounts(&roots, self.config.workspace.profile_name(), &self.config.tools, &self.home)?;
+    self.tool_mounts = profile_mounts(&roots, self.config.workspace.profile_name(), &self.config.tools, self.layout.home())?;
     Ok(self)
   }
 
@@ -620,7 +289,8 @@ impl<'a> StackBuilder<'a> {
         path: ca_path.clone(),
         source,
       })?;
-      self.guest = guest_identity_mounts(&self.config.rules, &ca, &workspace_state_dir(self.root).join("guests"), &self.home)?;
+      let guests_dir = self.layout.guests_dir();
+      self.guest = self.layout.guest_identity_mounts(&self.config.rules, &ca, &guests_dir)?;
     }
     Ok(self)
   }
@@ -634,23 +304,21 @@ impl<'a> StackBuilder<'a> {
   /// Returns an error when the configured build does not resolve or names an
   /// empty image tag.
   fn stack(self) -> Result<Stack, Error> {
-    let host_home = self.host_home.as_deref();
     let build_paths: Option<(PathBuf, PathBuf)> = self
       .config
       .workspace
       .build
       .as_ref()
-      .map(|build| resolve_build(self.root, build, host_home))
+      .map(|build| self.layout.resolve_build(build))
       .transpose()?;
-    let agent_image = agent_image(&self.project, self.config.workspace.image.as_deref(), build_paths.is_some())?;
     let agent = AgentSpec {
-      root: translate(self.root, host_home, &self.home),
-      home: self.home.clone(),
-      storage: workspace_state_dir(self.root).join("containers"),
+      root: translate(self.layout.root(), self.layout.host_home(), self.layout.home()),
+      home: self.layout.home().to_string(),
+      storage: self.layout.state_dir().join("containers"),
       uid: current_uid(),
       devices: self.config.workspace.devices.clone(),
       cap_add: self.config.workspace.cap_add.clone(),
-      image: agent_image,
+      image: AgentSpec::image(&self.project, self.config.workspace.image.as_deref(), build_paths.is_some())?,
       build: build_paths.map(|(context, dockerfile)| AgentBuild { context, dockerfile }),
     };
     // The runtime bypass file both services share: the agent entrypoint
@@ -659,7 +327,7 @@ impl<'a> StackBuilder<'a> {
     // list to feed.
     let mut mounts = self.mounts;
     if self.backend == ProxyBackend::Ebpf {
-      mounts.push(bypass_mount(self.root));
+      mounts.push(self.layout.bypass_mount());
     }
     Ok(Stack {
       backend: self.backend,
@@ -668,7 +336,7 @@ impl<'a> StackBuilder<'a> {
       agent,
       mounts,
       tool_mounts: self.tool_mounts,
-      fnox: fnox_binds(fnox_config_dir(host_home).as_deref(), config_dir().as_deref()),
+      fnox: FnoxBinds::resolve(self.layout.fnox_config_dir().as_deref(), config_dir().as_deref()),
       guest: self.guest,
       init: self.config.workspace.init.clone(),
       ports: self.config.workspace.ports.clone(),
@@ -703,671 +371,11 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
   Ok(stack.render())
 }
 
-/// Real/decoy byte pairs for one rewrite's env names, in declared order.
-pub(crate) type RewritePairs = Vec<(Vec<u8>, Vec<u8>)>;
-
-/// Pairs each rewrite's env names with their real and decoy bytes.
-///
-/// # Errors
-///
-/// Returns an error naming the env when a name has no known real value or
-/// no decoy.
-fn rewrite_pairs(rewrite: &FileRewrite, env: &HashMap<String, String>, by_env: &BTreeMap<&str, &str>) -> Result<RewritePairs, Error> {
-  let mut pairs = Vec::new();
-  for name in &rewrite.envs {
-    let real = env
-      .get(name)
-      .filter(|value| !value.is_empty())
-      .ok_or_else(|| Error::RewriteNoValue {
-        file: rewrite.source.clone(),
-        name: name.clone(),
-      })?;
-    let decoy = by_env.get(name.as_str()).ok_or_else(|| Error::RewriteNoDecoy {
-      file: rewrite.source.clone(),
-      name: name.clone(),
-    })?;
-    pairs.push((real.as_bytes().to_vec(), decoy.as_bytes().to_vec()));
-  }
-  Ok(pairs)
-}
-
-/// Inputs for [`write_rewrites`]: the generation context the rewrite loop
-/// reads, as one value instead of eight positional arguments.
-pub(crate) struct RewriteInputs<'a> {
-  /// State directory the rewritten files land in.
-  pub(crate) files_dir: &'a Path,
-  /// Workspace root relative sources resolve against.
-  pub(crate) root: &'a Path,
-  /// Rewrite entries from `[workspace] file_rewrite`.
-  pub(crate) rewrites: &'a [FileRewrite],
-  /// Selected decoys supplying the replacement values.
-  pub(crate) decoys: &'a [Decoy],
-  /// Resolved real values keyed by env name.
-  pub(crate) env: &'a HashMap<String, String>,
-  /// Xpanda expander for sources and dests.
-  pub(crate) expander: &'a Xpanda,
-  /// Container home expanding `{home}` in dests.
-  pub(crate) home: &'a str,
-  /// Host home relative sources and `~` expand against.
-  pub(crate) host_home: Option<&'a Path>,
-  /// Guest-identity CA, preloaded by generation or injected by tests; the
-  /// kube adapter mints the guest pair from it.
-  pub(crate) kube_ca: Option<&'a CertAuthority>,
-  /// Guest pairs mint here; the kube adapter reads them back for the decoy.
-  pub(crate) guests_dir: &'a Path,
-}
-
-/// What `write_rewrites` produces: the agent mounts plus the tool-config
-/// grants whose fragments land in the state grant layer.
-#[derive(Debug)]
-pub(crate) struct RewriteOutputs {
-  /// Read-only mounts of the rewritten files at their dests.
-  pub(crate) mounts: Vec<Mount>,
-  /// Grants adapted from kubeconfig and talosconfig sources.
-  pub(crate) grants: Vec<RewriteAdapted>,
-}
-
-/// Rewrite each `file_rewrite` source with decoys and write the outputs under
-/// `files_dir`, returning a read-only mount per entry at its `{home}`-expanded
-/// dest. Kubeconfig sources take the adapter path instead: the file is the
-/// secret source, so they state no `envs`, and the grant layer writes from
-/// the returned grants.
-///
-/// # Errors
-///
-/// Returns an error naming the variable when a path fails to expand, naming
-/// the env name when a rewrite names one with no known real value or no
-/// decoy, when a kubeconfig source states `envs` or does not map, or when a
-/// source file cannot be read or an output written.
-pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutputs, Error> {
-  let RewriteInputs {
-    files_dir,
-    root,
-    rewrites,
-    decoys,
-    env,
-    expander,
-    home,
-    host_home,
-    kube_ca,
-    guests_dir,
-  } = *inputs;
-  if rewrites.is_empty() {
-    return Ok(RewriteOutputs {
-      mounts: Vec::new(),
-      grants: Vec::new(),
-    });
-  }
-  let by_env: BTreeMap<&str, &str> = decoys.iter().map(|decoy| (decoy.env.as_str(), decoy.value.as_str())).collect();
-  let mut pass = ExplicitRewrites {
-    files_dir,
-    guests_dir,
-    expander,
-    home,
-    preloaded_ca: kube_ca,
-    ca: None,
-    collector: RewriteCollector::new(files_dir)?,
-  };
-  for (index, rewrite) in rewrites.iter().enumerate() {
-    pass.write(index, rewrite, root, host_home, env, &by_env)?;
-  }
-  Ok(pass.collector.outputs())
-}
-
-/// Grants and decoy mounts collected from adapted documents: emitting one
-/// document writes its decoy side files into the state directory and mounts
-/// each read-only at its stated container path.
-struct RewriteCollector {
-  /// State directory the decoy files land in.
-  files_dir: PathBuf,
-  /// Read-only mounts collected with the grants.
-  mounts: Vec<Mount>,
-  /// Grants adapted from the documents.
-  grants: Vec<RewriteAdapted>,
-}
-
-impl RewriteCollector {
-  /// Create the state directory the decoy files land in.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the directory cannot be created.
-  fn new(files_dir: &Path) -> Result<Self, Error> {
-    fs::create_dir_all(files_dir).map_err(|source| Error::CreateDir {
-      path: files_dir.to_path_buf(),
-      source,
-    })?;
-    Ok(Self {
-      files_dir: files_dir.to_path_buf(),
-      mounts: Vec::new(),
-      grants: Vec::new(),
-    })
-  }
-
-  /// Write one adapted document's decoy side files and mount them.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when a side file cannot be written.
-  fn decoy_files(&mut self, first: &RewriteAdapted) -> Result<(), Error> {
-    for file in &first.decoy_files {
-      let file_path = self.files_dir.join(&file.name);
-      fs::write(&file_path, &file.bytes).map_err(|source| Error::WriteFile {
-        path: file_path.clone(),
-        source,
-      })?;
-      self.mounts.push(Mount {
-        host: file_path,
-        container: PathBuf::from(&file.container),
-        ro: true,
-      });
-    }
-    Ok(())
-  }
-
-  /// Emit one adapted source: its decoy twin at `twin_dest`, its side
-  /// files, and the grant set. An empty adaptation derives nothing.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when an output cannot be written.
-  fn twin(&mut self, adapted: Vec<RewriteAdapted>, twin_name: &str, twin_dest: &str) -> Result<(), Error> {
-    let Some(first) = adapted.first() else {
-      return Ok(());
-    };
-    let twin_path = self.files_dir.join(twin_name);
-    fs::write(&twin_path, first.decoy.as_bytes()).map_err(|source| Error::WriteFile {
-      path: twin_path.clone(),
-      source,
-    })?;
-    self.mounts.push(Mount {
-      host: twin_path,
-      container: PathBuf::from(twin_dest),
-      ro: true,
-    });
-    self.decoy_files(first)?;
-    self.grants.extend(adapted);
-    Ok(())
-  }
-
-  /// The collected mounts and grants.
-  fn outputs(self) -> RewriteOutputs {
-    RewriteOutputs {
-      mounts: self.mounts,
-      grants: self.grants,
-    }
-  }
-}
-
-/// One workspace's explicit `[[workspace.file_rewrite]]` pass: each source
-/// expands, swaps its plain env values or runs the format adapter, and
-/// lands in the state directory with a read-only mount at its dest.
-struct ExplicitRewrites<'a> {
-  /// State directory the rewritten files land in.
-  files_dir: &'a Path,
-  /// Guest-identity directory the kube and talos adapters mint into.
-  guests_dir: &'a Path,
-  /// Xpanda expander for dest values.
-  expander: &'a Xpanda,
-  /// Container home for `{home}` substitution.
-  home: &'a str,
-  /// The guest CA preloaded by the caller, when it loaded one.
-  preloaded_ca: Option<&'a CertAuthority>,
-  /// The guest CA this pass loaded, on first adapter use.
-  ca: Option<CertAuthority>,
-  /// Grants and decoy mounts collected along the way.
-  collector: RewriteCollector,
-}
-
-impl ExplicitRewrites<'_> {
-  /// The guest CA for the format adapters: the caller's preloaded one, or
-  /// one loaded from the config directory on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the hodor config directory or the CA cannot be
-  /// loaded.
-  fn ca(&mut self) -> Result<&CertAuthority, Error> {
-    if let Some(ca) = self.preloaded_ca {
-      return Ok(ca);
-    }
-    if self.ca.is_none() {
-      let ca_path = config_dir()
-        .ok_or_else(|| Error::ConfigDir {
-          detail: "an adapted rewrite needs the hodor config directory to load the CA from".to_string(),
-        })?
-        .join("ca.pem");
-      self.ca = Some(load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
-        path: ca_path.clone(),
-        source,
-      })?);
-    }
-    match self.ca.as_ref() {
-      Some(ca) => Ok(ca),
-      None => Err(Error::ConfigDir {
-        detail: "the adapted-rewrite CA slot is empty after loading it".to_string(),
-      }),
-    }
-  }
-
-  /// One rewrite's output bytes: the format adapter's decoy document with
-  /// its side files emitted, or the plain env-value swap.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the adapter rejects the document, a side file
-  /// cannot be written, or a stated format does not match the document.
-  fn output(&mut self, rewrite: &FileRewrite, host: &Path, content: &[u8], pairs: &RewritePairs) -> Result<Vec<u8>, Error> {
-    let Some(format) = rewrite.format.or_else(|| sniff(content)) else {
-      return Ok(apply_rewrites(content, pairs));
-    };
-    if !rewrite.envs.is_empty() {
-      return Err(Error::RewriteWithEnvs {
-        file: rewrite.source.clone(),
-        format,
-      });
-    }
-    let adapted: Vec<RewriteAdapted> = {
-      let guests_dir = self.guests_dir;
-      let ca = self.ca()?;
-      match format {
-        RewriteFormat::Kubeconfig => kube::adapt(host, content, ca, guests_dir)?.into_iter().collect(),
-        RewriteFormat::Talos => Vec::from([talos::adapt(host, content, ca, guests_dir)?]),
-      }
-    };
-    match adapted.first() {
-      Some(first) => {
-        let bytes = first.decoy.clone().into_bytes();
-        self.collector.decoy_files(first)?;
-        self.collector.grants.extend(adapted);
-        Ok(bytes)
-      }
-      None if rewrite.format.is_some() => Err(Error::RewriteInvalid {
-        file: host.to_path_buf(),
-        format,
-        detail: "the document does not carry the format's markers".to_string(),
-      }),
-      None => Ok(apply_rewrites(content, pairs)),
-    }
-  }
-
-  /// Write one declared rewrite's output and mount it at its dest.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when a path fails to expand, the source cannot be
-  /// read, or an output cannot be written.
-  fn write(
-    &mut self,
-    index: usize,
-    rewrite: &FileRewrite,
-    root: &Path,
-    host_home: Option<&Path>,
-    env: &HashMap<String, String>,
-    by_env: &BTreeMap<&str, &str>,
-  ) -> Result<(), Error> {
-    let pairs = rewrite_pairs(rewrite, env, by_env)?;
-    let expanded_source = PathBuf::from(expand_path(self.expander, &rewrite.source.to_string_lossy())?);
-    let host = expand(&expanded_source, root, host_home);
-    let content = fs::read(&host).map_err(|source| Error::ReadFile {
-      path: host.clone(),
-      source,
-    })?;
-    let out_bytes = self.output(rewrite, &host, &content, &pairs)?;
-    let out_path = self.files_dir.join(rewrite_file_name(index, &host));
-    fs::write(&out_path, out_bytes).map_err(|source| Error::WriteFile {
-      path: out_path.clone(),
-      source,
-    })?;
-    let container = expand_value(self.expander, &rewrite.dest)?.replace("{home}", self.home);
-    if !container.starts_with('/') {
-      return Err(Error::RewriteDestNotAbsolute {
-        dest: rewrite.dest.clone(),
-      });
-    }
-    self.collector.mounts.push(Mount {
-      host: out_path,
-      container: PathBuf::from(container),
-      ro: true,
-    });
-    Ok(())
-  }
-}
-
-/// Inputs for [`derive_sources`]: the generation context the ambient
-/// sources read.
-pub(crate) struct DeriveInputs<'a> {
-  /// State directory the decoy twins land in.
-  pub(crate) files_dir: &'a Path,
-  /// Workspace root git resolution starts from.
-  pub(crate) root: &'a Path,
-  /// Host-known registry joining forge hosts to env names.
-  pub(crate) registry: &'a Registry,
-  /// Selected decoys supplying the replacement values.
-  pub(crate) decoys: &'a [Decoy],
-  /// Xpanda expander for comparing declared sources.
-  pub(crate) expander: &'a Xpanda,
-  /// Container home the twins mount under.
-  pub(crate) home: &'a str,
-  /// Host home the default source paths live under.
-  pub(crate) host_home: Option<&'a Path>,
-  /// Guest-identity directory the kube and talos adapters mint into.
-  pub(crate) guests_dir: &'a Path,
-  /// Declared rewrites: an explicitly-declared source stays with its
-  /// declaration, not the ambient default.
-  pub(crate) rewrites: &'a [FileRewrite],
-}
-
-/// Read the ambient authentication sources every workspace carries — no
-/// declaration, like fnox's own chain — and map each onto grants plus the
-/// agent's decoy twin at the tool's default path. The gitconfig resolves
-/// from the workspace root the way `git` there resolves it; jj reads its
-/// user chain; the ssh, kubectl, and talosctl configs come from their
-/// default paths. An absent source derives nothing; a present one that
-/// does not map fails closed naming the file.
-///
-/// # Errors
-///
-/// Returns an error naming the source when it cannot be read or does not
-/// map, when the guest CA cannot be loaded, or when an output cannot be
-/// written.
-///
-/// ponytail: no opt-out exists yet; none has been asked for.
-/// `KUBECONFIG`/`TALOSCONFIG` honor a single path — a list warns and falls
-/// back to the default.
-pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs, Error> {
-  let DeriveInputs {
-    files_dir,
-    root,
-    registry,
-    decoys,
-    expander,
-    home,
-    host_home,
-    guests_dir,
-    rewrites,
-  } = *inputs;
-  let Some(host_home) = host_home else {
-    return Ok(RewriteOutputs {
-      mounts: Vec::new(),
-      grants: Vec::new(),
-    });
-  };
-  let declared = rewrites
-    .iter()
-    .map(|rewrite| {
-      let expanded = PathBuf::from(expand_path(expander, &rewrite.source.to_string_lossy())?);
-      Ok(expand(&expanded, root, Some(host_home)))
-    })
-    .collect::<Result<Vec<_>, Error>>()?;
-  let mut deriver = AmbientDeriver {
-    root,
-    registry,
-    decoys,
-    home,
-    host_home,
-    guests_dir,
-    declared,
-    ca: None,
-    collector: RewriteCollector::new(files_dir)?,
-  };
-  deriver.git()?;
-  deriver.jj()?;
-  deriver.ssh()?;
-  deriver.kube_and_talos()?;
-  Ok(deriver.collector.outputs())
-}
-
-/// One workspace's ambient-source pass: the authentication sources every
-/// workspace carries — gitconfig, jj, ssh, kubectl, talosctl — map onto
-/// grants plus the agent's decoy twin at the tool's default path. A source
-/// the workspace declared explicitly stays with its declaration; a present
-/// source that does not map warns, and one whose guest CA is unavailable
-/// skips.
-struct AmbientDeriver<'a> {
-  /// Workspace root git resolution starts from.
-  root: &'a Path,
-  /// Host-known registry joining forge hosts to env names.
-  registry: &'a Registry,
-  /// Selected decoys supplying the replacement values.
-  decoys: &'a [Decoy],
-  /// Container home the twins mount under.
-  home: &'a str,
-  /// Host home the default source paths live under.
-  host_home: &'a Path,
-  /// Guest-identity directory the kube and talos adapters mint into.
-  guests_dir: &'a Path,
-  /// Sources the workspace declared explicitly; the ambient pass leaves
-  /// them to their declarations.
-  declared: Vec<PathBuf>,
-  /// The guest CA, loaded on first use.
-  ca: Option<CertAuthority>,
-  /// Grants and decoy mounts collected along the way.
-  collector: RewriteCollector,
-}
-
-impl AmbientDeriver<'_> {
-  /// The gitconfig chain `git` at the workspace root resolves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the twin output cannot be written.
-  fn git(&mut self) -> Result<(), Error> {
-    let mut git_sources = vec![self.host_home.join(".gitconfig")];
-    if let Some(dir) = dirs_config_dir() {
-      git_sources.push(dir.join("git").join("config"));
-    }
-    if let Some(path) = env::var_os("GIT_CONFIG_GLOBAL") {
-      git_sources.push(PathBuf::from(path));
-    }
-    if git_sources.iter().any(|path| self.declared.contains(path)) {
-      return Ok(());
-    }
-    let first = &git_sources[0];
-    match git::adapt(first, self.root, self.registry, self.decoys, self.home, self.host_home) {
-      Ok(adapted) => self.collector.twin(adapted, "gitconfig", &format!("{}/.gitconfig", self.home)),
-      Err(err) => {
-        tracing::warn!(source = %first.display(), %err, "gitconfig source skipped");
-        Ok(())
-      }
-    }
-  }
-
-  /// The full host jj config dir, mounted writable.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the twin output cannot be written.
-  fn jj(&mut self) -> Result<(), Error> {
-    if jj::chain_paths().iter().any(|path| self.declared.contains(path)) {
-      return Ok(());
-    }
-    let host_jj = jj::config_path().parent().map(Path::to_path_buf).unwrap_or_default();
-    if !host_jj.as_os_str().is_empty() {
-      if self.declared.iter().any(|path| path == &host_jj || path.starts_with(&host_jj)) {
-        return Ok(());
-      }
-      if host_jj.is_dir() {
-        self.collector.mounts.push(Mount {
-          host: host_jj,
-          container: PathBuf::from(format!("{}/.config/jj", self.home)),
-          ro: false,
-        });
-        return Ok(());
-      }
-    }
-    if let Some(adapted) = jj::adapt(self.root) {
-      let dest = format!("{}/.config/jj/config.toml", self.home);
-      return self.collector.twin(vec![adapted], "jj-config", &dest);
-    }
-    Ok(())
-  }
-
-  /// The ssh config at its default path.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the config cannot be read or the twin output
-  /// cannot be written.
-  fn ssh(&mut self) -> Result<(), Error> {
-    let ssh_config = self.host_home.join(".ssh").join("config");
-    if self.declared.contains(&ssh_config) || !ssh_config.is_file() {
-      return Ok(());
-    }
-    let content = fs::read(&ssh_config).map_err(|source| Error::ReadFile {
-      path: ssh_config.clone(),
-      source,
-    })?;
-    let dest = format!("{}/.ssh/config", self.home);
-    match ssh::adapt(&ssh_config, &content, self.home, self.host_home) {
-      Ok(adapted) => self.collector.twin(adapted, "ssh-config", &dest),
-      Err(err) => {
-        tracing::warn!(source = %ssh_config.display(), %err, "ssh source skipped");
-        Ok(())
-      }
-    }
-  }
-
-  /// The kubeconfig and talosconfig at their default paths, honoring a
-  /// single-path `KUBECONFIG`/`TALOSCONFIG` override.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when a twin output cannot be written.
-  fn kube_and_talos(&mut self) -> Result<(), Error> {
-    for (name, env_name, default, twin_name, twin_dest) in [
-      ("kubeconfig", "KUBECONFIG", ".kube/config", "kube-config", ".kube/config"),
-      ("talosconfig", "TALOSCONFIG", ".talos/config", "talos-config", ".talos/config"),
-    ] {
-      let path = env_source(env_name, default, self.host_home);
-      if self.declared.contains(&path) || !path.is_file() {
-        continue;
-      }
-      let Ok(content) = fs::read(&path) else {
-        tracing::warn!(source = %path.display(), "{name} source skipped: it cannot be read");
-        continue;
-      };
-      let guests_dir = self.guests_dir;
-      let ca = match self.ca() {
-        Ok(ca) => ca,
-        Err(err) => {
-          tracing::warn!(source = %path.display(), %err, "{name} source skipped: the guest CA is unavailable");
-          continue;
-        }
-      };
-      let adapted = match name {
-        "kubeconfig" => kube::adapt(&path, &content, ca, guests_dir)
-          .ok()
-          .flatten()
-          .map(|adapted| vec![adapted])
-          .unwrap_or_default(),
-        _ => talos::adapt(&path, &content, ca, guests_dir)
-          .map(|adapted| vec![adapted])
-          .ok()
-          .unwrap_or_default(),
-      };
-      if adapted.is_empty() {
-        tracing::warn!(source = %path.display(), "{name} source skipped: it does not map onto a grant");
-        continue;
-      }
-      self.collector.twin(adapted, twin_name, &format!("{}/{twin_dest}", self.home))?;
-    }
-    Ok(())
-  }
-
-  /// The guest CA for the kubeconfig and talosconfig adapters, loaded on
-  /// first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the hodor config directory or the CA cannot be
-  /// loaded.
-  fn ca(&mut self) -> Result<&CertAuthority, Error> {
-    if self.ca.is_none() {
-      let ca_path = config_dir()
-        .ok_or_else(|| Error::ConfigDir {
-          detail: "ambient kubeconfig derivation needs the hodor config directory to load the CA from".to_string(),
-        })?
-        .join("ca.pem");
-      self.ca = Some(load_or_generate(&ca_path).map_err(|source| Error::GuestCa { path: ca_path, source })?);
-    }
-    match self.ca.as_ref() {
-      Some(ca) => Ok(ca),
-      None => Err(Error::ConfigDir {
-        detail: "the ambient guest CA slot is empty after loading it".to_string(),
-      }),
-    }
-  }
-}
-
-/// The source path one `KUBECONFIG`-style override names, or the default
-/// under the host home.
-fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
-  match env::var(env_name) {
-    Ok(value) if !value.contains(':') => PathBuf::from(value),
-    Ok(value) => {
-      tracing::warn!(env_name, value, "names multiple paths; using the default location instead");
-      host_home.join(default)
-    }
-    Err(_) => host_home.join(default),
-  }
-}
-
 /// The process's user id, from the kernel: the same value `id -u` prints,
 /// without the subprocess.
 pub(crate) fn current_uid() -> u32 {
   // Safety: `getuid` takes no arguments, cannot fail, and touches no memory.
   unsafe { getuid() }
-}
-
-/// `hodor rules` TOML for the selection: what derivation substitutes, what
-/// still needs a host, and what no registry entry covers.
-pub(crate) fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[String]) -> String {
-  let mut out = String::from(
-    "# `hodor rules` — what this workspace's proxy substitutes.\n\
-     #\n\
-     # The catalog derives at serve time: every fnox-declared name the registry\n\
-     # gives hosts becomes a rule, its value resolving from fnox. Config states\n\
-     # overrides only — a [rules.<env>] block in the workspace\n\
-     # `.config/hodor/config.toml` or the global `<config-dir>/hodor/config.toml`,\n\
-     # where the workspace file wins per label; its `allow` unions with the\n\
-     # registry hosts, and `registry = false` keeps only `allow`. To give a name\n\
-     # hosts in every workspace instead, add an override file in\n\
-     # `<config-dir>/hodor/rules.d/` or `<workspace root>/.config/hodor/rules.d/`.\n",
-  );
-  if !decoys.is_empty() {
-    out.push_str("#\n# derives automatically at serve time, hosts from the registry:\n");
-    for decoy in decoys {
-      let _ = writeln!(out, "[rules.{}]\nenv = \"{}\"\n", decoy.env.to_lowercase(), decoy.env);
-    }
-  }
-  if !hostless.is_empty() {
-    out.push_str(
-      "#\n\
-       # The registry knows these names but states no hosts: either the endpoint is\n\
-       # per deployment (self-hosted control planes) or the value is a signing input\n\
-       # that never reaches the wire (exchange API secrets — see\n\
-       # https://github.com/casualjim/hodor/issues/19). Name the endpoint to use the\n\
-       # key as a rule, or drop it from fnox to stop emitting a decoy:\n\
-       #\n",
-    );
-    for decoy in hostless {
-      let _ = writeln!(
-        out,
-        "# [rules.{}]\n# env = \"{}\"\n# allow = [\"https://<your-host>\"]\n",
-        decoy.env.to_lowercase(),
-        decoy.env
-      );
-    }
-  }
-  if !unregistered.is_empty() {
-    let _ = writeln!(
-      out,
-      "#\n# fnox declares these but no registry entry covers them, so nothing derives:\n# {}\n",
-      unregistered.join(", ")
-    );
-  }
-  out
 }
 
 /// What the generated agent service is built from: container-side paths and
@@ -1405,41 +413,18 @@ pub(crate) struct AgentBuild {
   pub(crate) dockerfile: PathBuf,
 }
 
-/// Image tag the agent service runs: the configured `image`, a local tag
-/// derived from the project when `[workspace.build]` builds one unnamed, or
-/// the default pull. An empty `image` is a config error, not a silent
-/// default: compose would fail on the empty tag without naming the setting.
-pub(crate) fn agent_image(project: &str, image: Option<&str>, has_build: bool) -> Result<String, Error> {
-  match image {
-    Some(name) if !name.is_empty() => Ok(name.to_string()),
-    Some(_) => Err(Error::EmptyImage),
-    None if has_build => Ok(format!("hodor-agent-{}:local", project.to_lowercase())),
-    None => Ok(DEFAULT_AGENT_IMAGE.to_string()),
-  }
-}
-
-/// What the hodor service runs for a capture backend, the extra capabilities
-/// that needs, and the service keys that go with it.
-fn backend_service(backend: ProxyBackend, project: &str) -> (String, &'static [&'static str], String) {
-  match backend {
-    ProxyBackend::Ebpf => (
-      "[\"serve\", \"--proxy-backend\", \"ebpf\", \"--ebpf-cgroup\", \"enclosing\"]".to_string(),
-      &["BPF", "PERFMON"],
-      // Both services carry the same `cgroup_parent`, so docker creates that
-      // cgroup as part of hodor's own start and hodor attaches to it by
-      // resolving its parent from `/proc/self/cgroup`: the daemon resolves the
-      // parent relative to its own cgroup root, which is why no host path is
-      // written down here.
-      format!("    cgroup: host\n    cgroup_parent: hodor-{project}.slice\n"),
-    ),
-    ProxyBackend::Tun => (
-      "[\"serve\", \"--proxy-backend\", \"tun\"]".to_string(),
-      &[],
-      "    devices: [/dev/net/tun]\n".to_string(),
-    ),
-    ProxyBackend::Tproxy => ("[\"serve\", \"--proxy-backend\", \"tproxy\"]".to_string(), &[], String::new()),
-    // `hodor init` rejects `none`; rendered anyway so this match is exhaustive.
-    ProxyBackend::None => ("[\"serve\"]".to_string(), &[], String::new()),
+impl AgentSpec {
+  /// Image tag the agent service runs: the configured `image`, a local tag
+  /// derived from the project when `[workspace.build]` builds one unnamed, or
+  /// the default pull. An empty `image` is a config error, not a silent
+  /// default: compose would fail on the empty tag without naming the setting.
+  pub(crate) fn image(project: &str, image: Option<&str>, has_build: bool) -> Result<String, Error> {
+    match image {
+      Some(name) if !name.is_empty() => Ok(name.to_string()),
+      Some(_) => Err(Error::EmptyImage),
+      None if has_build => Ok(format!("hodor-agent-{}:local", project.to_lowercase())),
+      None => Ok(DEFAULT_AGENT_IMAGE.to_string()),
+    }
   }
 }
 
@@ -1485,9 +470,34 @@ pub(crate) struct Stack {
 }
 
 impl Stack {
+  /// What the hodor service runs for a capture backend, the extra
+  /// capabilities that needs, and the service keys that go with it.
+  fn backend_service(backend: ProxyBackend, project: &str) -> (String, &'static [&'static str], String) {
+    match backend {
+      ProxyBackend::Ebpf => (
+        "[\"serve\", \"--proxy-backend\", \"ebpf\", \"--ebpf-cgroup\", \"enclosing\"]".to_string(),
+        &["BPF", "PERFMON"],
+        // Both services carry the same `cgroup_parent`, so docker creates that
+        // cgroup as part of hodor's own start and hodor attaches to it by
+        // resolving its parent from `/proc/self/cgroup`: the daemon resolves the
+        // parent relative to its own cgroup root, which is why no host path is
+        // written down here.
+        format!("    cgroup: host\n    cgroup_parent: hodor-{project}.slice\n"),
+      ),
+      ProxyBackend::Tun => (
+        "[\"serve\", \"--proxy-backend\", \"tun\"]".to_string(),
+        &[],
+        "    devices: [/dev/net/tun]\n".to_string(),
+      ),
+      ProxyBackend::Tproxy => ("[\"serve\", \"--proxy-backend\", \"tproxy\"]".to_string(), &[], String::new()),
+      // `hodor init` rejects `none`; rendered anyway so this match is exhaustive.
+      ProxyBackend::None => ("[\"serve\"]".to_string(), &[], String::new()),
+    }
+  }
+
   /// The compose file this stack renders to.
   pub(crate) fn render(&self) -> String {
-    let (serve, extra_caps, service_extra) = backend_service(self.backend, &self.project);
+    let (serve, extra_caps, service_extra) = Self::backend_service(self.backend, &self.project);
     let mut out = String::new();
     let _ = write!(
       out,
@@ -1791,228 +801,10 @@ impl Stack {
   }
 }
 
-/// Container location each tool reads its config from by default, keyed by the
-/// directory name under `profiles/<profile>/`. `{home}` expands to
-/// `[workspace] home`. `[tools.<name>] config_dir` overrides an entry or adds
-/// one the table does not carry.
-pub(crate) const TOOL_CONFIG_DIRS: &[(&str, &str)] = &[
-  ("amazon-q", "{home}/.aws/amazonq"),
-  ("amazonq", "{home}/.aws/amazonq"),
-  ("amp", "{home}/.config/amp"),
-  ("auggie", "{home}/.augment"),
-  ("augment", "{home}/.augment"),
-  ("claude", "{home}/.claude"),
-  ("claude-code", "{home}/.claude"),
-  ("cline", "{home}/.cline"),
-  ("codebuddy", "{home}/.codebuddy"),
-  ("codebuff", "{home}/.config/manicode"),
-  ("codex", "{home}/.codex"),
-  ("codex-cli", "{home}/.codex"),
-  ("continue", "{home}/.continue"),
-  ("copilot", "{home}/.copilot"),
-  ("crush", "{home}/.config/crush"),
-  ("cursor", "{home}/.cursor"),
-  ("deepagents", "{home}/.deepagents"),
-  ("droid", "{home}/.factory"),
-  ("dsh", "{home}/.dsh"),
-  ("factory", "{home}/.factory"),
-  ("forge", "{home}/.forge"),
-  ("gemini", "{home}/.gemini"),
-  ("gemini-cli", "{home}/.gemini"),
-  ("gh", "{home}/.config/gh"),
-  ("goose", "{home}/.config/goose"),
-  ("gptme", "{home}/.config/gptme"),
-  ("grok", "{home}/.grok"),
-  ("grok-build", "{home}/.grok"),
-  ("hermes", "{home}/.hermes"),
-  ("iflow", "{home}/.iflow"),
-  ("junie", "{home}/.junie"),
-  ("junie-cli", "{home}/.junie"),
-  ("kilo", "{home}/.config/kilo"),
-  ("kimi", "{home}/.kimi"),
-  ("kimi-code", "{home}/.kimi-code"),
-  ("kiro", "{home}/.kiro"),
-  ("kiro-cli", "{home}/.kiro"),
-  ("mimo", "{home}/.mimo-code"),
-  ("mimo-code", "{home}/.mimo-code"),
-  ("muse", "{home}/.muse-code"),
-  ("muse-code", "{home}/.muse-code"),
-  ("omp", "{home}/.omp"),
-  ("open-interpreter", "{home}/.config/open-interpreter"),
-  ("openclaw", "{home}/.openclaw"),
-  ("openhands", "{home}/.openhands"),
-  ("openinterpreter", "{home}/.config/open-interpreter"),
-  ("opencode", "{home}/.config/opencode"),
-  ("pi", "{home}/.pi"),
-  ("qoder", "{home}/.qoder"),
-  ("qwen", "{home}/.qwen"),
-  ("qwen-code", "{home}/.qwen"),
-  ("roo", "{home}/.config/roo"),
-  ("roo-code", "{home}/.config/roo"),
-  ("trae", "{home}/.trae"),
-  ("vibe", "{home}/.vibe"),
-  ("warp", "{home}/.config/warp-terminal"),
-  ("workbuddy", "{home}/.codebuddy"),
-];
-
-/// Profile roots searched for tool configs: the workspace's own directory
-/// first, the global one next.
-pub(crate) struct ProfileRoots<'a> {
-  /// `<root>/.config/hodor/profiles/`, when generation knows the workspace.
-  pub(crate) project: Option<&'a Path>,
-  /// `<config-dir>/hodor/profiles/`, when the global config resolves.
-  pub(crate) global: Option<&'a Path>,
-}
-
-impl ProfileRoots<'_> {
-  /// A profile-chain layer carrying `name`, project first: the directory to
-  /// mount when the tool is already installed somewhere.
-  fn chain_dir(&self, chain: &[String], name: &str) -> Option<PathBuf> {
-    [self.project, self.global]
-      .into_iter()
-      .flatten()
-      .flat_map(|layer| chain.iter().map(move |parent| layer.join(parent).join(name)))
-      .find(|dir| dir.is_dir())
-  }
-
-  /// Where a configured tool's missing profile dir is made: the global
-  /// profiles dir only. The workspace's project layer is read-only — hodor
-  /// never creates anything inside the project root.
-  fn create_base(&self, profile: &str) -> Option<PathBuf> {
-    self.global.map(|global| global.join(profile))
-  }
-}
-
-/// Mount the selected profile's tool configs at the locations the tools read
-/// by default, so nothing has to point a tool at them. Explicitly configured
-/// tools mount (their missing profile dir is created in the global profiles
-/// dir, never the project); known tools mount only a directory the profile
-/// chain already carries — nothing is mapped for a tool nobody installed,
-/// and nothing is ever generated inside the project root.
-pub(crate) fn profile_mounts(
-  roots: &ProfileRoots,
-  profile: &str,
-  configured: &BTreeMap<String, ToolCfg>,
-  home: &str,
-) -> Result<Vec<Mount>, Error> {
-  let chain = hodor_config::config::profile_chain(roots.project, roots.global, profile)?;
-  if let Some(global) = roots.global {
-    let dir = global.join(SHARED_PROFILE);
-    fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
-  }
-  // Explicit `[tools]` entries are opted in: their profile dir is made under
-  // the global profiles dir when no layer carries it, so a first-run setup
-  // persists — and the project root stays untouched.
-  let mut mounts = Vec::new();
-  for (name, tool) in configured {
-    if !valid_profile(name) {
-      return Err(Error::ToolNameInvalid { name: name.clone() });
-    }
-    let container = tool.config_dir.replace("{home}", home);
-    if !container.starts_with('/') {
-      return Err(Error::ToolConfigNotAbsolute {
-        name: name.clone(),
-        template: tool.config_dir.clone(),
-      });
-    }
-    let host = match (roots.chain_dir(&chain, name), roots.create_base(profile)) {
-      (Some(existing), _) => existing,
-      (None, Some(base)) => {
-        let dir = base.join(name);
-        fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
-        dir
-      }
-      (None, None) => continue,
-    };
-    mounts.push(Mount {
-      host,
-      container: PathBuf::from(container),
-      ro: false,
-    });
-  }
-  // Known tools nobody configured mount only a directory the profile chain
-  // already has: nothing is mapped for a tool nobody installed.
-  for (name, template) in TOOL_CONFIG_DIRS {
-    if configured.contains_key(*name) {
-      continue;
-    }
-    let Some(host) = roots.chain_dir(&chain, name) else {
-      continue;
-    };
-    mounts.push(Mount {
-      host,
-      container: PathBuf::from(template.replace("{home}", home)),
-      ro: false,
-    });
-  }
-  Ok(mounts)
-}
-
-/// Registry for the generation commands: bundled table, global `rules.d`,
-/// then the workspace's own.
-pub(crate) fn generation_registry(root: Option<&Path>) -> Result<Registry, Error> {
-  Ok(Registry::load_union(
-    rules_dir().as_deref(),
-    root.map(project_rules_dir).as_deref(),
-  )?)
-}
-
-/// Open fnox via its own discovery; no hodor-specific env vars.
-pub(crate) fn open_fnox() -> Result<Option<FnoxSource>, Error> {
-  Ok(FnoxSource::open()?)
-}
-
-/// The workspace's state directory: `<state-dir>/hodor/ws/<slug>`. The
-/// generated stack lives here and the agent's inner-runtime storage sits
-/// beside it.
-pub(crate) fn workspace_state_dir(root: &Path) -> PathBuf {
-  state_dir()
-    .unwrap_or_else(|| PathBuf::from("."))
-    .join("hodor")
-    .join("ws")
-    .join(workspace_slug(root))
-}
-
-/// The workspace's override file: `hodor.compose.yaml` first, then `.yml`.
-pub(crate) fn workspace_file(root: &Path) -> PathBuf {
-  let yaml = root.join(".config").join("hodor.compose.yaml");
-  if yaml.is_file() {
-    return yaml;
-  }
-  root.join(".config").join("hodor.compose.yml")
-}
-
-/// Stable directory slug for a workspace root: lowercase path segments
-/// joined with dashes.
-pub(crate) fn workspace_slug(root: &Path) -> String {
-  let slug: Vec<String> = root
-    .components()
-    .filter_map(|component| match component {
-      Component::Normal(part) => {
-        let text = part.to_string_lossy().to_lowercase();
-        let cleaned: String = text.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-        (!cleaned.trim_matches('-').is_empty()).then(|| cleaned.trim_matches('-').to_string())
-      }
-      _ => None,
-    })
-    .collect();
-  slug.join("-")
-}
-
-/// The workspace's own config, as generation and support-file setup read it:
-/// the unified project layer when it exists, the legacy flat file otherwise,
-/// and the unified path itself when neither does — a workspace with no config
-/// has no project layer at all, never one discovered from the process cwd.
-pub(crate) fn workspace_config(root: &Path) -> Result<AppConfig, Error> {
-  let cli = Cli {
-    config: Some(project_config_file(root).unwrap_or_else(|| project_config_write_path(root))),
-  };
-  Ok(load(&cli, None)?.0)
-}
-
 #[cfg(test)]
 mod tests {
-  use super::{guest_identity_mounts, uncovered_names, uncovered_warning, validate_passthrough};
+  use crate::decoys::{Decoy, uncovered_names, uncovered_warning, validate_passthrough};
+  use crate::mounts::Layout;
   use hodor_config::config::{HostTlsCfg, IfMissing, RuleCfg};
   use hodor_config::grants::GuestTlsMode;
   use hodor_pki::ca::CertAuthority;
@@ -2057,16 +849,17 @@ mod tests {
   fn guest_identity_mounts_declared_paths_and_keeps_an_existing_pair() {
     let ca = CertAuthority::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path(), "/root".to_string(), None);
     let guests = dir.path().join("guests");
     let rules = mtls_rule(Some("/safe/cert.pem"), Some("/safe/cert.key"));
-    let mounts = guest_identity_mounts(&rules, &ca, &guests, "/root").unwrap();
+    let mounts = layout.guest_identity_mounts(&rules, &ca, &guests).unwrap();
     assert_eq!(mounts.len(), 2);
     assert_eq!(mounts[0].container, PathBuf::from("/safe/cert.pem"));
     assert_eq!(mounts[1].container, PathBuf::from("/safe/cert.key"));
     assert!(mounts.iter().all(|mount| mount.ro));
     assert!(mounts[0].host.is_file() && mounts[1].host.is_file());
     let cert_before = fs::read(&mounts[0].host).unwrap();
-    let again = guest_identity_mounts(&rules, &ca, &guests, "/root").unwrap();
+    let again = layout.guest_identity_mounts(&rules, &ca, &guests).unwrap();
     assert_eq!(again[0].host, mounts[0].host);
     assert_eq!(fs::read(&mounts[0].host).unwrap(), cert_before);
   }
@@ -2077,8 +870,9 @@ mod tests {
   fn guest_identity_defaults_the_container_paths_when_none_declared() {
     let ca = CertAuthority::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path(), "/root".to_string(), None);
     let rules = mtls_rule(None, None);
-    let mounts = guest_identity_mounts(&rules, &ca, &dir.path().join("guests"), "/root").unwrap();
+    let mounts = layout.guest_identity_mounts(&rules, &ca, &dir.path().join("guests")).unwrap();
     assert_eq!(mounts[0].container, PathBuf::from("/root/.config/hodor/guest/github.pem"));
     assert_eq!(mounts[1].container, PathBuf::from("/root/.config/hodor/guest/github.key"));
   }
@@ -2088,7 +882,7 @@ mod tests {
   #[test]
   fn passthrough_overlapping_a_rule_or_decoy_fails() {
     let rules = mtls_rule(None, None);
-    let decoys = vec![super::Decoy {
+    let decoys = vec![Decoy {
       env: "ANTHROPIC_API_KEY".to_string(),
       value: "decoy".to_string(),
     }];

@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
-use crate::confine::{compose_command, init_workspace, resolve_backend, resolve_root, up_workspace, workspace_arg};
+use crate::confine::{compose_command, init_workspace, resolve_backend, up_workspace};
 use crate::error::Error;
-use crate::stack::{workspace_config, workspace_slug};
+use crate::workspace::Workspace;
 
 /// One recorded host-port claim: which workspace owns it and what container
 /// port it reaches.
@@ -184,8 +184,8 @@ pub(crate) fn ensure_expose_entry(path: &Path, port: u16, host: u16) -> Result<b
 
 /// `docker compose port hodor <port>`: the host binding compose reports for
 /// the container port, proving the publish survived `up`.
-async fn compose_port(root: &Path, port: u16) -> Result<String, Error> {
-  let mut command = compose_command(root)?;
+async fn compose_port(workspace: &Workspace, port: u16) -> Result<String, Error> {
+  let mut command = compose_command(workspace)?;
   command.arg("port").arg("hodor").arg(port.to_string());
   let output = command.output().await.map_err(|source| Error::SpawnCompose { source })?;
   if !output.status.success() {
@@ -231,9 +231,9 @@ impl CliCommand for ExposeArgs {
   /// unusable (zero, a capture listener) or claimed by another workspace, the
   /// project config cannot be updated, or the compose commands fail.
   async fn run(self, _cli: &Cli, hodor_version: &str) -> Result<(), Self::Error> {
-    let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
+    let workspace = Workspace::resolve(self.workspace.as_deref())?;
     if self.list {
-      return list_exposes(&root);
+      return list_exposes(&workspace);
     }
     let Some(port) = self.port else {
       return Err(Error::ExposeNoPort);
@@ -249,27 +249,27 @@ impl CliCommand for ExposeArgs {
         return Err(Error::Config(Box::new(ConfigError::CapturePort { port: refused })));
       }
     }
-    let slug = workspace_slug(&root);
+    let slug = workspace.slug();
     check_claim(&read_registry()?, &slug, host, port)?;
-    let config_path = project_config_write_path(&root);
+    let config_path = project_config_write_path(workspace.root());
     ensure_expose_entry(&config_path, port, host)?;
     // An unnamed backend keeps whatever the stack on disk already runs —
     // exposing a port must never silently switch how traffic is captured.
-    init_workspace(&root, resolve_backend(None)?, false, hodor_version).await?;
+    init_workspace(&workspace, resolve_backend(None)?, false, hodor_version).await?;
     // Publishings are create-time state: this recreates the hodor service
     // (and the agent riding its netns), so exec sessions drop.
-    up_workspace(&root, false).await?;
+    up_workspace(&workspace, false).await?;
     let mut registry = read_registry()?;
     registry.insert(
       host,
       Claim {
         workspace: slug.clone(),
-        root: root.clone(),
+        root: workspace.root().to_path_buf(),
         port,
       },
     );
     write_registry(&registry)?;
-    let published = compose_port(&root, port).await.map_err(|err| match err {
+    let published = compose_port(&workspace, port).await.map_err(|err| match err {
       Error::ExposeVerify { port, status, .. } => Error::ExposeVerify { host, port, status },
       err => err,
     })?;
@@ -280,9 +280,9 @@ impl CliCommand for ExposeArgs {
 }
 
 /// Print this workspace's publishings plus every workspace's expose claims.
-fn list_exposes(root: &Path) -> Result<(), Error> {
-  let config = workspace_config(root)?;
-  println!("workspace {}:", root.display());
+fn list_exposes(workspace: &Workspace) -> Result<(), Error> {
+  let config = workspace.config()?;
+  println!("workspace {}:", workspace.root().display());
   for port in &config.workspace.ports {
     println!("  127.0.0.1:{port} -> :{port} ([workspace] ports)");
   }

@@ -5,22 +5,28 @@
 //! in one go.
 
 mod adapt;
+mod ambient;
 mod confine;
+mod decoys;
 mod error;
 mod expand;
 mod expose;
 mod git;
 mod jj;
 mod kube;
+mod mounts;
 mod paths;
+mod profiles;
+mod rewrites;
 mod ssh;
 mod stack;
 mod talos;
+mod workspace;
 
 pub use confine::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
+pub use decoys::rules_command;
 pub use error::Error;
 pub use expose::ExposeArgs;
-pub use stack::rules_command;
 
 #[cfg(test)]
 mod tests {
@@ -34,10 +40,16 @@ mod tests {
   use hodor_config::config::{ExposeMap, FileRewrite, RewriteFormat, RuleCfg, ToolCfg, WorkspaceBuild, fake_for};
   use tempfile::tempdir;
 
+  use crate::ambient::*;
   use crate::confine::*;
+  use crate::decoys::*;
   use crate::expand::*;
+  use crate::mounts::*;
   use crate::paths::*;
+  use crate::profiles::*;
+  use crate::rewrites::*;
   use crate::stack::*;
+  use crate::workspace::*;
 
   fn decoys() -> Vec<Decoy> {
     vec![
@@ -114,7 +126,12 @@ mod tests {
 
   #[test]
   fn rules_toml_prints_derived_rules_as_blocks() {
-    let toml = rules_toml(&decoys(), &[], &[]);
+    let toml = Report {
+      active: decoys(),
+      hostless: Vec::new(),
+      unregistered: Vec::new(),
+    }
+    .render();
     assert!(toml.contains("[rules.github_token]\nenv = \"GITHUB_TOKEN\""), "{toml}");
     assert!(toml.contains("[rules.anthropic_api_key]\nenv = \"ANTHROPIC_API_KEY\""), "{toml}");
     assert!(!toml.contains("value ="), "{toml}");
@@ -139,7 +156,10 @@ mod tests {
 
   #[test]
   fn names_the_registry_states_no_hosts_for_split_out_of_the_active_rules() {
-    let registry = generation_registry(None).unwrap();
+    let selection = Selection {
+      fnox: None,
+      registry: generation_registry(None).unwrap(),
+    };
     let decoys = vec![
       Decoy {
         env: "GITHUB_TOKEN".to_string(),
@@ -150,7 +170,7 @@ mod tests {
         value: "decoy".to_string(),
       },
     ];
-    let (with_hosts, hostless) = by_hosts(&registry, decoys);
+    let (with_hosts, hostless) = selection.split_by_hosts(decoys);
     assert_eq!(with_hosts.len(), 1);
     assert_eq!(with_hosts[0].env, "GITHUB_TOKEN");
     assert_eq!(hostless.len(), 1);
@@ -163,7 +183,12 @@ mod tests {
       env: "ARGO_CD_TOKEN".to_string(),
       value: "decoy".to_string(),
     }];
-    let toml = rules_toml(&decoys(), &hostless, &["TAVILY_API_KEY".to_string()]);
+    let toml = Report {
+      active: decoys(),
+      hostless,
+      unregistered: vec!["TAVILY_API_KEY".to_string()],
+    }
+    .render();
     assert!(toml.contains("# [rules.argo_cd_token]"), "{toml}");
     assert!(toml.contains("# env = \"ARGO_CD_TOKEN\""), "{toml}");
     assert!(toml.contains("# allow = [\"https://<your-host>\"]"), "{toml}");
@@ -561,12 +586,12 @@ mod tests {
   #[test]
   fn agent_image_resolution_prefers_config_then_build_then_default() {
     assert_eq!(
-      agent_image("hodor", Some("ghcr.io/example/devenv:1.0"), false).unwrap(),
+      AgentSpec::image("hodor", Some("ghcr.io/example/devenv:1.0"), false).unwrap(),
       "ghcr.io/example/devenv:1.0"
     );
-    assert_eq!(agent_image("hodor", None, false).unwrap(), DEFAULT_AGENT_IMAGE);
-    assert_eq!(agent_image("hodor", None, true).unwrap(), "hodor-agent-hodor:local");
-    agent_image("hodor", Some(""), false).unwrap_err();
+    assert_eq!(AgentSpec::image("hodor", None, false).unwrap(), DEFAULT_AGENT_IMAGE);
+    assert_eq!(AgentSpec::image("hodor", None, true).unwrap(), "hodor-agent-hodor:local");
+    AgentSpec::image("hodor", Some(""), false).unwrap_err();
   }
 
   #[test]
@@ -576,12 +601,13 @@ mod tests {
       dockerfile: PathBuf::from("docker/Dockerfile.agent"),
       context: PathBuf::from("docker"),
     };
-    let err = resolve_build(dir.path(), &build, None).unwrap_err();
+    let layout = Layout::new(dir.path(), String::new(), None);
+    let err = layout.resolve_build(&build).unwrap_err();
     assert!(err.to_string().contains("dockerfile"), "{err:?}");
     let docker = dir.path().join("docker");
     fs::create_dir(&docker).unwrap();
     fs::write(docker.join("Dockerfile.agent"), "FROM scratch\n").unwrap();
-    let (context, dockerfile) = resolve_build(dir.path(), &build, None).unwrap();
+    let (context, dockerfile) = layout.resolve_build(&build).unwrap();
     assert_eq!(context, docker);
     assert_eq!(dockerfile, docker.join("Dockerfile.agent"));
     fs::remove_dir_all(&docker).unwrap();
@@ -590,7 +616,7 @@ mod tests {
       dockerfile: PathBuf::from("Dockerfile.agent"),
       context: PathBuf::from("docker"),
     };
-    let err = resolve_build(dir.path(), &lone, None).unwrap_err();
+    let err = layout.resolve_build(&lone).unwrap_err();
     assert!(err.to_string().contains("context"), "{err:?}");
   }
 
@@ -658,9 +684,9 @@ mod tests {
   }
 
   #[test]
-  fn workspace_slug_uses_path_segments() {
-    assert_eq!(workspace_slug(Path::new("/home/ivan/github/hodor")), "home-ivan-github-hodor");
-    assert_eq!(workspace_slug(Path::new("/srv/My_Project")), "srv-my-project");
+  fn slug_uses_path_segments() {
+    assert_eq!(slug(Path::new("/home/ivan/github/hodor")), "home-ivan-github-hodor");
+    assert_eq!(slug(Path::new("/srv/My_Project")), "srv-my-project");
   }
 
   #[test]
@@ -685,17 +711,19 @@ mod tests {
   }
 
   #[test]
-  fn includes_that_are_not_there_are_rejected() {
+  fn includes_absorb_overlaps_and_reject_missing() {
     let host_home = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let sibling = root.path().join("sibling");
     std::fs::create_dir_all(&sibling).unwrap();
 
-    let entries = include_entries(root.path(), &[PathBuf::from("sibling:ro")], Some(host_home.path())).unwrap();
-    assert_eq!(entries.len(), 2, "{entries:?}");
-    assert!(entries.iter().any(|(path, ro)| path == &sibling && *ro), "{entries:?}");
+    let layout = Layout::new(root.path(), "/home/eng".to_string(), Some(host_home.path().to_path_buf()));
+    let mounts = layout.include_mounts(&[PathBuf::from("sibling:ro")]).unwrap();
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    assert_eq!(mounts[0].host, root.path(), "{mounts:?}");
+    assert!(!mounts[0].ro, "{mounts:?}");
 
-    let err = include_entries(root.path(), &[PathBuf::from("missing")], Some(host_home.path())).unwrap_err();
+    let err = layout.include_mounts(&[PathBuf::from("missing")]).unwrap_err();
     assert!(err.to_string().contains("does not exist"), "{err:?}");
     assert!(err.to_string().contains("missing"), "{err:?}");
   }
@@ -714,7 +742,7 @@ mod tests {
     .unwrap();
     std::fs::write(config_dir.path().join("config.toml"), "[proxy]\n").unwrap();
 
-    let binds = fnox_binds(Some(&fnox_dir), Some(config_dir.path()));
+    let binds = FnoxBinds::resolve(Some(&fnox_dir), Some(config_dir.path()));
     let rendered: Vec<String> = binds
       .mounts
       .iter()
@@ -731,7 +759,7 @@ mod tests {
 
     let empty = tempfile::tempdir().unwrap();
     assert!(
-      fnox_binds(Some(&empty.path().join("missing")), Some(empty.path()))
+      FnoxBinds::resolve(Some(&empty.path().join("missing")), Some(empty.path()))
         .mounts
         .is_empty(),
       "a path that is not there is never mounted: docker would create a directory in its place"
@@ -743,7 +771,7 @@ mod tests {
     let previous = std::env::var_os(key);
     set_env(key, "0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let yaml = Stack {
-      fnox: fnox_binds(None, None),
+      fnox: FnoxBinds::resolve(None, None),
       ..test_stack(ProxyBackend::Tproxy)
     }
     .render();
@@ -770,7 +798,7 @@ mod tests {
     )
     .unwrap();
 
-    let binds = fnox_binds(None, Some(config_dir.path()));
+    let binds = FnoxBinds::resolve(None, Some(config_dir.path()));
     let rendered: Vec<String> = binds
       .mounts
       .iter()
@@ -863,16 +891,19 @@ mod tests {
       toml_edit::de::from_str("env = \"ANTHROPIC_API_KEY\"\npattern = \"sk-ant-api03-{hex:8}\"\n").unwrap();
     let rules = BTreeMap::from([("anthropic".to_string(), rule)]);
 
-    let shaped = with_rule_patterns(
+    let selection = Selection { fnox: None, registry };
+    let shaped = selection.apply_rule_patterns(
       vec![Decoy {
         env: "ANTHROPIC_API_KEY".to_string(),
         value: default.clone(),
       }],
-      &registry,
       &rules,
     );
 
-    assert_eq!(shaped[0].value, registry.decoy("ANTHROPIC_API_KEY", Some("sk-ant-api03-{hex:8}")));
+    assert_eq!(
+      shaped[0].value,
+      selection.registry.decoy("ANTHROPIC_API_KEY", Some("sk-ant-api03-{hex:8}"))
+    );
     assert_ne!(shaped[0].value, default);
   }
 
@@ -919,7 +950,7 @@ mod tests {
 
   #[test]
   fn the_bypass_mount_names_the_shared_state_file() {
-    let mount = bypass_mount(Path::new("/root"));
+    let mount = Layout::new(Path::new("/root"), String::new(), None).bypass_mount();
     assert_eq!(mount.container, Path::new("/hodor/ebpf-bypass"));
     assert!(
       mount.host.ends_with("ebpf-bypass"),
