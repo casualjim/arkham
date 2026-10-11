@@ -153,11 +153,16 @@ jobs:
               manifest.write_text("".join(out))
           print(f"workspace members set to {next_version}")
           PY
+      - name: Refresh lockfile for stamped versions
+        # The lock still pins the old member versions; cargo release aborts
+        # on any dirty or inconsistent lock state, so refresh and commit it
+        # alongside the manifests below.
+        run: cargo generate-lockfile
       - name: Generate changelog
         run: git-cliff --tag v${{ steps.version.outputs.next_version }} -o CHANGELOG.md
       - name: Commit changelog and member versions
         run: |
-          git add CHANGELOG.md crates/*/Cargo.toml
+          git add CHANGELOG.md crates/*/Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
             echo "No changelog or version changes to commit"
             exit 0
