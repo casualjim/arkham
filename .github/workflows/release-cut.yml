@@ -123,6 +123,36 @@ jobs:
           with open(output_path, "a", encoding="utf-8") as f:
               f.write(f"next_version={next_version}\n")
           PY
+      - name: Sync workspace member versions
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          # Lockstep versions: every workspace member rides the release
+          # version. Only the [package] version line is rewritten; dependency
+          # requirements are never touched.
+          next_version = os.environ["NEXT_VERSION"]
+          for manifest in sorted(pathlib.Path("crates").glob("*/Cargo.toml")):
+              lines = manifest.read_text().splitlines(keepends=True)
+              in_package = False
+              done = False
+              out = []
+              for line in lines:
+                  stripped = line.strip()
+                  if stripped.startswith("["):
+                      in_package = stripped == "[package]"
+                  elif in_package and not done and stripped.startswith('version = "'):
+                      line = f'version = "{next_version}"\n'
+                      done = True
+                  out.append(line)
+              if not done:
+                  raise SystemExit(f"no [package] version found in {manifest}")
+              manifest.write_text("".join(out))
+          print(f"workspace members set to {next_version}")
+          PY
       - name: Generate changelog
         run: git-cliff --tag v${{ steps.version.outputs.next_version }} -o CHANGELOG.md
       - name: Commit changelog

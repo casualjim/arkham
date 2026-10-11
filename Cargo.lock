@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-compose"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "arkham-config",
  "arkham-fnox",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-config"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "base62",
  "clap",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -400,14 +400,14 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf-programs"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "aya-ebpf",
 ]
 
 [[package]]
 name = "arkham-fnox"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "arkham-config",
  "fnox-core",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-pki"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "pretty_assertions",
  "rama",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-plugin"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "arkham-config",
  "pretty_assertions",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-proxy"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tproxy"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tun"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "arkham-config",
  "arkham-pki",
