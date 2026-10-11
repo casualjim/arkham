@@ -1,8 +1,20 @@
-## [0.3.10] - 2026-10-11
+## [0.3.11] - 2026-10-11
+
+### 🐛 Bug Fixes
+
+- *(ci)* Commit member bumps pre-release
+- *(ci)* Refresh and commit lockfile in cut-release
 
 ### 🚜 Refactor
 
 - [**breaking**] Rename hodor to arkham
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.10 [ci skip]
+- Release
+- Unify crate versions at 0.3.10
+- Release all workspace crates in lockstep
 ## [0.3.9] - 2026-10-10
 
 ### 🚜 Refactor
