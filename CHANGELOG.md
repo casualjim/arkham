@@ -1,3 +1,8 @@
+## [0.3.12] - 2026-10-11
+
+### 🐛 Bug Fixes
+
+- Convert out of rama TcpStream via From
 ## [0.3.11] - 2026-10-11
 
 ### 🐛 Bug Fixes
@@ -15,6 +20,8 @@
 - Release
 - Unify crate versions at 0.3.10
 - Release all workspace crates in lockstep
+- Update changelog for v0.3.11 [ci skip]
+- Release
 ## [0.3.9] - 2026-10-10
 
 ### 🚜 Refactor
