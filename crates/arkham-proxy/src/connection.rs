@@ -14,6 +14,7 @@ use rama::net::client::ConnectorTarget;
 use rama::net::socket::SocketOptions;
 use rama::service::service_fn;
 use rama::tcp::client::TcpStreamConnector;
+use rama::tcp::stream::TokioTcpStream;
 use rama::tls::boring::client::ConnectorConfigClientAuth;
 use rama::tls::boring::core::ssl::SslCredential;
 use rama::tls::boring::core::x509::store::X509Store;
@@ -245,8 +246,8 @@ async fn dial_one(addr: SocketAddr, fwmark: Option<u32>) -> std::io::Result<TcpS
     mark: fwmark,
     ..SocketOptions::default_tcp()
   });
-  // The mark lives on the fd, so the tokio stream unwraps losslessly.
-  opts.connect(addr).await.map(|stream| stream.stream).map_err(std::io::Error::other)
+  // The mark lives on the fd, so the tokio stream converts losslessly.
+  opts.connect(addr).await.map(TokioTcpStream::from).map_err(std::io::Error::other)
 }
 
 /// A stream prefixed with already-read bytes (replays `initial_buf` first).

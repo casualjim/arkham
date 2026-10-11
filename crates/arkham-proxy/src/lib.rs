@@ -255,7 +255,7 @@ impl Service<RamaTcpStream> for ExplicitService {
   type Error = std::convert::Infallible;
 
   async fn serve(&self, input: RamaTcpStream) -> Result<Self::Output, Self::Error> {
-    let client = input.stream;
+    let client = TcpStream::from(input);
     let peer = client.peer_addr().ok();
     if let Err(err) = dispatch(client, &self.state).await {
       tracing::debug!(?peer, ?err, "connection failed");

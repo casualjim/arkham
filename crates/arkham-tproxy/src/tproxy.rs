@@ -176,7 +176,7 @@ pub(crate) async fn run_tproxy_with(options: Options, state: Arc<ProxyState>) ->
   loop {
     let (stream, _peer) = listener.accept().await.map_err(|err| Error::TproxyAccept { origin: err })?;
     // On a transparent socket the local address IS the original destination.
-    let stream = stream.stream;
+    let stream = TcpStream::from(stream);
     let Ok(dst) = stream.local_addr() else {
       continue;
     };
