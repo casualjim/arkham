@@ -1,24 +1,24 @@
 # Secure agent workspace
 
-This is a workspace you can secure. `.config/hodor/config.toml` is the whole input, and `hodor init` turns it into a two-service docker compose stack: hodor, and the agent. `hodor agent` does that, starts it, and drops you into the agent in one go.
+This is a workspace you can secure. `.config/arkham/config.toml` is the whole input, and `arkham init` turns it into a two-service docker compose stack: arkham, and the agent. `arkham agent` does that, starts it, and drops you into the agent in one go.
 
-The agent container holds decoy credentials and shares hodor's network namespace, so every connection it makes is captured, with no proxy setting to find and no way around the proxy. hodor swaps a decoy for the real value only on the hosts your rules allow, and puts the decoy back on the response.
+The agent container holds decoy credentials and shares arkham's network namespace, so every connection it makes is captured, with no proxy setting to find and no way around the proxy. arkham swaps a decoy for the real value only on the hosts your rules allow, and puts the decoy back on the response.
 
 ## What the two services do
 
 | Service | Job |
 | --- | --- |
-| `hodor` | Captures egress transparently (backend chosen by `hodor init --backend`, `ebpf` by default), terminates TLS on a grant match, swaps decoys for real values, redacts them back on the response. Holds the CA, and resolves real values from fnox itself. |
-| `agent` | Runs the agent behind an entrypoint that trusts hodor's CA, which is all it takes to make a secure agent work. Holds decoys only. |
+| `arkham` | Captures egress transparently (backend chosen by `arkham init --backend`, `ebpf` by default), terminates TLS on a grant match, swaps decoys for real values, redacts them back on the response. Holds the CA, and resolves real values from fnox itself. |
+| `agent` | Runs the agent behind an entrypoint that trusts arkham's CA, which is all it takes to make a secure agent work. Holds decoys only. |
 
 ## Topology
 
 ```text
-  agent            shares hodor's network namespace, no proxy setting
+  agent            shares arkham's network namespace, no proxy setting
     |
     |  every connection, captured transparently in the shared namespace
     v
-  hodor            grant match: terminate TLS, swap the decoy for the real value
+  arkham            grant match: terminate TLS, swap the decoy for the real value
     |
     +--> api.anthropic.com   grant matched, the real key goes on the wire
     +--> anything else       spliced byte for byte, the decoy stays on the wire
@@ -26,41 +26,41 @@ The agent container holds decoy credentials and shares hodor's network namespace
 
 ## Before you start
 
-- docker with compose, and hodor on `PATH`.
+- docker with compose, and arkham on `PATH`.
 - The secrets this workspace uses, declared to fnox. The registry supplies their hosts and decoy shapes, so no `[rules.*]` blocks are needed.
-- Your fnox setup readable by the hodor container: the stack mounts your fnox config directory and hodor's fnox files read-only, and forwards the provider credentials in your environment, so a value that resolves here resolves there.
+- Your fnox setup readable by the arkham container: the stack mounts your fnox config directory and arkham's fnox files read-only, and forwards the provider credentials in your environment, so a value that resolves here resolves there.
 
 ## Run it
 
 From this directory:
 
 ```sh
-hodor rules            # preview what derives: fnox declarations ∩ registry, as [rules.*] blocks
-hodor init             # the stack, the CA, and the entrypoint (--backend ebpf by default)
-hodor up               # start both services
-hodor logs -f          # the stack's logs, following
-hodor agent            # init, up, and a shell in the agent — one idempotent command
-hodor agent --rm       # the same, stopping both when the shell exits
-hodor down             # stop both
+arkham rules            # preview what derives: fnox declarations ∩ registry, as [rules.*] blocks
+arkham init             # the stack, the CA, and the entrypoint (--backend ebpf by default)
+arkham up               # start both services
+arkham logs -f          # the stack's logs, following
+arkham agent            # init, up, and a shell in the agent — one idempotent command
+arkham agent --rm       # the same, stopping both when the shell exits
+arkham down             # stop both
 ```
 
 `init` writes three things, and never overwrites one that already exists:
 
 | Path | What it is |
 | --- | --- |
-| `<state-dir>/hodor/ws/<slug>/compose.yml` | the generated stack, which is yours to edit (`<state-dir>` is `~/.local/state` on Linux) |
-| `~/.config/hodor/ca.pem` | hodor's CA, with `ca.crt` and `ca.key` written beside it |
-| `~/.config/hodor/agent-entrypoint.sh` | the agent's entrypoint |
+| `<state-dir>/arkham/ws/<slug>/compose.yml` | the generated stack, which is yours to edit (`<state-dir>` is `~/.local/state` on Linux) |
+| `~/.config/arkham/ca.pem` | arkham's CA, with `ca.crt` and `ca.key` written beside it |
+| `~/.config/arkham/agent-entrypoint.sh` | the agent's entrypoint |
 
-`up` merges three compose layers, later winning: `<config-dir>/hodor/compose.yml`, the generated file above, then this workspace's `.config/hodor.compose.yaml` if you create one.
+`up` merges three compose layers, later winning: `<config-dir>/arkham/compose.yml`, the generated file above, then this workspace's `.config/arkham.compose.yaml` if you create one.
 
 ## Where the secrets live
 
-The real values stay in fnox; the hodor service resolves them itself when a request matches a grant. The agent gets one deterministic decoy per rule, shaped by that rule's pattern:
+The real values stay in fnox; the arkham service resolves them itself when a request matches a grant. The agent gets one deterministic decoy per rule, shaped by that rule's pattern:
 
 ```sh
-hodor fake ANTHROPIC_API_KEY    # what the agent sends
-hodor fake GH_TOKEN
+arkham fake ANTHROPIC_API_KEY    # what the agent sends
+arkham fake GH_TOKEN
 ```
 
 A decoy follows the env name, so renaming a variable changes its decoy and substitution stops matching until you regenerate. A rule whose key fnox does not declare produces no decoy at all.
@@ -68,15 +68,15 @@ A decoy follows the env name, so renaming a variable changes its decoy and subst
 ## Check that it works
 
 ```sh
-hodor agent -- curl -sS https://api.anthropic.com/v1/models -H "x-api-key: $ANTHROPIC_API_KEY"
+arkham agent -- curl -sS https://api.anthropic.com/v1/models -H "x-api-key: $ANTHROPIC_API_KEY"
 ```
 
-No proxy variable is set anywhere: the connection is captured on its way out. `api.anthropic.com` is a grant, so hodor terminates TLS with its own CA and the upstream sees your real key rather than the decoy.
+No proxy variable is set anywhere: the connection is captured on its way out. `api.anthropic.com` is a grant, so arkham terminates TLS with its own CA and the upstream sees your real key rather than the decoy.
 
-To watch the swap, set `RUST_LOG: debug` on the hodor service in the generated compose file and read its log. The matching lines name the label and the location, never a value:
+To watch the swap, set `RUST_LOG: debug` on the arkham service in the generated compose file and read its log. The matching lines name the label and the location, never a value:
 
 ```sh
-docker compose -f ~/.local/state/hodor/ws/<slug>/compose.yml logs hodor | grep substituted
+docker compose -f ~/.local/state/arkham/ws/<slug>/compose.yml logs arkham | grep substituted
 ```
 
 ```text
@@ -90,6 +90,6 @@ substituted label=anthropic location=Header
 - The listener is on loopback in the shared namespace, so `HTTPS_PROXY=http://127.0.0.1:8080` works as a fallback if you would rather not rely on capture. Both paths can be live at once.
 - Keep your own mounts, devices, and environment on the `agent` service: the generated file is a normal compose file for you to edit. To run other images, override `image:` in a compose layer.
 - Each `profiles/<name>/<tool>/` directory mounts into the agent at that tool's default config location, writable. `__shared__` is the base every profile inherits.
-- Recreate the two services together. The agent shares hodor's network namespace, so recreating hodor alone leaves it attached to a dead namespace and its DNS stops resolving.
+- Recreate the two services together. The agent shares arkham's network namespace, so recreating arkham alone leaves it attached to a dead namespace and its DNS stops resolving.
 
 [How to secure your workspace](../../docs/user/how-to/confine-a-workspace.md) covers the whole flow, and the [main README](../../README.md) covers allow entries, decoy patterns, and the rest of the configuration.

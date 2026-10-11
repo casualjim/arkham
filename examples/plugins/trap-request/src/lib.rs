@@ -2,7 +2,7 @@ use wit_bindgen::generate;
 
 generate!({
   world: "request",
-  path: "../../../crates/hodor-plugin/wit",
+  path: "../../../crates/arkham-plugin/wit",
 });
 
 struct TrapRequest;

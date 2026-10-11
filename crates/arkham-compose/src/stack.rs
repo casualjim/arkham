@@ -1,0 +1,917 @@
+//! Compose stack generation: mount resolution, rewrites, and YAML.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use arkham_config::cli::ProxyBackend;
+use arkham_config::config::{AppConfig, ExposeMap, config_dir, project_profiles_dir};
+use arkham_config::grants::GuestTlsMode;
+use arkham_pki::ca::{CertAuthority, load_or_generate};
+use dirs::home_dir;
+use libc::getuid;
+use xpanda::Xpanda;
+
+use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted};
+use crate::ambient::{DeriveInputs, derive_sources};
+use crate::decoys::{Decoy, Selection, validate_passthrough};
+use crate::error::Error;
+use crate::expand::{block_on, build_expander, expand_path, expand_value, resolution_env};
+use crate::mounts::{BYPASS_CONTAINER_PATH, FnoxBinds, Layout};
+use crate::paths::{Mount, translate};
+use crate::profiles::{ProfileRoots, profile_mounts};
+use crate::rewrites::{RewriteInputs, write_rewrites};
+use crate::workspace::Workspace;
+
+/// Revision of the generated stack's shape, written into the compose file's
+/// `# stack shape:` marker line and read back by [`stack_shape_in`] to tell a
+/// stack an older binary generated from a current one. Bump whenever
+/// [`Stack::render`] emits something an existing stack must pick up — a new
+/// service, new publishings, an environment variable the wiring needs — so
+/// `arkham init` and `arkham agent` regenerate instead of leaving the old
+/// wiring behind. What each shape changed is git history, not this comment.
+pub(crate) const STACK_SHAPE: u32 = 14;
+
+/// Fixed port the generated stack renders as `ARKHAM_LISTEN` instead of the
+/// `127.0.0.1:8080` default: the explicit proxy is loopback-bound in the
+/// shared netns, and 8080 is the port dev servers default to — squatted on.
+pub(crate) const EXPLICIT_LISTEN: &str = "127.0.0.1:8099";
+
+/// The shape revision a generated stack carries, from its `# stack shape:`
+/// marker line; `None` for a file without a readable one, which is a stack
+/// from before the marker existed.
+pub(crate) fn stack_shape_in(compose: &str) -> Option<u32> {
+  compose
+    .lines()
+    .find_map(|line| line.trim_start().strip_prefix("# stack shape: "))
+    .and_then(|shape| shape.trim().parse().ok())
+}
+
+/// Builder of the generated [`Stack`]: owns the resolved workspace context
+/// and every intermediate the steps produce, and each method resolves one
+/// concern, in the order the story reads — resolve the context, select the
+/// secrets, rewrite the declared files, derive the ambient sources, write
+/// the grants, mount the tool profiles, mint the guest identities, then
+/// assemble the agent and the stack. [`generate_stack`] is that chain.
+struct StackBuilder<'a> {
+  /// Mount layout: root, container home, and host home every mount resolves
+  /// against.
+  layout: Layout,
+  /// Secret selection: fnox discovery joined against the registry.
+  selection: Selection,
+  /// Capture backend the serve command runs.
+  backend: ProxyBackend,
+  /// Arkham image tag: the binary's version, threaded from the face.
+  version: &'a str,
+  /// The workspace's merged config.
+  config: AppConfig,
+  /// Expansion environment: the process env plus fnox-resolved names.
+  env: HashMap<String, String>,
+  /// Xpanda expander built over `env`.
+  expander: Xpanda,
+  /// Compose project name: the configured name or the workspace slug.
+  project: String,
+  /// Include-derived mounts, deepest path first.
+  mounts: Vec<Mount>,
+  /// Decoys for the agent environment, from [`StackBuilder::secrets`].
+  decoys: Vec<Decoy>,
+  /// Adapter grants from [`StackBuilder::rewrites`] and
+  /// [`StackBuilder::ambient`], written by [`StackBuilder::grants`].
+  grants: Vec<RewriteAdapted>,
+  /// Rewritten-file mounts, from [`StackBuilder::rewrites`] and
+  /// [`StackBuilder::ambient`].
+  file_mounts: Vec<Mount>,
+  /// Grant-layer mounts, from [`StackBuilder::grants`].
+  grants_mounts: Vec<Mount>,
+  /// Tool-profile mounts, from [`StackBuilder::profiles`].
+  tool_mounts: Vec<Mount>,
+  /// Guest-identity mounts, from [`StackBuilder::guest_identities`].
+  guest: Vec<Mount>,
+}
+
+impl<'a> StackBuilder<'a> {
+  /// Resolve the workspace context every step shares: the merged config, the
+  /// registry, fnox, the expansion environment, the include mounts, and the
+  /// project name.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the registry or config fails to load, when value
+  /// resolution fails, or when a path fails to expand.
+  fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str) -> Result<Self, Error> {
+    let workspace = Workspace::new(root);
+    let config = workspace.config()?;
+    let selection = workspace.selection()?;
+    let raw_home = config.workspace.container_home().to_string();
+    let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
+    let env = block_on(resolution_env(&selection.registry, selection.fnox.as_ref(), &referenced))??;
+    let expander = build_expander(env.clone());
+    let home = expand_value(&expander, &raw_home)?;
+    let layout = Layout::new(root, home, home_dir());
+    let includes: Vec<PathBuf> = config
+      .workspace
+      .include
+      .iter()
+      .map(|entry| expand_path(&expander, &entry.to_string_lossy()).map(PathBuf::from))
+      .collect::<Result<_, Error>>()?;
+    let mounts = layout.include_mounts(&includes)?;
+    let project = config.workspace.name.clone().unwrap_or_else(|| workspace.slug());
+    Ok(Self {
+      layout,
+      selection,
+      backend,
+      version,
+      config,
+      env,
+      expander,
+      project,
+      mounts,
+      decoys: Vec::new(),
+      grants: Vec::new(),
+      file_mounts: Vec::new(),
+      grants_mounts: Vec::new(),
+      tool_mounts: Vec::new(),
+      guest: Vec::new(),
+    })
+  }
+
+  /// Select the decoys the agent environment holds, reshaped by each rule's
+  /// own pattern — serve-time substitution derives its fake from
+  /// `rule.pattern`, so a registry default would never match — and check the
+  /// passthrough names against them.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a passthrough name overlaps a rule env or a
+  /// selected decoy.
+  fn secrets(mut self) -> Result<Self, Error> {
+    self.decoys = self.selection.apply_rule_patterns(self.selection.select(), &self.config.rules);
+    validate_passthrough(&self.config.rules, &self.decoys, &self.config.workspace.passthrough)?;
+    Ok(self)
+  }
+
+  /// The declared `[workspace] file_rewrite` entries: decoy twins written
+  /// under the state directory and mounted read-only into the agent, plus
+  /// the grants their adapters derive.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a rewrite names an env with no known value or no
+  /// decoy, or its dest does not expand to an absolute container path.
+  fn rewrites(mut self) -> Result<Self, Error> {
+    let kube_ca = self.rewrite_ca()?;
+    let files_dir = self.layout.files_dir();
+    let guests_dir = self.layout.guests_dir();
+    let rewritten = write_rewrites(&RewriteInputs {
+      files_dir: &files_dir,
+      root: self.layout.root(),
+      rewrites: &self.config.workspace.file_rewrite,
+      decoys: &self.decoys,
+      env: &self.env,
+      expander: &self.expander,
+      home: self.layout.home(),
+      host_home: self.layout.host_home(),
+      kube_ca: kube_ca.as_ref(),
+      guests_dir: &guests_dir,
+    })?;
+    self.grants = rewritten.grants;
+    self.file_mounts = rewritten.mounts;
+    Ok(self)
+  }
+
+  /// The guest-identity CA when the workspace declares file rewrites: their
+  /// adapters mint guest pairs from it. `None` when there is nothing to
+  /// mint, so no rewrite pays for a CA it does not need.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the config directory does not resolve or the CA
+  /// cannot load.
+  fn rewrite_ca(&self) -> Result<Option<CertAuthority>, Error> {
+    if self.config.workspace.file_rewrite.is_empty() {
+      return Ok(None);
+    }
+    let ca_path = config_dir()
+      .ok_or_else(|| Error::ConfigDir {
+        detail: "file rewrites need the arkham config directory to load the CA from".to_string(),
+      })?
+      .join("ca.pem");
+    load_or_generate(&ca_path).map(Some).map_err(|source| Error::GuestCa {
+      path: ca_path.clone(),
+      source,
+    })
+  }
+
+  /// The ambient sources — gitconfig, jj, ssh, kube, talos from their
+  /// default locations: decoy twins mounted read-only plus the grants they
+  /// derive, joined onto the declared rewrites.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a source does not map onto grants or a decoy
+  /// twin.
+  fn ambient(mut self) -> Result<Self, Error> {
+    let files_dir = self.layout.files_dir();
+    let guests_dir = self.layout.guests_dir();
+    let derived = derive_sources(&DeriveInputs {
+      files_dir: &files_dir,
+      root: self.layout.root(),
+      registry: &self.selection.registry,
+      decoys: &self.decoys,
+      expander: &self.expander,
+      home: self.layout.home(),
+      host_home: self.layout.host_home(),
+      guests_dir: &guests_dir,
+      rewrites: &self.config.workspace.file_rewrite,
+    })?;
+    self.grants.extend(derived.grants);
+    self.file_mounts.extend(derived.mounts);
+    Ok(self)
+  }
+
+  /// Write the grant-adapter state the arkham service mounts read-only: no
+  /// grants, no state, no mount.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the state cannot be written.
+  fn grants(mut self) -> Result<Self, Error> {
+    if !self.grants.is_empty() {
+      let grants_state = self.layout.state_dir().join("grants");
+      adapt::write_state(&grants_state, &self.grants)?;
+      self.grants_mounts = vec![Mount {
+        host: grants_state,
+        container: PathBuf::from(GRANTS_STATE_DIR),
+        ro: true,
+      }];
+    }
+    Ok(self)
+  }
+
+  /// The tool-config mounts for the selected profile.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a `[tools.*]` name or `config_dir` is invalid, or
+  /// a profile directory cannot be created.
+  fn profiles(mut self) -> Result<Self, Error> {
+    let global_profiles = config_dir().map(|dir| dir.join("profiles"));
+    let project_profiles = project_profiles_dir(self.layout.root());
+    let roots = ProfileRoots {
+      project: Some(project_profiles.as_path()),
+      global: global_profiles.as_deref(),
+    };
+    self.tool_mounts = profile_mounts(&roots, self.config.workspace.profile_name(), &self.config.tools, self.layout.home())?;
+    Ok(self)
+  }
+
+  /// Guest identity pairs for rules that request mTLS, minted from the CA
+  /// and mounted read-only at their declared container paths; none when no
+  /// rule requests one.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the config directory does not resolve, the CA
+  /// cannot load, or a pair cannot be written.
+  fn guest_identities(mut self) -> Result<Self, Error> {
+    let mtls = self
+      .config
+      .rules
+      .values()
+      .any(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls));
+    if mtls {
+      let ca_path = config_dir()
+        .ok_or_else(|| Error::ConfigDir {
+          detail: "a guest identity needs the arkham config directory to load the CA from".to_string(),
+        })?
+        .join("ca.pem");
+      let ca = load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
+        path: ca_path.clone(),
+        source,
+      })?;
+      let guests_dir = self.layout.guests_dir();
+      self.guest = self.layout.guest_identity_mounts(&self.config.rules, &ca, &guests_dir)?;
+    }
+    Ok(self)
+  }
+
+  /// The agent service and the finished stack: the translated root, the
+  /// resolved image or build, the fnox mounts, and the backend's bypass
+  /// mount.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the configured build does not resolve or names an
+  /// empty image tag.
+  fn stack(self) -> Result<Stack, Error> {
+    let build_paths: Option<(PathBuf, PathBuf)> = self
+      .config
+      .workspace
+      .build
+      .as_ref()
+      .map(|build| self.layout.resolve_build(build))
+      .transpose()?;
+    let agent = AgentSpec {
+      root: translate(self.layout.root(), self.layout.host_home(), self.layout.home()),
+      home: self.layout.home().to_string(),
+      storage: self.layout.state_dir().join("containers"),
+      uid: current_uid(),
+      devices: self.config.workspace.devices.clone(),
+      cap_add: self.config.workspace.cap_add.clone(),
+      image: AgentSpec::image(&self.project, self.config.workspace.image.as_deref(), build_paths.is_some())?,
+      build: build_paths.map(|(context, dockerfile)| AgentBuild { context, dockerfile }),
+    };
+    // The runtime bypass file both services share: the agent entrypoint
+    // rewrites it from `podman network inspect`, arkham reloads it live into
+    // the programs' bypass list. Ebpf only — other backends have no bypass
+    // list to feed.
+    let mut mounts = self.mounts;
+    if self.backend == ProxyBackend::Ebpf {
+      mounts.push(self.layout.bypass_mount());
+    }
+    Ok(Stack {
+      backend: self.backend,
+      project: self.project,
+      decoys: self.decoys,
+      agent,
+      mounts,
+      tool_mounts: self.tool_mounts,
+      fnox: FnoxBinds::resolve(self.layout.fnox_config_dir().as_deref(), config_dir().as_deref()),
+      guest: self.guest,
+      init: self.config.workspace.init.clone(),
+      ports: self.config.workspace.ports.clone(),
+      expose: self.config.workspace.expose.clone(),
+      networks: self.config.workspace.networks.clone(),
+      extra_hosts: self.config.workspace.extra_hosts.clone(),
+      passthrough: self.config.workspace.passthrough.clone(),
+      file_mounts: self.file_mounts,
+      grants_mounts: self.grants_mounts,
+      arkham_version: self.version.to_string(),
+    })
+  }
+}
+
+/// The compose file for a workspace: resolve the context, run the build
+/// steps, render.
+///
+/// # Errors
+///
+/// Returns whatever step fails: config or registry loading, value
+/// resolution, rewrites, ambient derivation, grant state, profiles, guest
+/// identities, or the agent build.
+pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, arkham_version: &str) -> Result<String, Error> {
+  let stack = StackBuilder::resolve(root, backend, arkham_version)?
+    .secrets()?
+    .rewrites()?
+    .ambient()?
+    .grants()?
+    .profiles()?
+    .guest_identities()?
+    .stack()?;
+  Ok(stack.render())
+}
+
+/// The process's user id, from the kernel: the same value `id -u` prints,
+/// without the subprocess.
+pub(crate) fn current_uid() -> u32 {
+  // Safety: `getuid` takes no arguments, cannot fail, and touches no memory.
+  unsafe { getuid() }
+}
+
+/// What the generated agent service is built from: container-side paths and
+/// the host directory mounted as the inner runtime's storage.
+pub(crate) struct AgentSpec {
+  /// Workspace root, translated into the agent container.
+  pub(crate) root: PathBuf,
+  /// The agent user's home directory in the container.
+  pub(crate) home: String,
+  /// Host directory mounted at `{home}/.local/share/containers`.
+  pub(crate) storage: PathBuf,
+  /// Host uid baked as the agent user: mounts the agent writes must be its own.
+  pub(crate) uid: u32,
+  /// Extra devices from `[workspace] devices`, appended to `/dev/net/tun`.
+  pub(crate) devices: Vec<String>,
+  /// Extra capabilities from `[workspace] cap_add`, appended to the built-in
+  /// set.
+  pub(crate) cap_add: Vec<String>,
+  /// Image tag the agent service runs: configured, derived, or default.
+  pub(crate) image: String,
+  /// Dockerfile build from `[workspace.build]`, when one builds the image.
+  pub(crate) build: Option<AgentBuild>,
+}
+
+/// Default agent image, when `[workspace] image` is unset and no
+/// `[workspace.build]` builds one.
+pub(crate) const DEFAULT_AGENT_IMAGE: &str = "ghcr.io/casualjim/devagent:26.04";
+
+/// Resolved Dockerfile build for the agent service: absolute host paths for
+/// compose, which sends the context to the daemon itself.
+pub(crate) struct AgentBuild {
+  /// Build context directory.
+  pub(crate) context: PathBuf,
+  /// Dockerfile to build.
+  pub(crate) dockerfile: PathBuf,
+}
+
+impl AgentSpec {
+  /// Image tag the agent service runs: the configured `image`, a local tag
+  /// derived from the project when `[workspace.build]` builds one unnamed, or
+  /// the default pull. An empty `image` is a config error, not a silent
+  /// default: compose would fail on the empty tag without naming the setting.
+  pub(crate) fn image(project: &str, image: Option<&str>, has_build: bool) -> Result<String, Error> {
+    match image {
+      Some(name) if !name.is_empty() => Ok(name.to_string()),
+      Some(_) => Err(Error::EmptyImage),
+      None if has_build => Ok(format!("arkham-agent-{}:local", project.to_lowercase())),
+      None => Ok(DEFAULT_AGENT_IMAGE.to_string()),
+    }
+  }
+}
+
+/// A stack to generate: every input compose rendering reads, as one value.
+/// [`StackBuilder`] fills it from a workspace; tests build it literally.
+pub(crate) struct Stack {
+  pub(crate) backend: ProxyBackend,
+  pub(crate) project: String,
+  pub(crate) decoys: Vec<Decoy>,
+  pub(crate) agent: AgentSpec,
+  pub(crate) mounts: Vec<Mount>,
+  pub(crate) tool_mounts: Vec<Mount>,
+  pub(crate) fnox: FnoxBinds,
+  pub(crate) guest: Vec<Mount>,
+  pub(crate) init: Option<String>,
+  /// Ports the arkham service publishes as stable host `127.0.0.1` bindings,
+  /// from `[workspace] ports`.
+  pub(crate) ports: Vec<u16>,
+  /// Host-to-container publishings from `[[workspace.expose]]`: each maps a
+  /// distinct host port onto a container port.
+  pub(crate) expose: Vec<ExposeMap>,
+  /// Existing compose networks the arkham service joins (declared `external`
+  /// at the top level), from `[workspace] networks`. The agent inherits them
+  /// through the shared network namespace.
+  pub(crate) networks: Vec<String>,
+  /// Extra host entries for the arkham and agent services, from
+  /// `[workspace] extra_hosts`.
+  pub(crate) extra_hosts: Vec<String>,
+  /// Env names forwarded as `${NAME}` interpolation in the agent
+  /// environment, from `[workspace] passthrough`.
+  pub(crate) passthrough: Vec<String>,
+  /// Rewritten files mounted read-only at their dests, from
+  /// `[workspace] file_rewrite`; after workspace mounts so they win.
+  pub(crate) file_mounts: Vec<Mount>,
+  /// Upstream identity files adapter grants materialize: mounted into the
+  /// arkham service at their absolute paths, so host and container serve
+  /// resolve the same fragment entries. Never into the agent: real secrets
+  /// stay out.
+  pub(crate) grants_mounts: Vec<Mount>,
+  /// Arkham image tag: the binary's version, threaded from the binary crate.
+  /// Library crates version independently, so `env!` here would lie.
+  pub(crate) arkham_version: String,
+}
+
+impl Stack {
+  /// What the arkham service runs for a capture backend, the extra
+  /// capabilities that needs, and the service keys that go with it.
+  fn backend_service(backend: ProxyBackend, project: &str) -> (String, &'static [&'static str], String) {
+    match backend {
+      ProxyBackend::Ebpf => (
+        "[\"serve\", \"--proxy-backend\", \"ebpf\", \"--ebpf-cgroup\", \"enclosing\"]".to_string(),
+        &["BPF", "PERFMON"],
+        // Both services carry the same `cgroup_parent`, so docker creates that
+        // cgroup as part of arkham's own start and arkham attaches to it by
+        // resolving its parent from `/proc/self/cgroup`: the daemon resolves the
+        // parent relative to its own cgroup root, which is why no host path is
+        // written down here.
+        format!("    cgroup: host\n    cgroup_parent: arkham-{project}.slice\n"),
+      ),
+      ProxyBackend::Tun => (
+        "[\"serve\", \"--proxy-backend\", \"tun\"]".to_string(),
+        &[],
+        "    devices: [/dev/net/tun]\n".to_string(),
+      ),
+      ProxyBackend::Tproxy => ("[\"serve\", \"--proxy-backend\", \"tproxy\"]".to_string(), &[], String::new()),
+      // `arkham init` rejects `none`; rendered anyway so this match is exhaustive.
+      ProxyBackend::None => ("[\"serve\"]".to_string(), &[], String::new()),
+    }
+  }
+
+  /// The compose file this stack renders to.
+  pub(crate) fn render(&self) -> String {
+    let (serve, extra_caps, service_extra) = Self::backend_service(self.backend, &self.project);
+    let mut out = String::new();
+    let _ = write!(
+      out,
+      "# stack shape: {shape}\n\
+       # generated by `arkham init` — edit freely; the file regenerates when the\n\
+       # workspace config or the shape above changed since it was generated.\n\
+       # arkham merges config like always\n\
+       # (global layer plus this workspace's .config/arkham/config.toml, discovered\n\
+       # from its working directory, plus the generated tool-config grant layer\n\
+       # when a rewrite adapts one); the agent holds decoys only.\n\
+       name: {project}\n\
+       services:\n\
+       \x20 arkham:\n\
+       \x20   image: ghcr.io/casualjim/arkham:{version}\n\
+       \x20   working_dir: \"{root}\"\n\
+      \x20   command: {serve}\n\
+       {service_extra}\
+      \x20   # Capture dies with this process: the eBPF attachments are fd-held\n\
+      \x20   # and the listeners live in it, so a crash would silently end all\n\
+      \x20   # capture until the next `up`. Restart instead, loudly — the\n\
+      \x20   # restart count in `compose ps` is what makes flapping visible.\n\
+      \x20   restart: unless-stopped\n\
+      \x20   environment:\n\
+      \x20     RUST_LOG: info\n\
+       \x20     # 8080 must stay free on loopback: agent dev servers default\n\
+       \x20     # to it, and the explicit proxy's default bind would squat on\n\
+       \x20     # 127.0.0.1:8080, leaving the fwd sidecar nothing to expose.\n\
+       \x20     ARKHAM_LISTEN: {listen}\n",
+      root = self.agent.root.display(),
+      project = self.project,
+      listen = EXPLICIT_LISTEN,
+      version = self.arkham_version,
+      shape = STACK_SHAPE
+    );
+    if self.backend == ProxyBackend::Ebpf {
+      // The runtime bypass file, rewritten by the agent entrypoint from
+      // `podman network inspect` and reloaded live by the loader: podman
+      // networks are created inside the agent after arkham starts, so no
+      // startup flag can name them.
+      let _ = writeln!(out, "      ARKHAM_EBPF_BYPASS_FILE: {BYPASS_CONTAINER_PATH}");
+    }
+    out.push_str(
+      "    cap_add:\n\
+       \x20     - NET_ADMIN\n",
+    );
+    for cap in extra_caps {
+      let _ = writeln!(out, "      - {cap}");
+    }
+    if !self.ports.is_empty() || !self.expose.is_empty() {
+      out.push_str("    ports:\n");
+      for port in &self.ports {
+        // Same port both sides: the fwd sidecar holds the netns's own bridge
+        // address for each exposed agent listener, and a stable host binding
+        // names it instead of the changing bridge IP. Fixed at create:
+        // applying a change takes a restart.
+        let _ = writeln!(out, "      - \"127.0.0.1:{port}:{port}\"");
+      }
+      for map in &self.expose {
+        // Distinct host port onto a container port: the `arkham expose`
+        // allocation so workspaces sharing one host never bind the same host
+        // port twice. Same restart rule as `ports`.
+        let _ = writeln!(out, "      - \"127.0.0.1:{}:{}\"", map.host, map.port);
+      }
+    }
+    // `/etc/hosts` is per container, so the agent service renders the same
+    // block: the agent resolves the name, arkham dials the upstream.
+    // `host.docker.internal` always points at the host gateway — generation
+    // is Linux-only, so no platform branch; an explicitly stated gateway is
+    // not repeated.
+    out.push_str("    extra_hosts:\n");
+    for entry in self.effective_extra_hosts() {
+      let _ = writeln!(out, "      - \"{entry}\"");
+    }
+    if !self.networks.is_empty() {
+      // The agent rides this service's network namespace, so it inherits
+      // every network joined here — including DNS for their containers.
+      out.push_str("    networks:\n");
+      for network in &self.networks {
+        let _ = writeln!(out, "      - \"{network}\"");
+      }
+    }
+    out.push_str(
+      "    stop_grace_period: 1s\n\
+       \x20   volumes:\n",
+    );
+    for mount in &self.mounts {
+      let mode = if mount.ro { "ro" } else { "rw" };
+      let _ = writeln!(out, "      - {}:{}:{mode}", mount.host.display(), mount.container.display());
+    }
+    let _ = writeln!(
+      out,
+      "      - {}:/certs/ca.pem",
+      config_dir()
+        .unwrap_or_else(|| Path::new("~/.config/arkham").to_path_buf())
+        .join("ca.pem")
+        .display()
+    );
+    for mount in &self.fnox.mounts {
+      let _ = writeln!(out, "      - {}:{}:ro", mount.host.display(), mount.container.display());
+    }
+    for mount in &self.grants_mounts {
+      let _ = writeln!(out, "      - {}:{}:ro", mount.host.display(), mount.container.display());
+      // The grant layer is the container's global config, mounted at the
+      // standard path rather than named by ARKHAM_CONFIG: config discovery
+      // derives `rules.d` from the config file's directory, so the env would
+      // point that at /arkham/grants and hide the host's global rules.d mount.
+      let _ = writeln!(
+        out,
+        "      - {}:/root/.config/arkham/config.toml:ro",
+        mount.host.join("arkham.toml").display()
+      );
+    }
+    out.push_str(&self.agent_service());
+    out.push_str(&self.fwd_service());
+    if !self.networks.is_empty() {
+      // Joined networks are existing ones (a sidecar's project network, e.g.
+      // headroom's): arkham creates none of them, so every one is external.
+      out.push_str("networks:\n");
+      for network in &self.networks {
+        let _ = writeln!(out, "  \"{network}\":\n    external: true");
+      }
+    }
+    out
+  }
+  /// Host entries both services render: `host.docker.internal` always points
+  /// at the host gateway, then the configured extras. An explicitly stated
+  /// gateway (either separator) is not repeated.
+  fn effective_extra_hosts(&self) -> Vec<&str> {
+    let mut hosts = vec!["host.docker.internal:host-gateway"];
+    for entry in &self.extra_hosts {
+      let stated_gateway = entry
+        .split_once([':', '='])
+        .is_some_and(|(host, target)| host.trim() == "host.docker.internal" && target.trim() == "host-gateway");
+      if !stated_gateway {
+        hosts.push(entry);
+      }
+    }
+    hosts
+  }
+
+  /// The agent service: it shares arkham's network namespace and holds decoys
+  /// only, plus the backend's cgroup placement when the capture needs one. The
+  /// hooks only capture processes inside the cgroup they attach to, so this
+  /// service lands in it and arkham stays outside.
+  fn agent_service(&self) -> String {
+    let cgroup = match self.backend {
+      ProxyBackend::Ebpf => format!(
+        "    # Both services sit in this cgroup and arkham attaches to it: the hooks\n\
+       \x20   # capture what is inside, and arkham's own sockets are skipped by\n\
+       \x20   # the recorded proxy PID.\n\
+       \x20   cgroup_parent: arkham-{}.slice\n",
+        self.project
+      ),
+      ProxyBackend::Tun | ProxyBackend::Tproxy | ProxyBackend::None => String::new(),
+    };
+    let caps = std::iter::once("SYS_CHROOT")
+      .chain(["AUDIT_WRITE", "NET_ADMIN", "SETUID", "SETGID", "SYS_ADMIN"])
+      .chain(self.agent.cap_add.iter().map(String::as_str))
+      .collect::<Vec<_>>()
+      .join(", ");
+    let devices = std::iter::once("/dev/net/tun")
+      .chain(self.agent.devices.iter().map(String::as_str))
+      .collect::<Vec<_>>()
+      .join(", ");
+    let build = self
+      .agent
+      .build
+      .as_ref()
+      .map(|build| {
+        format!(
+          "    build:\n      context: {}\n      dockerfile: {}\n",
+          build.context.display(),
+          build.dockerfile.display()
+        )
+      })
+      .unwrap_or_default();
+    let mut out = String::new();
+    let _ = write!(
+      out,
+      "\n\
+     \x20 agent:\n\
+     \x20   image: {image}\n\
+      {build}\
+     \x20   # The agent runs containers of its own, which is what the widened\n\
+     \x20   # privileges are for: inner containers mount, chroot and raise their\n\
+     \x20   # own networking, so seccomp/systempaths/apparmor are unconfined and\n\
+     \x20   # SYS_ADMIN is granted. apparmor=unconfined is what Ubuntu's default\n\
+     \x20   # profile requires and is inert where AppArmor is not loaded.\n\
+     \x20   # systempaths=unconfined is podman-only: drop it under docker.\n\
+     \x20   security_opt: [seccomp=unconfined, systempaths=unconfined, apparmor=unconfined]\n\
+     \x20   cap_add: [{caps}]\n\
+     \x20   devices: [{devices}]\n\
+     {cgroup}\
+     \x20   # docker-init (tini) as pid 1: signal handling and child reaping\n\
+     \x20   # for the long-running shells this container hosts\n\
+     \x20   init: true\n\
+     \x20   user: \"{uid}\"\n\
+     \x20   working_dir: \"{root}\"\n\
+     \x20   entrypoint: [\"{home}/.config/arkham/agent-entrypoint.sh\"]\n\
+     \x20   command: [\"sleep\", \"infinity\"]\n\
+     \x20   environment:\n\
+     \x20     # The entrypoint installs the CA into the system store. Node and\n\
+     \x20     # Python's requests read their own bundle, so point them at it.\n\
+     \x20     NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt\n\
+     \x20     REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt\n\
+     \x20     # decoys — one per declared rule, swapped by arkham on grant match\n",
+      root = self.agent.root.display(),
+      home = self.agent.home,
+      uid = self.agent.uid,
+      image = self.agent.image,
+      build = build,
+    );
+    self.agent_service_tail(&mut out);
+    out
+  }
+
+  /// The agent service's environment and volumes: init chain, decoys,
+  /// passthrough interpolation, and every mount layer with the entrypoint,
+  /// CA, and inner container storage last.
+  fn agent_service_tail(&self, out: &mut String) {
+    if self.backend == ProxyBackend::Ebpf {
+      // Where the entrypoint publishes podman subnets for arkham's bypass
+      // list; the entrypoint only activates when this is set.
+      let _ = writeln!(out, "      ARKHAM_EBPF_BYPASS_FILE: {BYPASS_CONTAINER_PATH}");
+    }
+    if let Some(init) = &self.init {
+      let _ = writeln!(out, "      ARKHAM_INIT: \"{init}\"");
+    }
+    for decoy in &self.decoys {
+      let _ = writeln!(out, "      {}: \"{}\"", decoy.env, decoy.value);
+    }
+    if !self.passthrough.is_empty() {
+      out.push_str("      # passthrough — compose interpolates these from the host at `up`, never baked\n");
+    }
+    for name in &self.passthrough {
+      // Single `$`: compose substitutes the host value when the stack starts,
+      // so the file holds no secret and values stay fresh without regenerating.
+      let _ = writeln!(out, "      {name}: \"${{{name}}}\"");
+    }
+    // No `extra_hosts` here: the daemon rejects custom host-to-IP mappings
+    // on a service joined by `network_mode`. The arkham service owns the
+    // namespace and its mappings; the agent shares that namespace.
+    out.push_str("    volumes:\n");
+    for mount in self
+      .mounts
+      .iter()
+      .chain(&self.file_mounts)
+      .chain(&self.tool_mounts)
+      .chain(&self.guest)
+    {
+      let mode = if mount.ro { "ro" } else { "rw" };
+      let _ = writeln!(out, "      - {}:{}:{mode}", mount.host.display(), mount.container.display());
+    }
+    let cfg_dir = config_dir();
+    let entrypoint_host = cfg_dir
+      .as_deref()
+      .unwrap_or_else(|| Path::new("~/.config/arkham"))
+      .join("agent-entrypoint.sh");
+    let ca_crt_host = cfg_dir.as_deref().unwrap_or_else(|| Path::new("~/.config/arkham")).join("ca.crt");
+    let _ = write!(
+      out,
+      "      - {}:{home}/.config/arkham/agent-entrypoint.sh:ro\n\
+     \x20     - {}:/usr/local/share/ca-certificates/arkham-ca.crt:ro\n\
+     \x20     # Inner container storage. Made at generation time under this\n\
+     \x20     # workspace's state directory, owned by the user that runs the\n\
+     \x20     # agent: a bind source the runtime creates itself is root-owned,\n\
+     \x20     # and podman inside then dies without a word. A named volume needs\n\
+     \x20     # the same ownership once, by hand.\n\
+     \x20     - {storage}:{home}/.local/share/containers\n\
+     \x20   network_mode: \"service:arkham\"\n",
+      entrypoint_host.display(),
+      ca_crt_host.display(),
+      home = self.agent.home,
+      storage = self.agent.storage.display()
+    );
+  }
+  /// The exposure sidecar: arkham's netns to see every listener of the shared
+  /// namespace, the agent's PID namespace so only agent-owned processes can
+  /// ever be attributed a listener — arkham's capture and explicit-proxy
+  /// listeners and docker's embedded DNS are structurally unattributable
+  /// from here and are never forwarded. The arkham image runs it because the
+  /// sidecar needs no image of its own and no payload inspection: `arkham
+  /// fwd` relays raw bytes.
+  fn fwd_service(&self) -> String {
+    let mut out = String::new();
+    let _ = write!(
+      out,
+      "\n\
+     \x20 fwd:\n\
+     \x20   image: ghcr.io/casualjim/arkham:{version}\n\
+     \x20   command: [\"fwd\"]\n\
+     \x20   # Shares the netns and the agent's PID namespace; publishing is on\n\
+     \x20   # the arkham service, and anything else it could reach is bound to\n\
+     \x20   # the netns itself. Never a PID namespace shared with arkham: the\n\
+     \x20   # agent holds the decoys, arkham the real secrets.\n\
+     \x20   network_mode: \"service:arkham\"\n\
+     \x20   pid: \"service:agent\"\n",
+      version = self.arkham_version
+    );
+    out
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::decoys::{Decoy, uncovered_names, uncovered_warning, validate_passthrough};
+  use crate::mounts::Layout;
+  use arkham_config::config::{HostTlsCfg, IfMissing, RuleCfg};
+  use arkham_config::grants::GuestTlsMode;
+  use arkham_pki::ca::CertAuthority;
+  use std::collections::{BTreeMap, BTreeSet};
+  use std::fs;
+  use std::path::PathBuf;
+
+  fn mtls_rule(guest_cert: Option<&str>, guest_key: Option<&str>) -> BTreeMap<String, RuleCfg> {
+    let mut tls = BTreeMap::new();
+    tls.insert(
+      "https://api.github.com".to_string(),
+      HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::Mtls,
+        guest_cert: guest_cert.map(PathBuf::from),
+        guest_key: guest_key.map(PathBuf::from),
+      },
+    );
+    let rule = RuleCfg {
+      env: "GITHUB_TOKEN".into(),
+      value: None,
+      real: None,
+      fnox_key: None,
+      allow: vec!["https://api.github.com".to_string()],
+      pattern: None,
+      registry: None,
+      oauth2: None,
+      tls,
+      ssh: BTreeMap::new(),
+      if_missing: IfMissing::default(),
+    };
+    let mut rules = BTreeMap::new();
+    rules.insert("github".to_string(), rule);
+    rules
+  }
+
+  /// One minted pair per rule, mounted read-only at the declared container
+  /// paths, and the second call is a no-op: the pair on disk is kept.
+  #[test]
+  fn guest_identity_mounts_declared_paths_and_keeps_an_existing_pair() {
+    let ca = CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path(), "/root".to_string(), None);
+    let guests = dir.path().join("guests");
+    let rules = mtls_rule(Some("/safe/cert.pem"), Some("/safe/cert.key"));
+    let mounts = layout.guest_identity_mounts(&rules, &ca, &guests).unwrap();
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].container, PathBuf::from("/safe/cert.pem"));
+    assert_eq!(mounts[1].container, PathBuf::from("/safe/cert.key"));
+    assert!(mounts.iter().all(|mount| mount.ro));
+    assert!(mounts[0].host.is_file() && mounts[1].host.is_file());
+    let cert_before = fs::read(&mounts[0].host).unwrap();
+    let again = layout.guest_identity_mounts(&rules, &ca, &guests).unwrap();
+    assert_eq!(again[0].host, mounts[0].host);
+    assert_eq!(fs::read(&mounts[0].host).unwrap(), cert_before);
+  }
+
+  /// An entry that declares no container paths gets the per-rule default
+  /// under the agent's home.
+  #[test]
+  fn guest_identity_defaults_the_container_paths_when_none_declared() {
+    let ca = CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path(), "/root".to_string(), None);
+    let rules = mtls_rule(None, None);
+    let mounts = layout.guest_identity_mounts(&rules, &ca, &dir.path().join("guests")).unwrap();
+    assert_eq!(mounts[0].container, PathBuf::from("/root/.config/arkham/guest/github.pem"));
+    assert_eq!(mounts[1].container, PathBuf::from("/root/.config/arkham/guest/github.key"));
+  }
+
+  /// A passthrough name that is also a rule env or a decoy fails, naming
+  /// the name; disjoint names pass.
+  #[test]
+  fn passthrough_overlapping_a_rule_or_decoy_fails() {
+    let rules = mtls_rule(None, None);
+    let decoys = vec![Decoy {
+      env: "ANTHROPIC_API_KEY".to_string(),
+      value: "decoy".to_string(),
+    }];
+    let error = validate_passthrough(&rules, &[], &["GITHUB_TOKEN".to_string()])
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("GITHUB_TOKEN"), "{error}");
+    let error = validate_passthrough(&rules, &decoys, &["ANTHROPIC_API_KEY".to_string()])
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("ANTHROPIC_API_KEY"), "{error}");
+    validate_passthrough(&rules, &decoys, &["DISPLAY".to_string()]).unwrap();
+  }
+
+  /// Uncovered keeps declared names minus selection, passthrough, and
+  /// fnox's own wiring; the warning sorts and names them with a fix.
+  #[test]
+  fn uncovered_diff_excludes_selected_passthrough_and_fnox_wiring() {
+    let declared = BTreeSet::from([
+      "GITHUB_TOKEN".to_string(),
+      "WAYLAND_DISPLAY".to_string(),
+      "DISPLAY".to_string(),
+      "FNOX_PROFILE".to_string(),
+    ]);
+    let uncovered = uncovered_names(&declared, &["GITHUB_TOKEN".to_string()], &["WAYLAND_DISPLAY".to_string()]);
+    assert_eq!(uncovered, vec!["DISPLAY".to_string()]);
+    let warning = uncovered_warning(&["B".to_string(), "A".to_string()]).unwrap();
+    assert!(warning.contains("A, B"), "{warning}");
+    assert!(warning.contains("[workspace] passthrough"), "{warning}");
+    assert_eq!(uncovered_warning(&[]), None);
+  }
+}

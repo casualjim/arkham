@@ -15,6 +15,6 @@ FROM ghcr.io/casualjim/bare:libcxx-udev-ssl
 # hadolint ignore=DL3002,DL3066
 USER root
 ARG BIN_DIR=.
-COPY ${BIN_DIR}/hodor /usr/local/bin/hodor
-ENTRYPOINT ["hodor"]
+COPY ${BIN_DIR}/arkham /usr/local/bin/arkham
+ENTRYPOINT ["arkham"]
 CMD ["serve"]

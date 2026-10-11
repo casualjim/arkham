@@ -38,7 +38,7 @@ Cover these 10 areas; skip none silently, mark clean ones clean with one line of
 
 ### 1. Crate roles and dependency directions
 
-Face `hodor` calls libraries; libraries never call the face. `hodor-config` and `hodor-pki` are leaves. `hodor-fnox` and `hodor-plugin` depend on `hodor-config` only. `hodor-proxy` owns substitution and may depend on config, pki, plugin only. Backends depend on proxy; proxy never imports a backend. `hodor-compose` never imports proxy, plugin, or backends. `hodor-ebpf-programs` is isolated (`aya-ebpf` only).
+Face `arkham` calls libraries; libraries never call the face. `arkham-config` and `arkham-pki` are leaves. `arkham-fnox` and `arkham-plugin` depend on `arkham-config` only. `arkham-proxy` owns substitution and may depend on config, pki, plugin only. Backends depend on proxy; proxy never imports a backend. `arkham-compose` never imports proxy, plugin, or backends. `arkham-ebpf-programs` is isolated (`aya-ebpf` only).
 
 Hard violations: a new workspace dep outside the allowed table; proxy importing a backend; compose importing proxy; plugin importing proxy or fnox; any crate importing the binary.
 
@@ -56,13 +56,13 @@ Hard violations: any of the above in `src/` or `crates/*/src/` outside `#[cfg(te
 
 ### 4. Validate once
 
-Grants parse once in `hodor-config`; secrets resolve once in `hodor-fnox`; the proxy trusts typed values. No second grant parser, host matcher, SNI parser, address codec, or credential check anywhere else.
+Grants parse once in `arkham-config`; secrets resolve once in `arkham-fnox`; the proxy trusts typed values. No second grant parser, host matcher, SNI parser, address codec, or credential check anywhere else.
 
 Flag: a second `uri_match`-shaped function, a second ClientHello parse, a second addr/port codec, validation repeated at the face or in a backend.
 
 ### 5. Config ownership
 
-Only the face loads files/env via `hodor-config::config::load`; libraries take typed settings. Subcommands are enum variants with `run` methods, never new binaries. CLI/env-only flags never enter files.
+Only the face loads files/env via `arkham-config::config::load`; libraries take typed settings. Subcommands are enum variants with `run` methods, never new binaries. CLI/env-only flags never enter files.
 
 Flag: `std::env` or file reads outside config/face, a new binary target for a subcommand, a CLI-only flag persisted into TOML.
 
@@ -72,9 +72,9 @@ One `Error` plus one `Result<T>` at each library crate root; children import fro
 
 Hard violations: a second error enum or module-local `Result` alias, `eyre` in a library crate, a stringly variant, a `map_err` that stringifies the source.
 
-### 7. Hodor gates
+### 7. Arkham gates
 
-Substitution lives only in `hodor-proxy` behind `serve_candidate_stream`; grant gating lives only in `hodor-config`; leaf issue and rotation live only in `hodor-pki`; guest failures close to `Verdict::Close`. BPF map structs stay `repr(C)` byte-explicit behind the single byte-order helpers; every host-wide command keeps `--exclude hodor-ebpf-programs`; no workspace-hack crate.
+Substitution lives only in `arkham-proxy` behind `serve_candidate_stream`; grant gating lives only in `arkham-config`; leaf issue and rotation live only in `arkham-pki`; guest failures close to `Verdict::Close`. BPF map structs stay `repr(C)` byte-explicit behind the single byte-order helpers; every host-wide command keeps `--exclude arkham-ebpf-programs`; no workspace-hack crate.
 
 Flag: a swap outside `wire/*`, a forward path that bypasses redaction, implicit padding in a map struct, a host command missing the ebpf-programs exclusion, a new hack crate.
 
@@ -86,7 +86,7 @@ Hard violations: any `allow` attribute, undocumented `pub` item, debug print lef
 
 ### Accepted exceptions
 
-- `hodor-ebpf-programs` does not inherit workspace lints: `aya-ebpf` macros emit undocumented wrappers no annotation can satisfy.
+- `arkham-ebpf-programs` does not inherit workspace lints: `aya-ebpf` macros emit undocumented wrappers no annotation can satisfy.
 - Poisoned-lock recovery via `.unwrap_or_else(PoisonError::into_inner)`: the lock state, not program logic, is unrecoverable.
 - `const`-evaluation failure at compile time: fails the build, never production.
 - `unwrap`/`expect` in `#[cfg(test)]`, benches, build scripts, `examples/`: test-only paths.
@@ -109,7 +109,7 @@ Grep these before judging:
 - banned vocabulary (`seam`, `spine`, `streak`, `pillar`, `load-bearing`, `birth`, `born`) in comments, docs, names, or strings
 - `unwrap(` / `expect(` outside tests, benches, build scripts, examples
 - `[` indexing / slicing on untrusted or variable-length input without `get`
-- `eyre` outside the `hodor` binary edge
+- `eyre` outside the `arkham` binary edge
 - second error enums or module-local `Result` aliases
 - `&String` / `&Vec` / `&PathBuf` in public APIs
 - `allow(` suppressions of any shape

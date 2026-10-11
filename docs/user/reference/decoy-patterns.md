@@ -10,7 +10,7 @@ How decoy shapes are written and chosen. A decoy is deterministic for its env na
 | `{d:N}` | N decimal digits. |
 | `{base62:N}` | N characters from `[0-9a-zA-Z]`. |
 
-N is greater than zero. Literal text passes through, so a pattern can carry any prefix. Any other verb is rejected at startup or, for `hodor fake --pattern`, at invocation.
+N is greater than zero. Literal text passes through, so a pattern can carry any prefix. Any other verb is rejected at startup or, for `arkham fake --pattern`, at invocation.
 
 The default pattern, when neither the rule nor the registry supplies one, is `{hex:32}`.
 
@@ -33,13 +33,13 @@ Across files, a later load's pattern overrides an earlier one regardless of tier
 ## Previewing
 
 ```sh
-hodor fake DEMO_TOKEN
+arkham fake DEMO_TOKEN
 # fd0c437df7ae3abca3e37d89840b4503
 
-hodor fake GH_TOKEN
+arkham fake GH_TOKEN
 # ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142
 
-hodor fake GH_TOKEN --pattern 'acme_{base62:24}'
+arkham fake GH_TOKEN --pattern 'acme_{base62:24}'
 # acme_yEXyMj1JqiTfFyxNXaoXx6n2
 ```
 

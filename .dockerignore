@@ -6,4 +6,4 @@
 /target/*
 !/target/release
 /target/release/*
-!/target/release/hodor
+!/target/release/arkham

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot PKI for the demo: a throwaway CA plus one leaf for the api
-# service (SAN DNS:api). hodor loads ca.pem (cert + PKCS#8 key), verifies
+# service (SAN DNS:api). arkham loads ca.pem (cert + PKCS#8 key), verifies
 # the api leaf as its upstream TLS peer, and mints MITM leaves from the
 # same key. The client trusts ca.crt only.
 set -euo pipefail
@@ -9,7 +9,7 @@ dir=${1:-/certs}
 
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/ca.key"
 openssl req -new -x509 -key "$dir/ca.key" -out "$dir/ca.crt" -days 2 \
-  -subj "/CN=hodor demo CA" \
+  -subj "/CN=arkham demo CA" \
   -addext "basicConstraints=critical,CA:TRUE" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"
 
@@ -31,15 +31,15 @@ openssl x509 -req -in "$dir/pg.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
 cat "$dir/ca.crt" "$dir/ca.key" >"$dir/ca.pem"
 chmod 600 "$dir/ca.key" "$dir/ca.pem"
 
-# SSH legs. hodor's host key is the one the agent's ssh verifies; the
-# identity is what hodor presents upstream (its public half is the sshd's
+# SSH legs. arkham's host key is the one the agent's ssh verifies; the
+# identity is what arkham presents upstream (its public half is the sshd's
 # authorized key); the decoy is the only private key that ever mounts into
 # the client. No pins: both sides run ssh's own accept-new.
 mkdir -p "$dir/ssh"
-rm -f "$dir/ssh/hodor_host" "$dir/ssh/hodor_host.pub" "$dir/ssh/identity" "$dir/ssh/identity.pub" "$dir/ssh/decoy" "$dir/ssh/decoy.pub"
-ssh-keygen -q -t ed25519 -N "" -C hodor-guest-host -f "$dir/ssh/hodor_host"
+rm -f "$dir/ssh/arkham_host" "$dir/ssh/arkham_host.pub" "$dir/ssh/identity" "$dir/ssh/identity.pub" "$dir/ssh/decoy" "$dir/ssh/decoy.pub"
+ssh-keygen -q -t ed25519 -N "" -C arkham-guest-host -f "$dir/ssh/arkham_host"
 ssh-keygen -q -t ed25519 -N "" -C demo-real-identity -f "$dir/ssh/identity"
 ssh-keygen -q -t ed25519 -N "" -C demo-decoy -f "$dir/ssh/decoy"
 cp "$dir/ssh/identity.pub" "$dir/ssh/authorized_keys"
-chmod 600 "$dir/ssh/identity" "$dir/ssh/decoy" "$dir/ssh/hodor_host"
+chmod 600 "$dir/ssh/identity" "$dir/ssh/decoy" "$dir/ssh/arkham_host"
 echo "certs ready in $dir"

@@ -25,16 +25,16 @@ Higher rule wins.
 
 ### Module map (workspace: `crates/*` + root binary `src/main.rs`)
 - `src/main.rs` = clap dispatch, backend selection, and the `with_capture` fail-closed helper; no proxy logic
-- `crates/hodor-config/src/cli.rs` = the clap types (`Cli`, `ServeArgs`, `ProxyBackend`)
-- `crates/hodor-config/src/config.rs` = confique 4-layer overlay (CLI > env `HODOR_*` > project `<root>/.config/hodor.toml` > global) + deterministic `fake_for`/`PATTERNS`; owns runtime config
-- `crates/hodor-config/src/grants.rs` = `scheme://host[:port]` grant model (`http`/`https`/`tcp`; tcp needs port; exact/`*.`-wildcard/`*`, ASCII case-insensitive) + `intercept_candidate` splice-vs-MITM gate
-- `crates/hodor-config/src/registry.rs` + `crates/hodor-fnox/` = host registry and fnox value resolution
-- `crates/hodor-proxy/src/lib.rs`, `relay.rs`, `sniff.rs` = explicit-proxy core (`serve`/`handle_conn`/`handle_connect`, `sniff_stream`, `mitm_tls_stream`, `relay_guarded`); `ProxyState` behind plain `Arc` (write-once, no reload)
-- `crates/hodor-proxy/src/substitute/` = substitution engine (`h1.rs` `SecretsMachine`, `h2.rs` `H2Machine` HPACK walker, `mod.rs` shared scan/replace); framing uncertainty degrades to opaque scan-and-forward, never blocks
-- `crates/hodor-pki/` = CA + per-domain leaf cache (`ca.rs`); hand-rolled ClientHello parse (`sni.rs`, `MAX_HELLO` 16K)
-- `crates/hodor-tproxy/`, `crates/hodor-tun/`, `crates/hodor-ebpf/` = the three capture backends; all reuse `serve_candidate_stream`
-- `crates/hodor-ebpf-programs/` = the no_std BPF programs; its map structs are a byte-level ABI with `crates/hodor-ebpf/src/lib.rs`, so every field including padding must be explicit on both sides
-- `crates/hodor-compose/` = compose stack generation
+- `crates/arkham-config/src/cli.rs` = the clap types (`Cli`, `ServeArgs`, `ProxyBackend`)
+- `crates/arkham-config/src/config.rs` = confique 4-layer overlay (CLI > env `ARKHAM_*` > project `<root>/.config/arkham.toml` > global) + deterministic `fake_for`/`PATTERNS`; owns runtime config
+- `crates/arkham-config/src/grants.rs` = `scheme://host[:port]` grant model (`http`/`https`/`tcp`; tcp needs port; exact/`*.`-wildcard/`*`, ASCII case-insensitive) + `intercept_candidate` splice-vs-MITM gate
+- `crates/arkham-config/src/registry.rs` + `crates/arkham-fnox/` = host registry and fnox value resolution
+- `crates/arkham-proxy/src/lib.rs`, `relay.rs`, `sniff.rs` = explicit-proxy core (`serve`/`handle_conn`/`handle_connect`, `sniff_stream`, `mitm_tls_stream`, `relay_guarded`); `ProxyState` behind plain `Arc` (write-once, no reload)
+- `crates/arkham-proxy/src/substitute/` = substitution engine (`h1.rs` `SecretsMachine`, `h2.rs` `H2Machine` HPACK walker, `mod.rs` shared scan/replace); framing uncertainty degrades to opaque scan-and-forward, never blocks
+- `crates/arkham-pki/` = CA + per-domain leaf cache (`ca.rs`); hand-rolled ClientHello parse (`sni.rs`, `MAX_HELLO` 16K)
+- `crates/arkham-tproxy/`, `crates/arkham-tun/`, `crates/arkham-ebpf/` = the three capture backends; all reuse `serve_candidate_stream`
+- `crates/arkham-ebpf-programs/` = the no_std BPF programs; its map structs are a byte-level ABI with `crates/arkham-ebpf/src/lib.rs`, so every field including padding must be explicit on both sides
+- `crates/arkham-compose/` = compose stack generation
 - flag logic in the wrong module (grant matching outside `grants.rs`, config parsing outside `config.rs`, substitution outside `substitute/`)
 
 ### Fail-closed MITM discipline non-negotiable
@@ -63,13 +63,13 @@ Flag:
 - cross-protocol redaction gaps (H1 redacts, H2 does not, or vice versa) without explicit sign-off
 
 ### Validate once
-- `hodor-config/src/config.rs::validate` (+ `validate_pattern`) is the semantic boundary: bad patterns/unknown schemes/ports rejected at load
+- `arkham-config/src/config.rs::validate` (+ `validate_pattern`) is the semantic boundary: bad patterns/unknown schemes/ports rejected at load
 - `grants.rs` parsing trusts typed config; do not repeat config validation defensively downstream
 - `proxy.rs`/`substitute.rs`: syntactic per-connection handling only, no re-validation of config
 - flag duplicated validation or normalization after the config boundary
 
 ### Config
-Runtime config loads via confique overlay in `crates/hodor-config/src/config.rs`, wired from `src/main.rs`. `--proxy-backend`/`HODOR_PROXY_BACKEND`, `--tproxy-allow-root-netns`, and `--ebpf-cgroup` are CLI/env only by design. Flag config parsing outside `config.rs`, duplicated overlay logic, or file/env precedence inversions (CLI > env > project > global).
+Runtime config loads via confique overlay in `crates/arkham-config/src/config.rs`, wired from `src/main.rs`. `--proxy-backend`/`ARKHAM_PROXY_BACKEND`, `--tproxy-allow-root-netns`, and `--ebpf-cgroup` are CLI/env only by design. Flag config parsing outside `config.rs`, duplicated overlay logic, or file/env precedence inversions (CLI > env > project > global).
 
 ### Error boundaries
 - `eyre::Result` everywhere with context strings (`bail!`/`ensure!`); no per-module `Error`/`Result` aliases, no `thiserror`

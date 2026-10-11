@@ -1,12 +1,12 @@
-# hodor
+# arkham
 
-Give your coding agent fake credentials that work. hodor is a secure agent environment. Your agent holds only format-valid decoys and works exactly as before. The real secrets stay in fnox. hodor swaps a decoy for the real value transparently, only on hosts you allow, and swaps it back on the response. Protect your secrets without changing how you work.
+Give your coding agent fake credentials that work. arkham is a secure agent environment. Your agent holds only format-valid decoys and works exactly as before. The real secrets stay in fnox. arkham swaps a decoy for the real value transparently, only on hosts you allow, and swaps it back on the response. Protect your secrets without changing how you work.
 
 A leaked prompt, a pasted log, or a dependency that phones home carries the decoy. The upstream rejects it everywhere except the grant. The real value appears on the wire only to a host you named.
 
-One command drops you into that environment. `hodor agent` starts the stack and opens a shell in a container that holds only decoys. Every connection is captured transparently, so there is no proxy setting to find and no way around the proxy.
+One command drops you into that environment. `arkham agent` starts the stack and opens a shell in a container that holds only decoys. Every connection is captured transparently, so there is no proxy setting to find and no way around the proxy.
 
-Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at hodor, or hodor can capture its traffic with `--proxy-backend` (`tproxy`, `tun`, or `ebpf`). On a grant match hodor terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
+Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at arkham, or arkham can capture its traffic with `--proxy-backend` (`tproxy`, `tun`, or `ebpf`). On a grant match arkham terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
 
 ## Protocols
 
@@ -24,28 +24,28 @@ Underneath sits a grant-scoped proxy. A workload can also point its proxy settin
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/casualjim/hodor/releases/latest/download/hodor-installer.sh | sh
+  https://github.com/casualjim/arkham/releases/latest/download/arkham-installer.sh | sh
 ```
 
 **With mise**, which installs the release tarball for your platform:
 
 ```sh
-mise use -g github:casualjim/hodor
+mise use -g github:casualjim/arkham
 ```
 
-Or download a tarball from [the releases page](https://github.com/casualjim/hodor/releases) and put `hodor` on your `PATH`.
+Or download a tarball from [the releases page](https://github.com/casualjim/arkham/releases) and put `arkham` on your `PATH`.
 
-**As a container**: `ghcr.io/casualjim/hodor`. The image is runtime-only, entrypoint `hodor`, default command `serve`.
+**As a container**: `ghcr.io/casualjim/arkham`. The image is runtime-only, entrypoint `arkham`, default command `serve`.
 
 ```sh
-docker run --rm ghcr.io/casualjim/hodor:latest fake GH_TOKEN
+docker run --rm ghcr.io/casualjim/arkham:latest fake GH_TOKEN
 ```
 
 **From source**: clone, then build with a recent stable Rust toolchain (the crate uses edition 2024; all three Linux capture backends compile in unconditionally):
 
 ```sh
-git clone https://github.com/casualjim/hodor
-cd hodor
+git clone https://github.com/casualjim/arkham
+cd arkham
 cargo build --release
 ```
 
@@ -53,24 +53,24 @@ The `ebpf` backend additionally needs a nightly toolchain (the BPF target has no
 
 ## Try it in 30 seconds
 
-You need docker and your secrets in fnox. Install hodor, name your source directories once, then step into any workspace as a secure agent.
+You need docker and your secrets in fnox. Install arkham, name your source directories once, then step into any workspace as a secure agent.
 
 ```sh
-mise use -g github:casualjim/hodor
-mkdir -p ~/.config/hodor
-cat > ~/.config/hodor/config.toml <<'EOF'
+mise use -g github:casualjim/arkham
+mkdir -p ~/.config/arkham
+cat > ~/.config/arkham/config.toml <<'EOF'
 [workspace]
 # source directories you want beside your workspace
 include = ["~/projects"]
 EOF
 
 cd ~/projects/my-awesome-thing
-hodor agent
+arkham agent
 # do work, exit the agent
-hodor down
+arkham down
 ```
 
-Container home, shell, listener, and CA all default, so that file is the whole setup. `hodor agent` generates the stack, starts it, and drops you into the agent. The agent holds only decoys. Real values stay in fnox and reach only granted hosts. `hodor down` stops the devenv.
+Container home, shell, listener, and CA all default, so that file is the whole setup. `arkham agent` generates the stack, starts it, and drops you into the agent. The agent holds only decoys. Real values stay in fnox and reach only granted hosts. `arkham down` stops the devenv.
 
 To see the raw credential swap from both sides of the wire, follow the [tutorial](docs/user/tutorial.md).
 
@@ -82,16 +82,16 @@ env = "GITHUB_TOKEN"          # decoy seed, registry key, fnox key
 allow = ["https://api.github.com"]
 ```
 
-That file is the whole config. The listener defaults to `127.0.0.1:8080` and the CA to `/certs/ca.pem` when the stack mounted it there, else `<config-dir>/hodor/ca.pem`. Start the proxy, hand your agent its decoy, and the rule is live:
+That file is the whole config. The listener defaults to `127.0.0.1:8080` and the CA to `/certs/ca.pem` when the stack mounted it there, else `<config-dir>/arkham/ca.pem`. Start the proxy, hand your agent its decoy, and the rule is live:
 
 ```sh
-hodor serve
-hodor fake GITHUB_TOKEN    # the value the agent holds
+arkham serve
+arkham fake GITHUB_TOKEN    # the value the agent holds
 ```
 
 `env = "GITHUB_TOKEN"` alone is a complete rule when the bundled known-host registry knows the name: the registry supplies the hosts and the decoy shape, and [fnox](https://fnox.jdx.dev) supplies the real value at serve time (age, 1Password, Vault, Bitwarden, AWS Secrets Manager, the OS keychain, and the rest of its provider catalog; no fnox binary needed). Most workspaces state no rules at all: every fnox-declared name the registry knows becomes a rule at serve time, and config holds overrides only.
 
-When the registry entry declares the service's OAuth2 flow, freshly issued tokens are covered too: the proxy rewrites the token endpoint's response so the agent holds a minted decoy, and swaps it back on every later request. `hodor registry from-oidc` / `from-openapi` turn a vendor's discovery or OpenAPI document into that entry.
+When the registry entry declares the service's OAuth2 flow, freshly issued tokens are covered too: the proxy rewrites the token endpoint's response so the agent holds a minted decoy, and swaps it back on every later request. `arkham registry from-oidc` / `from-openapi` turn a vendor's discovery or OpenAPI document into that entry.
 
 ## Documentation
 
@@ -101,16 +101,16 @@ Everything lives under [docs/user](docs/user/README.md), arranged by what you ne
 - [Tutorial](docs/user/tutorial.md) — one credential swap through the raw proxy, end to end, both sides of the wire.
 - How-to guides — [capture traffic transparently](docs/user/how-to/capture-traffic-transparently.md), [get values from fnox](docs/user/how-to/get-values-from-fnox.md), [extend the registry](docs/user/how-to/extend-the-registry.md), [trust the CA](docs/user/how-to/trust-the-ca.md).
 - Reference — [CLI](docs/user/reference/cli.md), [configuration](docs/user/reference/configuration.md), [allow entries](docs/user/reference/allow-entries.md), [decoy patterns](docs/user/reference/decoy-patterns.md), [registry](docs/user/reference/registry.md).
-- Explanation — [how hodor works](docs/user/explanation/how-it-works.md), [the security model](docs/user/explanation/security-model.md) (what it defends against and what it does not).
+- Explanation — [how arkham works](docs/user/explanation/how-it-works.md), [the security model](docs/user/explanation/security-model.md) (what it defends against and what it does not).
 
 Two runnable examples ship in the repository:
 
-- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to secure with `hodor up`: one hodor container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
+- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to secure with `arkham up`: one arkham container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
 - [integration](integration/README.md) — the compose demo behind `mise run demo`, asserting four substitution scenarios and one splice scenario.
 
 ## Where the limits are
 
-hodor matches the request authority, not the path. An agent that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust hodor's CA to reach a granted HTTPS host. Transparent capture needs root and Linux; the `tproxy` backend needs `CAP_NET_ADMIN`, the `tun` backend a TUN device, and the `ebpf` backend `CAP_BPF` + `CAP_NET_ADMIN`, kernel 5.15, and IPv4. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
+arkham matches the request authority, not the path. An agent that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust arkham's CA to reach a granted HTTPS host. Transparent capture needs root and Linux; the `tproxy` backend needs `CAP_NET_ADMIN`, the `tun` backend a TUN device, and the `ebpf` backend `CAP_BPF` + `CAP_NET_ADMIN`, kernel 5.15, and IPv4. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
 
 ## Contributing
 

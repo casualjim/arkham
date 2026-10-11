@@ -1,6 +1,6 @@
 # Bundled registry: environment names, API hosts, and token shapes.
-# Override any entry from <config-dir>/hodor/rules.d/*.toml or
-# <project-root>/.config/hodor/rules.d/*.toml; see README.
+# Override any entry from <config-dir>/arkham/rules.d/*.toml or
+# <project-root>/.config/arkham/rules.d/*.toml; see README.
 #
 # `hosts` are stable API endpoints; a service whose endpoint is per tenant
 # uses the host family its docs state (`https://*.example.com`).
@@ -6325,8 +6325,8 @@ pattern = "vck_{base62:56}"
 # other value. The signing half is an HMAC input that never reaches the wire:
 # each venue's secret names live in a hostless `<venue>-secret` entry, which
 # gives the agent a shape-valid decoy without creating a rule that can never
-# fire. `hodor rules` lists them commented. See
-# https://github.com/casualjim/hodor/issues/19.
+# fire. `arkham rules` lists them commented. See
+# https://github.com/casualjim/arkham/issues/19.
 # Key formats are vendor-specific and mostly undocumented; patterns are generic
 # unless a rule or a vendor page states one.
 # source: ccxt 4.5.78 — each exchange's `urls.api` map
@@ -6924,522 +6924,522 @@ pattern = "{base62:32}"
 [providers.alpaca-secret]
 env = ["ALPACA_API_SECRET", "ALPACA_PRIVATE_KEY", "ALPACA_SECRET", "ALPACA_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.apex-secret]
 env = ["APEX_API_SECRET", "APEX_PRIVATE_KEY", "APEX_SECRET", "APEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.aster-secret]
 env = ["ASTER_API_SECRET", "ASTER_PRIVATE_KEY", "ASTER_SECRET", "ASTER_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.backpack-secret]
 env = ["BACKPACK_API_SECRET", "BACKPACK_PRIVATE_KEY", "BACKPACK_SECRET", "BACKPACK_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bequant-secret]
 env = ["BEQUANT_API_SECRET", "BEQUANT_PRIVATE_KEY", "BEQUANT_SECRET", "BEQUANT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bigone-secret]
 env = ["BIGONE_API_SECRET", "BIGONE_PRIVATE_KEY", "BIGONE_SECRET", "BIGONE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.binance-secret]
 env = ["BINANCE_API_SECRET", "BINANCE_PRIVATE_KEY", "BINANCE_SECRET", "BINANCE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.binancecoinm-secret]
 env = ["BINANCECOINM_API_SECRET", "BINANCECOINM_PRIVATE_KEY", "BINANCECOINM_SECRET", "BINANCECOINM_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.binanceus-secret]
 env = ["BINANCEUS_API_SECRET", "BINANCEUS_PRIVATE_KEY", "BINANCEUS_SECRET", "BINANCEUS_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.binanceusdm-secret]
 env = ["BINANCEUSDM_API_SECRET", "BINANCEUSDM_PRIVATE_KEY", "BINANCEUSDM_SECRET", "BINANCEUSDM_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bingx-secret]
 env = ["BINGX_API_SECRET", "BINGX_PRIVATE_KEY", "BINGX_SECRET", "BINGX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bit2c-secret]
 env = ["BIT2C_API_SECRET", "BIT2C_PRIVATE_KEY", "BIT2C_SECRET", "BIT2C_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitbank-secret]
 env = ["BITBANK_API_SECRET", "BITBANK_PRIVATE_KEY", "BITBANK_SECRET", "BITBANK_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitbns-secret]
 env = ["BITBNS_API_SECRET", "BITBNS_PRIVATE_KEY", "BITBNS_SECRET", "BITBNS_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitfinex-secret]
 env = ["BITFINEX_API_SECRET", "BITFINEX_PRIVATE_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitflyer-secret]
 env = ["BITFLYER_API_SECRET", "BITFLYER_PRIVATE_KEY", "BITFLYER_SECRET", "BITFLYER_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitget-secret]
 env = ["BITGET_API_SECRET", "BITGET_PRIVATE_KEY", "BITGET_SECRET", "BITGET_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bithumb-secret]
 env = ["BITHUMB_API_SECRET", "BITHUMB_PRIVATE_KEY", "BITHUMB_SECRET", "BITHUMB_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitmex-secret]
 env = ["BITMEX_API_SECRET", "BITMEX_PRIVATE_KEY", "BITMEX_SECRET", "BITMEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitopro-secret]
 env = ["BITOPRO_API_SECRET", "BITOPRO_PRIVATE_KEY", "BITOPRO_SECRET", "BITOPRO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitrue-secret]
 env = ["BITRUE_API_SECRET", "BITRUE_PRIVATE_KEY", "BITRUE_SECRET", "BITRUE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitso-secret]
 env = ["BITSO_API_SECRET", "BITSO_PRIVATE_KEY", "BITSO_SECRET", "BITSO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitstamp-secret]
 env = ["BITSTAMP_API_SECRET", "BITSTAMP_PRIVATE_KEY", "BITSTAMP_SECRET", "BITSTAMP_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitteam-secret]
 env = ["BITTEAM_API_SECRET", "BITTEAM_PRIVATE_KEY", "BITTEAM_SECRET", "BITTEAM_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bittrade-secret]
 env = ["BITTRADE_API_SECRET", "BITTRADE_PRIVATE_KEY", "BITTRADE_SECRET", "BITTRADE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bitvavo-secret]
 env = ["BITVAVO_API_SECRET", "BITVAVO_PRIVATE_KEY", "BITVAVO_SECRET", "BITVAVO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.blockchaincom-secret]
 env = ["BLOCKCHAINCOM_API_SECRET", "BLOCKCHAINCOM_PRIVATE_KEY", "BLOCKCHAINCOM_SECRET", "BLOCKCHAINCOM_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.blofin-secret]
 env = ["BLOFIN_API_SECRET", "BLOFIN_PRIVATE_KEY", "BLOFIN_SECRET", "BLOFIN_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.btcbox-secret]
 env = ["BTCBOX_API_SECRET", "BTCBOX_PRIVATE_KEY", "BTCBOX_SECRET", "BTCBOX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.btcmarkets-secret]
 env = ["BTCMARKETS_API_SECRET", "BTCMARKETS_PRIVATE_KEY", "BTCMARKETS_SECRET", "BTCMARKETS_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.btcturk-secret]
 env = ["BTCTURK_API_SECRET", "BTCTURK_PRIVATE_KEY", "BTCTURK_SECRET", "BTCTURK_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.btse-secret]
 env = ["BTSE_API_SECRET", "BTSE_PRIVATE_KEY", "BTSE_SECRET", "BTSE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bullish-secret]
 env = ["BULLISH_API_SECRET", "BULLISH_PRIVATE_KEY", "BULLISH_SECRET", "BULLISH_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bybit-secret]
 env = ["BYBIT_API_SECRET", "BYBIT_PRIVATE_KEY", "BYBIT_SECRET", "BYBIT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bybiteu-secret]
 env = ["BYBITEU_API_SECRET", "BYBITEU_PRIVATE_KEY", "BYBITEU_SECRET", "BYBITEU_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.bydfi-secret]
 env = ["BYDFI_API_SECRET", "BYDFI_PRIVATE_KEY", "BYDFI_SECRET", "BYDFI_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.cex-secret]
 env = ["CEX_API_SECRET", "CEX_PRIVATE_KEY", "CEX_SECRET", "CEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinbase-secret]
 env = ["COINBASE_API_SECRET", "COINBASE_PRIVATE_KEY", "COINBASE_SECRET", "COINBASE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinbaseexchange-secret]
 env = ["COINBASEEXCHANGE_API_SECRET", "COINBASEEXCHANGE_PRIVATE_KEY", "COINBASEEXCHANGE_SECRET", "COINBASEEXCHANGE_SECRET_KEY", "COINBASE_EXCHANGE_API_SECRET"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinbaseinternational-secret]
 env = ["COINBASEINTERNATIONAL_API_SECRET", "COINBASEINTERNATIONAL_PRIVATE_KEY", "COINBASEINTERNATIONAL_SECRET", "COINBASEINTERNATIONAL_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coincheck-secret]
 env = ["COINCHECK_API_SECRET", "COINCHECK_PRIVATE_KEY", "COINCHECK_SECRET", "COINCHECK_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinex-secret]
 env = ["COINEX_API_SECRET", "COINEX_PRIVATE_KEY", "COINEX_SECRET", "COINEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinmate-secret]
 env = ["COINMATE_API_SECRET", "COINMATE_PRIVATE_KEY", "COINMATE_SECRET", "COINMATE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinone-secret]
 env = ["COINONE_API_SECRET", "COINONE_PRIVATE_KEY", "COINONE_SECRET", "COINONE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinsph-secret]
 env = ["COINSPH_API_SECRET", "COINSPH_PRIVATE_KEY", "COINSPH_SECRET", "COINSPH_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinspot-secret]
 env = ["COINSPOT_API_SECRET", "COINSPOT_PRIVATE_KEY", "COINSPOT_SECRET", "COINSPOT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.cryptocom-secret]
 env = ["CRYPTOCOM_API_SECRET", "CRYPTOCOM_PRIVATE_KEY", "CRYPTOCOM_SECRET", "CRYPTOCOM_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.cryptomus-secret]
 env = ["CRYPTOMUS_API_SECRET", "CRYPTOMUS_PRIVATE_KEY", "CRYPTOMUS_SECRET", "CRYPTOMUS_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.deepcoin-secret]
 env = ["DEEPCOIN_API_SECRET", "DEEPCOIN_PRIVATE_KEY", "DEEPCOIN_SECRET", "DEEPCOIN_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.delta-secret]
 env = ["DELTA_API_SECRET", "DELTA_PRIVATE_KEY", "DELTA_SECRET", "DELTA_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.deribit-secret]
 env = ["DERIBIT_API_SECRET", "DERIBIT_PRIVATE_KEY", "DERIBIT_SECRET", "DERIBIT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.derive-secret]
 env = ["DERIVE_API_SECRET", "DERIVE_PRIVATE_KEY", "DERIVE_SECRET", "DERIVE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.digifinex-secret]
 env = ["DIGIFINEX_API_SECRET", "DIGIFINEX_PRIVATE_KEY", "DIGIFINEX_SECRET", "DIGIFINEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.dydx-secret]
 env = ["DYDX_API_SECRET", "DYDX_PRIVATE_KEY", "DYDX_SECRET", "DYDX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.extended-secret]
 env = ["EXTENDED_API_SECRET", "EXTENDED_PRIVATE_KEY", "EXTENDED_SECRET", "EXTENDED_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.fmfwio-secret]
 env = ["FMFWIO_API_SECRET", "FMFWIO_PRIVATE_KEY", "FMFWIO_SECRET", "FMFWIO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.foxbit-secret]
 env = ["FOXBIT_API_SECRET", "FOXBIT_PRIVATE_KEY", "FOXBIT_SECRET", "FOXBIT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.gate-secret]
 env = ["GATE_API_SECRET", "GATE_PRIVATE_KEY", "GATE_SECRET", "GATE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.gateeu-secret]
 env = ["GATEEU_API_SECRET", "GATEEU_PRIVATE_KEY", "GATEEU_SECRET", "GATEEU_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.gemini-secret]
 env = ["GEMINI_API_SECRET", "GEMINI_PRIVATE_KEY", "GEMINI_SECRET", "GEMINI_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.grvt-secret]
 env = ["GRVT_API_SECRET", "GRVT_PRIVATE_KEY", "GRVT_SECRET", "GRVT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.hashkey-secret]
 env = ["HASHKEY_API_SECRET", "HASHKEY_PRIVATE_KEY", "HASHKEY_SECRET", "HASHKEY_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.hibachi-secret]
 env = ["HIBACHI_API_SECRET", "HIBACHI_PRIVATE_KEY", "HIBACHI_SECRET", "HIBACHI_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.hitbtc-secret]
 env = ["HITBTC_API_SECRET", "HITBTC_PRIVATE_KEY", "HITBTC_SECRET", "HITBTC_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.hollaex-secret]
 env = ["HOLLAEX_API_SECRET", "HOLLAEX_PRIVATE_KEY", "HOLLAEX_SECRET", "HOLLAEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.htx-secret]
 env = ["HTX_API_SECRET", "HTX_PRIVATE_KEY", "HTX_SECRET", "HTX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.hyperliquid-secret]
 env = ["HYPERLIQUID_API_SECRET", "HYPERLIQUID_PRIVATE_KEY", "HYPERLIQUID_SECRET", "HYPERLIQUID_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.independentreserve-secret]
 env = ["INDEPENDENTRESERVE_API_SECRET", "INDEPENDENTRESERVE_PRIVATE_KEY", "INDEPENDENTRESERVE_SECRET", "INDEPENDENTRESERVE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.indodax-secret]
 env = ["INDODAX_API_SECRET", "INDODAX_PRIVATE_KEY", "INDODAX_SECRET", "INDODAX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.kraken-secret]
 env = ["KRAKEN_API_SECRET", "KRAKEN_PRIVATE_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.krakenfutures-secret]
 env = ["KRAKENFUTURES_API_SECRET", "KRAKENFUTURES_PRIVATE_KEY", "KRAKENFUTURES_SECRET", "KRAKENFUTURES_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.kucoin-secret]
 env = ["KUCOIN_API_SECRET", "KUCOIN_PRIVATE_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.kucoinfutures-secret]
 env = ["KUCOINFUTURES_API_SECRET", "KUCOINFUTURES_PRIVATE_KEY", "KUCOINFUTURES_SECRET", "KUCOINFUTURES_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.latoken-secret]
 env = ["LATOKEN_API_SECRET", "LATOKEN_PRIVATE_KEY", "LATOKEN_SECRET", "LATOKEN_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.lbank-secret]
 env = ["LBANK_API_SECRET", "LBANK_PRIVATE_KEY", "LBANK_SECRET", "LBANK_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.lighter-secret]
 env = ["LIGHTER_API_SECRET", "LIGHTER_PRIVATE_KEY", "LIGHTER_SECRET", "LIGHTER_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.luno-secret]
 env = ["LUNO_API_SECRET", "LUNO_PRIVATE_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.mercado-secret]
 env = ["MERCADO_API_SECRET", "MERCADO_PRIVATE_KEY", "MERCADO_SECRET", "MERCADO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.mexc-secret]
 env = ["MEXC_API_SECRET", "MEXC_PRIVATE_KEY", "MEXC_SECRET", "MEXC_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.modetrade-secret]
 env = ["MODETRADE_API_SECRET", "MODETRADE_PRIVATE_KEY", "MODETRADE_SECRET", "MODETRADE_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.mudrex-secret]
 env = ["MUDREX_API_SECRET", "MUDREX_PRIVATE_KEY", "MUDREX_SECRET", "MUDREX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.myokx-secret]
 env = ["MYOKX_API_SECRET", "MYOKX_PRIVATE_KEY", "MYOKX_SECRET", "MYOKX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.nado-secret]
 env = ["NADO_API_SECRET", "NADO_PRIVATE_KEY", "NADO_SECRET", "NADO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.ndax-secret]
 env = ["NDAX_API_SECRET", "NDAX_PRIVATE_KEY", "NDAX_SECRET", "NDAX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.okx-secret]
 env = ["OKX_API_SECRET", "OKX_PRIVATE_KEY", "OKX_SECRET", "OKX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.okxus-secret]
 env = ["OKXUS_API_SECRET", "OKXUS_PRIVATE_KEY", "OKXUS_SECRET", "OKXUS_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.onetrading-secret]
 env = ["ONETRADING_API_SECRET", "ONETRADING_PRIVATE_KEY", "ONETRADING_SECRET", "ONETRADING_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.p2b-secret]
 env = ["P2B_API_SECRET", "P2B_PRIVATE_KEY", "P2B_SECRET", "P2B_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.pacifica-secret]
 env = ["PACIFICA_API_SECRET", "PACIFICA_PRIVATE_KEY", "PACIFICA_SECRET", "PACIFICA_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.paradex-secret]
 env = ["PARADEX_API_SECRET", "PARADEX_PRIVATE_KEY", "PARADEX_SECRET", "PARADEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.paymium-secret]
 env = ["PAYMIUM_API_SECRET", "PAYMIUM_PRIVATE_KEY", "PAYMIUM_SECRET", "PAYMIUM_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.phemex-secret]
 env = ["PHEMEX_API_SECRET", "PHEMEX_PRIVATE_KEY", "PHEMEX_SECRET", "PHEMEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.poloniex-secret]
 env = ["POLONIEX_API_SECRET", "POLONIEX_PRIVATE_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.revolutx-secret]
 env = ["REVOLUTX_API_SECRET", "REVOLUTX_PRIVATE_KEY", "REVOLUTX_SECRET", "REVOLUTX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.tokocrypto-secret]
 env = ["TOKOCRYPTO_API_SECRET", "TOKOCRYPTO_PRIVATE_KEY", "TOKOCRYPTO_SECRET", "TOKOCRYPTO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.toobit-secret]
 env = ["TOOBIT_API_SECRET", "TOOBIT_PRIVATE_KEY", "TOOBIT_SECRET", "TOOBIT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.upbit-secret]
 env = ["UPBIT_API_SECRET", "UPBIT_PRIVATE_KEY", "UPBIT_SECRET", "UPBIT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.weex-secret]
 env = ["WEEX_API_SECRET", "WEEX_PRIVATE_KEY", "WEEX_SECRET", "WEEX_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.whitebit-secret]
 env = ["WHITEBIT_API_SECRET", "WHITEBIT_PRIVATE_KEY", "WHITEBIT_SECRET", "WHITEBIT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.woo-secret]
 env = ["WOO_API_SECRET", "WOO_PRIVATE_KEY", "WOO_SECRET", "WOO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.woofipro-secret]
 env = ["WOOFIPRO_API_SECRET", "WOOFIPRO_PRIVATE_KEY", "WOOFIPRO_SECRET", "WOOFIPRO_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.xt-secret]
 env = ["XT_API_SECRET", "XT_PRIVATE_KEY", "XT_SECRET", "XT_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.zaif-secret]
 env = ["ZAIF_API_SECRET", "ZAIF_PRIVATE_KEY", "ZAIF_SECRET", "ZAIF_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.zebpay-secret]
 env = ["ZEBPAY_API_SECRET", "ZEBPAY_PRIVATE_KEY", "ZEBPAY_SECRET", "ZEBPAY_SECRET_KEY"]
 # signing half of the same venue: an HMAC input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 # ---------------------------------------------------------------------------
 # Crypto infrastructure beyond exchanges: market data, node/RPC providers,
@@ -7449,7 +7449,7 @@ env = ["ZEBPAY_API_SECRET", "ZEBPAY_PRIVATE_KEY", "ZEBPAY_SECRET", "ZEBPAY_SECRE
 # other value. A few vendors sign with the other half of the credential — an
 # HMAC or JWT input that never reaches the wire — and those names, like the
 # exchanges' above, live in hostless `<vendor>-secret` entries. See
-# https://github.com/casualjim/hodor/issues/19.
+# https://github.com/casualjim/arkham/issues/19.
 # ---------------------------------------------------------------------------
 
 
@@ -8044,12 +8044,12 @@ pattern = "{base62:32}"
 [providers.fireblocks-secret]
 env = ["FIREBLOCKS_API_PRIVATE_KEY", "FIREBLOCKS_API_SECRET", "FIREBLOCKS_PRIVATE_KEY"]
 # signing half: an HMAC or JWT input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.cobo-secret]
 env = ["COBO_API_PRIVATE_KEY", "COBO_API_SECRET", "COBO_PRIVATE_KEY"]
 # signing half: an HMAC or JWT input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.coinbase-developer-platform]
 env = ["CDP_API_KEY_ID", "CDP_API_KEY_NAME"]
@@ -8061,12 +8061,12 @@ pattern = "{base62:32}"
 [providers.coinbase-developer-platform-secret]
 env = ["CDP_API_KEY_SECRET", "CDP_WALLET_SECRET"]
 # signing half: an HMAC or JWT input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.chainlink-secret]
 env = ["CHAINLINK_API_SECRET", "CHAINLINK_USER_SECRET"]
 # signing half: an HMAC or JWT input that never reaches the wire,
-# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.defillama]
 env = ["DEFILLAMA_ACCESS_KEY", "DEFILLAMA_ACCESS_TOKEN", "DEFILLAMA_APIKEY", "DEFILLAMA_API_KEY", "DEFILLAMA_API_TOKEN", "DEFILLAMA_KEY"]

@@ -5,13 +5,13 @@
 //         + token issuer: discovery and client_credentials exchange
 //   9000  cleartext TCP line protocol     - raw substitution, tcp:// grant
 //   9443  TLS line protocol               - MITM + raw substitution, https:// grant
-//   9444  TLS line protocol, no grant     - spliced untouched by hodor
-const REAL = process.env.HODOR_REAL ?? "";
+//   9444  TLS line protocol, no grant     - spliced untouched by arkham
+const REAL = process.env.ARKHAM_REAL ?? "";
 const CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET ?? "";
 const ACCESS_TOKEN = process.env.OIDC_ACCESS_TOKEN ?? "";
 const CERT_DIR = process.env.CERT_DIR ?? "/certs";
 if (!REAL || !CLIENT_SECRET || !ACCESS_TOKEN) {
-  console.error("HODOR_REAL, OIDC_CLIENT_SECRET, or OIDC_ACCESS_TOKEN not set");
+  console.error("ARKHAM_REAL, OIDC_CLIENT_SECRET, or OIDC_ACCESS_TOKEN not set");
   process.exit(1);
 }
 
@@ -23,7 +23,7 @@ const fetch = (req: Request) => {
   if (auth === `Bearer ${REAL}`) {
     return new Response(`token:${REAL}\n`);
   }
-  // A minted access token: hodor swapped the client-held decoy for the
+  // A minted access token: arkham swapped the client-held decoy for the
   // real one. The body never echoes the access token, because minted
   // decoys are swapped on requests, not redacted from arbitrary response
   // positions.
@@ -42,7 +42,7 @@ Bun.serve({
 
 // Token issuer on the cleartext HTTP leg: discovery plus a
 // client_credentials exchange gated on the real client secret (Basic auth).
-// hodor swaps the client's fake secret to the real one here, mints a decoy
+// arkham swaps the client's fake secret to the real one here, mints a decoy
 // for the returned access token, and swaps that decoy back on later
 // requests.
 const issuerFetch = (req: Request) => {

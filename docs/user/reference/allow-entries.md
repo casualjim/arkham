@@ -30,7 +30,7 @@ allow = [
 | --- | --- |
 | `api.example.com` | That host only. |
 | `*.example.com` | Subdomains of `example.com` only, never the apex. |
-| `*` | Any host. hodor warns at startup: the secret is at risk of exfiltration. |
+| `*` | Any host. arkham warns at startup: the secret is at risk of exfiltration. |
 
 ## How entries gate interception
 
@@ -42,5 +42,5 @@ Two checks run at different layers:
 Consequences worth knowing:
 
 - Only an `https://` entry makes a host TLS-eligible. A `tcp://host:443` entry alone captures the connection but never terminates its TLS.
-- hodor matches the request authority, not the path. A grant to `https://api.example.com` also permits `https://api.example.com/admin`.
+- arkham matches the request authority, not the path. A grant to `https://api.example.com` also permits `https://api.example.com/admin`.
 - Under transparent capture, a raw TCP connection has no SNI: the destination address is the identity, so a `tcp://` entry must name the literal dialled address.

@@ -1,11 +1,11 @@
 # The secret source for the demo's database rule: fnox's own config syntax,
-# discovered at <config-dir>/fnox.toml. The real connection string — hodor's
+# discovered at <config-dir>/fnox.toml. The real connection string — arkham's
 # northbound dial target, carrying the real password — lives here, never in
-# hodor.toml. The `plain` provider serves a deterministic demo fixture
+# arkham.toml. The `plain` provider serves a deterministic demo fixture
 # without any secret manager.
 [providers.plain]
 type = "plain"
 
 [secrets.DATABASE_URL]
 provider = "plain"
-value = "postgres://hodor:hodor_real_password_01@db:5432/demo?sslmode=require"
+value = "postgres://arkham:arkham_real_password_01@db:5432/demo?sslmode=require"

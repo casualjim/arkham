@@ -1,20 +1,20 @@
 # How to secure your workspace
 
-This guide shows you how to run a coding agent inside a container that holds only decoy credentials, with hodor as its only egress path. Your agent works as before while hodor protects your secrets. You need hodor installed, docker with compose, and a workspace directory with secrets declared to fnox.
+This guide shows you how to run a coding agent inside a container that holds only decoy credentials, with arkham as its only egress path. Your agent works as before while arkham protects your secrets. You need arkham installed, docker with compose, and a workspace directory with secrets declared to fnox.
 
-The flow has three parts: see which rules derive from the secrets your workspace can already reach, describe the container layout in config, then let `hodor init` generate the compose project and `hodor up` drive it.
+The flow has three parts: see which rules derive from the secrets your workspace can already reach, describe the container layout in config, then let `arkham init` generate the compose project and `arkham up` drive it.
 
 ## 1. See what derives from fnox
 
 Rules derive at serve time: every name fnox declares that the bundled registry knows becomes a rule, allowed hosts and decoy shape included. From your workspace root:
 
 ```sh
-hodor rules
+arkham rules
 ```
 
 This prints the `[rules.<label>]` blocks the proxy will substitute, with comments at the end for names the registry knows but states no hosts for and fnox declarations no registry entry covers. The report is a preview, not a file to keep: nothing here needs writing.
 
-State a block in your workspace's `.config/hodor/config.toml` only to override derivation for that name:
+State a block in your workspace's `.config/arkham/config.toml` only to override derivation for that name:
 
 ```toml
 [rules.github_token]
@@ -36,7 +36,7 @@ include = ["~/.config/mise:ro", "../sibling-project"]
 | Key | Purpose |
 | --- | --- |
 | `home` | `$HOME` inside the agent container. Defaults to `/home/eng`. Host paths under your home directory translate into this prefix; other paths mount at their own location. |
-| `shell` | Shell `hodor agent` runs in the container when no command is given. Defaults to `sh`. |
+| `shell` | Shell `arkham agent` runs in the container when no command is given. Defaults to `sh`. |
 | `include` | Extra host paths the agent service mounts. `~` expands; relative paths resolve against the workspace root. A trailing `:ro` or `:rw` sets the mount mode, `rw` by default. Every path must exist: generation stops rather than let docker mount an empty directory in its place. |
 | `name` | Compose project name. Defaults to a slug of the workspace path. |
 | `profile` | Isolated tool-config namespace in `profiles/`. Unset mounts `__shared__`. |
@@ -50,27 +50,27 @@ container port) and fixed at container create. For a port you need now, or one
 another workspace already publishes, run:
 
 ```sh
-hodor expose 3000             # 127.0.0.1:3000 -> agent :3000
-hodor expose 3000 --host 3001 # second workspace: same server, distinct host port
-hodor expose --list           # this workspace's publishings plus every workspace's claims
+arkham expose 3000             # 127.0.0.1:3000 -> agent :3000
+arkham expose 3000 --host 3001 # second workspace: same server, distinct host port
+arkham expose --list           # this workspace's publishings plus every workspace's claims
 ```
 
 The command claims the host port in a registry shared across workspaces (a
 taken port fails naming the owning workspace), appends the
 `[[workspace.expose]]` mapping to the project config, regenerates, and `up`s.
-Publishing is create-time state, so the hodor service (and the agent riding
-its netns) recreates and exec sessions drop. `hodor down` releases the
+Publishing is create-time state, so the arkham service (and the agent riding
+its netns) recreates and exec sessions drop. `arkham down` releases the
 workspace's claims.
 
 ### Reach the host and sidecar networks
 
 Unmatched traffic splices through the capture byte-identical, so the agent can
-reach anything hodor can route — it only needs the name to resolve.
-`host.docker.internal` always points at the host gateway on both the hodor
+reach anything arkham can route — it only needs the name to resolve.
+`host.docker.internal` always points at the host gateway on both the arkham
 and agent services (`/etc/hosts` is per container: the agent resolves the
-name, hodor dials the upstream), so host-bound dev servers just work. Further
+name, arkham dials the upstream), so host-bound dev servers just work. Further
 entries go in `[workspace] extra_hosts`, and existing compose networks in
-`[workspace] networks` — both rendered on the hodor service, both inherited
+`[workspace] networks` — both rendered on the arkham service, both inherited
 by the agent through the shared netns:
 
 ```toml
@@ -80,21 +80,21 @@ networks = ["headroom_default"]
 ```
 
 A sidecar like `headroom` on a joined network resolves by name from the
-agent. Joining any network moves hodor off the default project network.
+agent. Joining any network moves arkham off the default project network.
 
 ## 3. Mount tool profiles
 
-Every `<tool>/` directory inside the selected profile mounts into the agent container at the location that tool reads its own configuration from by default. Profiles live under `<config-dir>/hodor/profiles/<name>/` globally, or `<workspace root>/.config/hodor/profiles/<name>/` per workspace. `__shared__` is the base every profile inherits off and hodor always creates. Create the directory for each tool you use:
+Every `<tool>/` directory inside the selected profile mounts into the agent container at the location that tool reads its own configuration from by default. Profiles live under `<config-dir>/arkham/profiles/<name>/` globally, or `<workspace root>/.config/arkham/profiles/<name>/` per workspace. `__shared__` is the base every profile inherits off and arkham always creates. Create the directory for each tool you use:
 
 ```sh
-mkdir -p ~/.config/hodor/profiles/__shared__/pi ~/.config/hodor/profiles/__shared__/gh
+mkdir -p ~/.config/arkham/profiles/__shared__/pi ~/.config/arkham/profiles/__shared__/gh
 ```
 
 A second identity is a second profile. Give the workspace a `profile.toml` cookie naming its parent, then fill in only the tools that differ:
 
 ```sh
-mkdir -p ~/.config/hodor/profiles/work/gh
-printf '[profile]\nparent = "__shared__"\n' > ~/.config/hodor/profiles/work/profile.toml
+mkdir -p ~/.config/arkham/profiles/work/gh
+printf '[profile]\nparent = "__shared__"\n' > ~/.config/arkham/profiles/work/profile.toml
 ```
 
 ```toml
@@ -119,47 +119,47 @@ The mounts are writable. Whatever the tool writes lands beside the profile on th
 
 | File | What it is |
 | --- | --- |
-| `~/.config/hodor/ca.pem` | hodor's CA, with `ca.crt` and `ca.key` written beside it. Delete the three to rotate; `init` and `up` create them again. |
-| `~/.config/hodor/agent-entrypoint.sh` | The agent's entrypoint. It installs the mounted `ca.crt` into the container's system store with `update-ca-certificates`, then chains to the image's own init: `[workspace] init` names it (`HODOR_INIT` in the generated stack — like `shell`, it lives in the workspace config), the common entrypoint script names are tried when unset, and the command runs directly otherwise. Installing the CA needs root, directly or through passwordless `sudo`; without either it prints a warning and the container's tools do not trust hodor. `init` regenerates the file whenever it differs from the generated script, so stale or edited copies cannot linger — a custom script belongs in a compose layer overriding `entrypoint:`. |
+| `~/.config/arkham/ca.pem` | arkham's CA, with `ca.crt` and `ca.key` written beside it. Delete the three to rotate; `init` and `up` create them again. |
+| `~/.config/arkham/agent-entrypoint.sh` | The agent's entrypoint. It installs the mounted `ca.crt` into the container's system store with `update-ca-certificates`, then chains to the image's own init: `[workspace] init` names it (`ARKHAM_INIT` in the generated stack — like `shell`, it lives in the workspace config), the common entrypoint script names are tried when unset, and the command runs directly otherwise. Installing the CA needs root, directly or through passwordless `sudo`; without either it prints a warning and the container's tools do not trust arkham. `init` regenerates the file whenever it differs from the generated script, so stale or edited copies cannot linger — a custom script belongs in a compose layer overriding `entrypoint:`. |
 
-The CA is yours after that: an existing one is never overwritten, so rotating means deleting the three files and letting `init` make a fresh CA. The entrypoint is the other way around — it is generated output, regenerated whenever it differs from the script above, because a stale copy is exactly how a stack silently stops trusting hodor. See [how to trust the CA](trust-the-ca.md) for the full range of trust options. Every mount the stack adds is conditional on the host path existing, because a bind mount of a missing path makes docker create a directory in its place.
+The CA is yours after that: an existing one is never overwritten, so rotating means deleting the three files and letting `init` make a fresh CA. The entrypoint is the other way around — it is generated output, regenerated whenever it differs from the script above, because a stale copy is exactly how a stack silently stops trusting arkham. See [how to trust the CA](trust-the-ca.md) for the full range of trust options. Every mount the stack adds is conditional on the host path existing, because a bind mount of a missing path makes docker create a directory in its place.
 
 Node and Python's `requests` read their own bundle instead of the system store, so the generated stack also points `NODE_EXTRA_CA_CERTS` and `REQUESTS_CA_BUNDLE` at the system bundle the entrypoint refreshes.
 
 ## 5. Generate, start, enter, stop
 
 ```sh
-hodor init             # CA, entrypoint, and the stack (--backend picks the capture backend; ebpf by default)
-hodor up               # start it
-hodor logs -f          # the stack's logs (--tail N, --no-log-prefix, --workspace PATH, service names as for docker compose)
-hodor agent            # init, up, and the shell in one idempotent command
-hodor agent --rm       # the same, stopping the stack when the shell exits
-hodor down             # stop it
+arkham init             # CA, entrypoint, and the stack (--backend picks the capture backend; ebpf by default)
+arkham up               # start it
+arkham logs -f          # the stack's logs (--tail N, --no-log-prefix, --workspace PATH, service names as for docker compose)
+arkham agent            # init, up, and the shell in one idempotent command
+arkham agent --rm       # the same, stopping the stack when the shell exits
+arkham down             # stop it
 ```
 
-`init` never writes workspace config: rules derive at serve time from fnox and the registry, and a workspace with no config file works. A config you wrote is yours and is never touched; when it changes after the stack was generated — or when the stack was generated by an older hodor, which the generated file's `# stack shape:` marker records — `init` regenerates `<state-dir>/hodor/ws/<slug>/compose.yml` from it (the agent's decoys derive from the rules, so a stale stack holds decoys that can never be swapped, and an old shape lacks wiring the current one ships) and says so, since that replaces hand edits. `hodor agent` runs the same generation before…
+`init` never writes workspace config: rules derive at serve time from fnox and the registry, and a workspace with no config file works. A config you wrote is yours and is never touched; when it changes after the stack was generated — or when the stack was generated by an older arkham, which the generated file's `# stack shape:` marker records — `init` regenerates `<state-dir>/arkham/ws/<slug>/compose.yml` from it (the agent's decoys derive from the rules, so a stale stack holds decoys that can never be swapped, and an old shape lacks wiring the current one ships) and says so, since that replaces hand edits. `arkham agent` runs the same generation before…
 
-1. `<config-dir>/hodor/compose.yml`, for additions shared by every workspace.
+1. `<config-dir>/arkham/compose.yml`, for additions shared by every workspace.
 2. The generated per-workspace `compose.yml`.
-3. The workspace's own `.config/hodor.compose.yaml` (or `.yml`), for additions local to this workspace.
+3. The workspace's own `.config/arkham.compose.yaml` (or `.yml`), for additions local to this workspace.
 
-`hodor agent [workspace] [--rm] [-- <command>...]` execs the configured shell as your uid at the translated workspace path, after generating what is missing and starting the stack, with `<command>` in place of the shell when you pass one. It leaves the stack running when that exits, or stops it when `--rm` is set. `logs` reads the stack's logs: `-f` to follow, `--no-log-prefix` for bare lines, `--tail <N|all>` (default `all`), service names to narrow it down, and `--workspace <PATH>` when the workspace is not the current directory.
+`arkham agent [workspace] [--rm] [-- <command>...]` execs the configured shell as your uid at the translated workspace path, after generating what is missing and starting the stack, with `<command>` in place of the shell when you pass one. It leaves the stack running when that exits, or stops it when `--rm` is set. `logs` reads the stack's logs: `-f` to follow, `--no-log-prefix` for bare lines, `--tail <N|all>` (default `all`), service names to narrow it down, and `--workspace <PATH>` when the workspace is not the current directory.
 
 ## What the generated stack does
 
-The hodor service runs `serve --proxy-backend <backend>`, `ebpf` unless `hodor init --backend` picked another, so the agent container, which shares hodor's network namespace, has every outbound connection captured with no proxy setting and no way around the proxy. Under `ebpf` both services carry the same `cgroup_parent`, and hodor attaches with `--ebpf-cgroup enclosing` — the cgroup its own cgroup lives under, resolved from `/proc/self/cgroup`, because the daemon places that parent relative to its own cgroup root; it also carries `cgroup: host` and the `BPF`/`PERFMON` capabilities, and the agent's inner containers land in the same cgroup. Under `tun` both services need `/dev/net/tun`. It holds the CA (`HODOR_CA_FILE=/certs/ca.pem`) and resolves the real values itself: your fnox config directory is mounted read-only at `/root/.config/fnox`, hodor's own fnox files at `/root/.config/hodor`, and every provider credential — including an age-encrypted secret, decrypted with the key inside the mounted fnox config — resolves from fnox inside the container, the way `fnox exec` would. The environment that started the stack is never a credential source.
+The arkham service runs `serve --proxy-backend <backend>`, `ebpf` unless `arkham init --backend` picked another, so the agent container, which shares arkham's network namespace, has every outbound connection captured with no proxy setting and no way around the proxy. Under `ebpf` both services carry the same `cgroup_parent`, and arkham attaches with `--ebpf-cgroup enclosing` — the cgroup its own cgroup lives under, resolved from `/proc/self/cgroup`, because the daemon places that parent relative to its own cgroup root; it also carries `cgroup: host` and the `BPF`/`PERFMON` capabilities, and the agent's inner containers land in the same cgroup. Under `tun` both services need `/dev/net/tun`. It holds the CA (`ARKHAM_CA_FILE=/certs/ca.pem`) and resolves the real values itself: your fnox config directory is mounted read-only at `/root/.config/fnox`, arkham's own fnox files at `/root/.config/arkham`, and every provider credential — including an age-encrypted secret, decrypted with the key inside the mounted fnox config — resolves from fnox inside the container, the way `fnox exec` would. The environment that started the stack is never a credential source.
 
 The agent service holds only decoys, one environment variable per rule, and runs behind your entrypoint. It mounts the same workspace paths plus the profile mounts from step 3. It runs a container runtime of its own, so it carries what that needs: unconfined seccomp, systempaths and apparmor, `SYS_CHROOT`/`AUDIT_WRITE`/`NET_ADMIN`/`SETUID`/`SETGID`/`SYS_ADMIN`, and `/dev/net/tun`. Its storage is a directory under this workspace's state, made at generation time and mounted at `{home}/.local/share/containers`. `systempaths=unconfined` is a podman option — under docker, drop it from `security_opt`.
 
-The generated file is fully baked: image names, the agent's uid, and every mount path are concrete values chosen at generation time from your config and machine, so the stack reads as the simple thing it is. Nothing in it is env-var configurable — to differ from the generated shape, use the compose layers (`~/.config/hodor/compose.yml` globally, the workspace's `.config/hodor.compose.yaml` locally), or change the config and let `init` regenerate.
+The generated file is fully baked: image names, the agent's uid, and every mount path are concrete values chosen at generation time from your config and machine, so the stack reads as the simple thing it is. Nothing in it is env-var configurable — to differ from the generated shape, use the compose layers (`~/.config/arkham/compose.yml` globally, the workspace's `.config/arkham.compose.yaml` locally), or change the config and let `init` regenerate.
 
 ## When it breaks
 
-- `no compose layers for ...` — run `hodor init` first, or create one of the layer files.
+- `no compose layers for ...` — run `arkham init` first, or create one of the layer files.
 - `[workspace] include ... does not exist` — fix or drop the entry. Docker would mount an empty directory in its place, so generation stops instead.
 - `warning: could not prepare …ca.pem` — `[proxy] ca_file` points at a container path. That is fine when you mount the CA yourself in one of the compose layers instead.
-- `hodor: not root and no passwordless sudo` — the entrypoint could not refresh the system store, so nothing in the agent trusts hodor. Run the agent service as root (`user: "0"` in one of your compose layers), give that user passwordless sudo, or bake the certificate into the image — see [how to trust the CA](trust-the-ca.md).
-- An inner container will not start, or podman inside the agent exits with nothing on stderr — its storage directory is not writable by the uid the agent runs as. That is why generation makes `<state-dir>/hodor/ws/<slug>/containers`; if a layer points the volume at your own directory or a named volume, `chown` it to that uid once. On Ubuntu, an inner container that dies on mount or networking also needs `apparmor=unconfined` in `security_opt`, which the generated file already sets.
-- A decoy does not get swapped — the decoy was generated with a different pattern than the rule's. `hodor init` derives each decoy from its rule's `pattern` for exactly this reason; if you hand-edit the compose file, regenerate decoys with `hodor fake <ENV>` after changing a pattern.
-- DNS stops resolving in the agent after recreating only the hodor service — the agent shares hodor's network namespace, so recreate both: `hodor up` again.
-- `grants: 0` in hodor's startup log, or a provider answering 401 while the agent holds credentials — no rule derived, so the decoy went out as-is. Run `hodor rules`: empty output means fnox declares nothing the registry knows (see [how to get values from fnox](get-values-from-fnox.md)); otherwise state an override block in `<workspace>/.config/hodor/config.toml` and regenerate.
+- `arkham: not root and no passwordless sudo` — the entrypoint could not refresh the system store, so nothing in the agent trusts arkham. Run the agent service as root (`user: "0"` in one of your compose layers), give that user passwordless sudo, or bake the certificate into the image — see [how to trust the CA](trust-the-ca.md).
+- An inner container will not start, or podman inside the agent exits with nothing on stderr — its storage directory is not writable by the uid the agent runs as. That is why generation makes `<state-dir>/arkham/ws/<slug>/containers`; if a layer points the volume at your own directory or a named volume, `chown` it to that uid once. On Ubuntu, an inner container that dies on mount or networking also needs `apparmor=unconfined` in `security_opt`, which the generated file already sets.
+- A decoy does not get swapped — the decoy was generated with a different pattern than the rule's. `arkham init` derives each decoy from its rule's `pattern` for exactly this reason; if you hand-edit the compose file, regenerate decoys with `arkham fake <ENV>` after changing a pattern.
+- DNS stops resolving in the agent after recreating only the arkham service — the agent shares arkham's network namespace, so recreate both: `arkham up` again.
+- `grants: 0` in arkham's startup log, or a provider answering 401 while the agent holds credentials — no rule derived, so the decoy went out as-is. Run `arkham rules`: empty output means fnox declares nothing the registry knows (see [how to get values from fnox](get-values-from-fnox.md)); otherwise state an override block in `<workspace>/.config/arkham/config.toml` and regenerate.

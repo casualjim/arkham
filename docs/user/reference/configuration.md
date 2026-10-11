@@ -5,9 +5,9 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 ## Layers
 
 1. CLI flags: `--listen`, `--ca-file`, `--config`.
-2. Environment variables: `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_PROXY_BACKEND`, `HODOR_TPROXY_ALLOW_ROOT_NETNS`.
-3. The project file at `<workspace root>/.config/hodor/config.toml` (legacy `.config/hodor.toml` still reads). The workspace root is found by walking up from the working directory.
-4. The global file at `$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`.
+2. Environment variables: `ARKHAM_LISTEN`, `ARKHAM_CA_FILE`, `ARKHAM_CONFIG`, `ARKHAM_PROXY_BACKEND`, `ARKHAM_TPROXY_ALLOW_ROOT_NETNS`.
+3. The project file at `<workspace root>/.config/arkham/config.toml` (legacy `.config/arkham.toml` still reads). The workspace root is found by walking up from the working directory.
+4. The global file at `$ARKHAM_CONFIG` or `<config-dir>/arkham/config.toml`.
 
 `--config <FILE>` replaces the project layer, it does not add a fifth one.
 
@@ -17,8 +17,8 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 
 | Key | Default | Environment | Purpose |
 | --- | --- | --- | --- |
-| `listen` | `127.0.0.1:8080` | `HODOR_LISTEN` | Address the explicit proxy listens on. |
-| `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/hodor/ca.pem` | `HODOR_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `hodor ca` also writes `ca.crt` and `ca.key` beside it. |
+| `listen` | `127.0.0.1:8080` | `ARKHAM_LISTEN` | Address the explicit proxy listens on. |
+| `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/arkham/ca.pem` | `ARKHAM_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `arkham ca` also writes `ca.crt` and `ca.key` beside it. |
 | `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
 | `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, and the upstream `SSLRequest` answer all share this budget. |
 
@@ -56,11 +56,11 @@ env = "PGPASSWORD"
 allow = ["tcp://10.0.0.8:5432"]
 ```
 
-A `tcp://` entry has no framing to rewrite, so the substitution is equal-length only, and hodor satisfies that by construction: the decoy for a rule with a `tcp://` entry is generated at the real value's length, falling back from the registry shape only when the shape renders another length. See [capture traffic transparently](../how-to/capture-traffic-transparently.md) for the capture side.
+A `tcp://` entry has no framing to rewrite, so the substitution is equal-length only, and arkham satisfies that by construction: the decoy for a rule with a `tcp://` entry is generated at the real value's length, falling back from the registry shape only when the shape renders another length. See [capture traffic transparently](../how-to/capture-traffic-transparently.md) for the capture side.
 
 ### Database rules
 
-A rule whose `value` states a `postgres://` connection string is a database rule. The rule states the FAKE connection string in `value` (a proper URL, so the env var holds a URL the client can dial through hodor), and the REAL one resolves from the secret source under `env`/`fnox_key` into `real` — never stated in config. No `allow` entries: the connection string is the grant.
+A rule whose `value` states a `postgres://` connection string is a database rule. The rule states the FAKE connection string in `value` (a proper URL, so the env var holds a URL the client can dial through arkham), and the REAL one resolves from the secret source under `env`/`fnox_key` into `real` — never stated in config. No `allow` entries: the connection string is the grant.
 
 The connection strings carry the upstream TLS policy as libpq parameters: `sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; default `prefer`), `sslnegotiation` (`postgres`, default, or `direct`), `sslrootcert` (upstream trust anchor, required for a verifying sslmode), and `sslcert`/`sslkey` (upstream client identity). These parameters belong on database connection strings only; endpoint rules state the same capabilities through `[rules.<label>.tls]`.
 
@@ -78,28 +78,28 @@ Per-entry TLS, keyed by the exact `allow` entry string. All keys optional.
 | --- | --- |
 | `client_cert` / `client_key` | Upstream client identity the proxy presents to this entry. Come together. |
 | `root_cert` | Upstream CA bundle trusting this entry's host, additive to webpki roots plus global `root_certs`. |
-| `guest_tls_mode` | `tls` (default) or `mtls`: demand a guest client certificate signed by the hodor CA. |
+| `guest_tls_mode` | `tls` (default) or `mtls`: demand a guest client certificate signed by the arkham CA. |
 | `guest_cert` / `guest_key` | Container-internal path the guest's minted certificate and key mount at. Defaults are under the workspace state directory; set these when the client reads its pair from a fixed location. |
 
 ## `[workspace]`
 
-Controls the compose stack `hodor init` generates.
+Controls the compose stack `arkham init` generates.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `home` | `/home/eng` | `$HOME` inside the agent container. Host paths under the host home translate into this prefix; other paths mount at their own path. |
 | `name` | workspace path slug | Compose project name. |
-| `shell` | `sh` | Shell `hodor agent` runs in the container when no command is given. |
-| `init` | none | Init script inside the agent image that the generated entrypoint chains to after installing the CA (`HODOR_INIT`). The common entrypoint script names are tried when unset; the command runs directly otherwise. |
+| `shell` | `sh` | Shell `arkham agent` runs in the container when no command is given. |
+| `init` | none | Init script inside the agent image that the generated entrypoint chains to after installing the CA (`ARKHAM_INIT`). The common entrypoint script names are tried when unset; the command runs directly otherwise. |
 | `include` | empty | Extra host paths the agent service mounts, translated into the container home. `~` expands; relative paths resolve against the workspace root; a trailing `:ro`/`:rw` sets the mode. Overlapping paths reuse the covering mount. A path that does not exist fails generation, because docker would mount an empty directory in its place. |
 | `ports` | empty | Ports published on the host as stable `127.0.0.1:<port>` bindings, forwarded to the same port inside the agent's shared network namespace. The generated stack's `fwd` sidecar exposes every agent-owned loopback listener there; a published port names one reliably from the host instead of through a changing container IP. Applying a change needs a stack restart. Port `0` and the capture listener ports (`15000`, `15001`) are refused at load. |
-| `expose` | empty | `[[workspace.expose]]` mappings with `port` (container) and `host` (host port) keys, publishing `127.0.0.1:<host>` onto a container port that differs — so two workspaces running the same dev server both publish it under distinct host ports. Managed by `hodor expose`, which claims the host port across workspaces. Same load rules as `ports`, and every host port must be distinct across `ports` and `expose`. |
-| `networks` | empty | Existing compose networks the hodor service joins, each declared `external` at the top level: the agent inherits them through the shared network namespace, so a sidecar like `headroom` on one of these networks is reachable by name from the agent. Joining any network moves hodor off the default project network. Applying a change needs a stack restart. |
-| `extra_hosts` | `host.docker.internal:host-gateway` only | Further `host:ip` (or `host=ip`) entries rendered as `extra_hosts` on the hodor and agent services — `/etc/hosts` is per container, so both need each entry: the agent resolves the name, hodor dials the upstream. `host.docker.internal:host-gateway` is always rendered, reaching host-bound services through the capture (which splices unmatched traffic, never blocks it). Applying a change needs a stack restart. |
+| `expose` | empty | `[[workspace.expose]]` mappings with `port` (container) and `host` (host port) keys, publishing `127.0.0.1:<host>` onto a container port that differs — so two workspaces running the same dev server both publish it under distinct host ports. Managed by `arkham expose`, which claims the host port across workspaces. Same load rules as `ports`, and every host port must be distinct across `ports` and `expose`. |
+| `networks` | empty | Existing compose networks the arkham service joins, each declared `external` at the top level: the agent inherits them through the shared network namespace, so a sidecar like `headroom` on one of these networks is reachable by name from the agent. Joining any network moves arkham off the default project network. Applying a change needs a stack restart. |
+| `extra_hosts` | `host.docker.internal:host-gateway` only | Further `host:ip` (or `host=ip`) entries rendered as `extra_hosts` on the arkham and agent services — `/etc/hosts` is per container, so both need each entry: the agent resolves the name, arkham dials the upstream. `host.docker.internal:host-gateway` is always rendered, reaching host-bound services through the capture (which splices unmatched traffic, never blocks it). Applying a change needs a stack restart. |
 
 ## Profiles
 
-Isolated tool-config namespaces for the secure stack. Global profiles live under `<config-dir>/hodor/profiles/<name>/`; project ones under `<workspace root>/.config/hodor/profiles/<name>/`. Each `<tool>/` directory inside a profile mounts into the agent container at the location that tool reads its own configuration from by default, so nothing has to set a config-directory variable. The workspace selects its profile with `[workspace] profile`; unset selects `__shared__`, the base every other profile inherits off and hodor always creates.
+Isolated tool-config namespaces for the secure stack. Global profiles live under `<config-dir>/arkham/profiles/<name>/`; project ones under `<workspace root>/.config/arkham/profiles/<name>/`. Each `<tool>/` directory inside a profile mounts into the agent container at the location that tool reads its own configuration from by default, so nothing has to set a config-directory variable. The workspace selects its profile with `[workspace] profile`; unset selects `__shared__`, the base every other profile inherits off and arkham always creates.
 
 ```toml
 [workspace]
@@ -116,7 +116,7 @@ A profile mounts its own tool dirs plus every tool its cookie parent names that 
 
 ## Automatic sources
 
-`hodor agent` derives a working, decoy-only development environment from the authentication sources a workspace already carries — no declaration, the same way fnox's own chain is read. Each source present on the host maps onto grants plus a decoy twin mounted at the tool's default path; an absent source derives nothing, and the pass is liberal: a source that does not map — an ssh config whose blocks carry `Include`/`Match`/`ProxyJump` or a second identity, a broken kubeconfig — is skipped with a warning, never a failure. Only a credential-shaped gitconfig value (an `Authorization` extra header, an insteadOf base with userinfo) skips its whole source, because mounting a twin would carry a real secret.
+`arkham agent` derives a working, decoy-only development environment from the authentication sources a workspace already carries — no declaration, the same way fnox's own chain is read. Each source present on the host maps onto grants plus a decoy twin mounted at the tool's default path; an absent source derives nothing, and the pass is liberal: a source that does not map — an ssh config whose blocks carry `Include`/`Match`/`ProxyJump` or a second identity, a broken kubeconfig — is skipped with a warning, never a failure. Only a credential-shaped gitconfig value (an `Authorization` extra header, an insteadOf base with userinfo) skips its whole source, because mounting a twin would carry a real secret.
 
 | Source | Resolution | Twin mounts at |
 | --- | --- | --- |
@@ -126,11 +126,11 @@ A profile mounts its own tool dirs plus every tool its cookie parent names that 
 | kubeconfig | `KUBECONFIG` when it names a single file, else `~/.kube/config`. A file-reference kubeconfig must be flattened first: `kubectl config view --flatten --minify`. | `{home}/.kube/config` |
 | talosconfig | `TALOSCONFIG` when it names a single file, else `~/.talos/config`. | `{home}/.talos/config` |
 
-The gitconfig is a per-forge-host authentication map, never a secret store: an `Authorization` extra header or an insteadOf base with embedded userinfo fails closed, because the agent's copy must carry decoys only. For each https remote (rewritten through `url.<base>.insteadOf`) and `credential.<url>` scope whose host a fnox-declared registry name covers, the twin mints an `http.<url>.extraHeader` holding basic auth over that name's decoy — the agent runs no credential helpers, and the proxy decodes, swaps decoy for the real value, and re-encodes. Remotes over git+ssh with a `core.sshCommand -i` identity mint the same per-host ssh grant the ssh config source mints; ssh remotes without one warn. A kubeconfig source is adapted rather than byte-swapped: the API server URL becomes an `https://` allow entry, the client certificate and key materialize into a per-entry TLS identity, the cluster CA becomes that entry's `root_cert`, and the decoy twin points at the same server but carries the hodor CA plus a minted guest pair. A talosconfig adapts the same way (bare endpoints gain the Talos API port 50000); Omni `auth:` blocks carry no substitutable pair and fail closed.
+The gitconfig is a per-forge-host authentication map, never a secret store: an `Authorization` extra header or an insteadOf base with embedded userinfo fails closed, because the agent's copy must carry decoys only. For each https remote (rewritten through `url.<base>.insteadOf`) and `credential.<url>` scope whose host a fnox-declared registry name covers, the twin mints an `http.<url>.extraHeader` holding basic auth over that name's decoy — the agent runs no credential helpers, and the proxy decodes, swaps decoy for the real value, and re-encodes. Remotes over git+ssh with a `core.sshCommand -i` identity mint the same per-host ssh grant the ssh config source mints; ssh remotes without one warn. A kubeconfig source is adapted rather than byte-swapped: the API server URL becomes an `https://` allow entry, the client certificate and key materialize into a per-entry TLS identity, the cluster CA becomes that entry's `root_cert`, and the decoy twin points at the same server but carries the arkham CA plus a minted guest pair. A talosconfig adapts the same way (bare endpoints gain the Talos API port 50000); Omni `auth:` blocks carry no substitutable pair and fail closed.
 
 ## `[[workspace.file_rewrite]]`
 
-Host files rewritten with decoys and mounted read-only into the agent — the escape hatch for files outside the automatic sources above. Each listed env name's real value is byte-replaced by its decoy in the file, and the rewritten copy lands under the workspace state directory — the agent sees decoys only; hodor holds the real values.
+Host files rewritten with decoys and mounted read-only into the agent — the escape hatch for files outside the automatic sources above. Each listed env name's real value is byte-replaced by its decoy in the file, and the rewritten copy lands under the workspace state directory — the agent sees decoys only; arkham holds the real values.
 
 | Key | Required | Purpose |
 | --- | --- | --- |
@@ -189,12 +189,12 @@ An entry overrides a built-in path for that name or adds a name the table does n
 
 | Variable | Effect |
 | --- | --- |
-| `HODOR_LISTEN` | Sets `[proxy] listen`. |
-| `HODOR_CA_FILE` | Sets `[proxy] ca_file`. |
-| `HODOR_CONFIG` | Sets the global config file path. |
-| `HODOR_PROXY_BACKEND` | Same as `--proxy-backend`. CLI and environment only. |
-| `HODOR_TPROXY_ALLOW_ROOT_NETNS` | Same as `--tproxy-allow-root-netns`. |
-| `HODOR_EBPF_CGROUP` | Same as `--ebpf-cgroup`. CLI and environment only. |
+| `ARKHAM_LISTEN` | Sets `[proxy] listen`. |
+| `ARKHAM_CA_FILE` | Sets `[proxy] ca_file`. |
+| `ARKHAM_CONFIG` | Sets the global config file path. |
+| `ARKHAM_PROXY_BACKEND` | Same as `--proxy-backend`. CLI and environment only. |
+| `ARKHAM_TPROXY_ALLOW_ROOT_NETNS` | Same as `--tproxy-allow-root-netns`. |
+| `ARKHAM_EBPF_CGROUP` | Same as `--ebpf-cgroup`. CLI and environment only. |
 
 ## Validation
 

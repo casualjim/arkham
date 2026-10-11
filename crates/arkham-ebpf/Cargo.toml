@@ -1,0 +1,32 @@
+[package]
+name = "arkham-ebpf"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: eBPF capture backend"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+aya = { workspace = true }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+arkham-config = { workspace = true }
+arkham-proxy = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+aya-build = { workspace = true }
+
+[dev-dependencies]
+aya-obj = { workspace = true }
+arkham-pki = { workspace = true }
+rustls = { workspace = true }
+secrecy = { workspace = true }
+tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
+
+[lints]
+workspace = true

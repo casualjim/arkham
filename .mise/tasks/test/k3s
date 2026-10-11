@@ -8,9 +8,9 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
-cluster="hodor-k3s-test"
+cluster="arkham-k3s-test"
 scratch=$proj_dir/target/k3s-e2e
-hodor=$proj_dir/target/debug/hodor
+arkham=$proj_dir/target/debug/arkham
 serve_pid=""
 
 cleanup() {
@@ -21,7 +21,7 @@ cleanup() {
 }
 trap cleanup EXIT
 rm -rf "$scratch"
-mkdir -p "$scratch" "$scratch/config/hodor"
+mkdir -p "$scratch" "$scratch/config/arkham"
 
 # Isolation: every k3d/kubectl call in this task sees only task-local
 # kubeconfig files under $scratch; the user's ~/.kube/config is never
@@ -30,7 +30,7 @@ export KUBECONFIG="$scratch/task-kubeconfig"
 # Stack generation needs `[workspace] home`, which normally arrives via the
 # user's global config; the hermetic XDG_CONFIG_HOME hides that file, so the
 # task seeds the one value generation requires.
-printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/hodor/config.toml"
+printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/arkham/config.toml"
 
 # Fresh cluster every run: leftover state from a killed run must not leak in.
 # The kubeconfig flags keep k3d from touching ~/.kube/config even if the
@@ -54,9 +54,9 @@ k3d kubeconfig get "$cluster" | sed 's|https://0.0.0.0:|https://127.0.0.1:|' >"$
 # Bearer-leg source: token-only copy of the same kubeconfig.
 cp "$scratch/cert-kubeconfig" "$scratch/token-kubeconfig"
 export KUBECONFIG="$scratch/cert-kubeconfig"
-kubectl create serviceaccount hodor-test >/dev/null
-kubectl create clusterrolebinding hodor-test --clusterrole=cluster-admin --serviceaccount=default:hodor-test >/dev/null
-token=$(kubectl create token hodor-test --duration=3600s)
+kubectl create serviceaccount arkham-test >/dev/null
+kubectl create clusterrolebinding arkham-test --clusterrole=cluster-admin --serviceaccount=default:arkham-test >/dev/null
+token=$(kubectl create token arkham-test --duration=3600s)
 user=$(kubectl config view -o 'jsonpath={.users[0].name}')
 export KUBECONFIG="$scratch/token-kubeconfig"
 kubectl config set-credentials "$user" --token="$token" >/dev/null
@@ -65,36 +65,36 @@ kubectl config unset "users.$user.client-key-data" >/dev/null
 
 # One leg: init a workspace against a kubeconfig source, serve host-side, and
 # prove the three states — real works direct, decoy fails direct, decoy works
-# through the proxy. Host-side serve cannot resolve the /hodor/grants container
+# through the proxy. Host-side serve cannot resolve the /arkham/grants container
 # mount, so the layer runs as a copy with host paths; substitution behavior
 # is unaffected by the prefix.
 run_leg() {
   local name=$1 source=$2 port=$3
   local ws=$scratch/ws-$name
-  mkdir -p "$ws/.config/hodor"
-  printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$source\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$ws/.config/hodor/config.toml"
-  # Redirects stay on the hodor invocations only: XDG_CONFIG_HOME breaks the
+  mkdir -p "$ws/.config/arkham"
+  printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$source\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$ws/.config/arkham/config.toml"
+  # Redirects stay on the arkham invocations only: XDG_CONFIG_HOME breaks the
   # mise shims kubectl and k3d run through, so those keep the real environment.
   local statedir=$scratch/state-$name
-  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$hodor" init --backend tproxy "$ws"
+  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
   shopt -s nullglob
   kubedirs=()
-  for d in "$statedir"/hodor/ws/*/grants; do kubedirs+=("$d"); done
+  for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
   decoys=()
-  for d in "$statedir"/hodor/ws/*/files/00-*; do decoys+=("$d"); done
+  for d in "$statedir"/arkham/ws/*/files/00-*; do decoys+=("$d"); done
   shopt -u nullglob
   if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
     echo "init generated no kube state under $XDG_STATE_HOME" >&2
     exit 1
   fi
   local kubedir=${kubedirs[0]} decoy=${decoys[0]}
-  sed "s|/hodor/grants|$kubedir|" "$kubedir/hodor.toml" >"$scratch/host-layer-$name.toml"
+  sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
   cp "$decoy" "$scratch/proxy-$name.yaml"
   local context
   context=$(KUBECONFIG="$source" kubectl config current-context)
   KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster "$context" --proxy-url="http://127.0.0.1:$port" >/dev/null
 
-  XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox HODOR_CONFIG="$scratch/host-layer-$name.toml" HODOR_CA_FILE="$scratch/config/hodor/ca.pem" HODOR_LISTEN="127.0.0.1:$port" "$hodor" serve &
+  XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox ARKHAM_CONFIG="$scratch/host-layer-$name.toml" ARKHAM_CA_FILE="$scratch/config/arkham/ca.pem" ARKHAM_LISTEN="127.0.0.1:$port" "$arkham" serve &
   serve_pid=$!
   sleep 2
 

@@ -2,7 +2,7 @@ use wit_bindgen::generate;
 
 generate!({
   world: "request",
-  path: "../../../crates/hodor-plugin/wit",
+  path: "../../../crates/arkham-plugin/wit",
 });
 
 struct MarkerRequest;
@@ -10,7 +10,7 @@ struct MarkerRequest;
 impl Guest for MarkerRequest {
   fn rewrite_request_head(mut head: RequestHead) -> Result<RequestHead, String> {
     head.headers.push(Header {
-      name: "x-hodor-plugin".to_string(),
+      name: "x-arkham-plugin".to_string(),
       value: b"marker".to_vec(),
     });
     Ok(head)

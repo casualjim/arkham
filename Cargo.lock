@@ -300,6 +300,243 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkham"
+version = "0.3.9"
+dependencies = [
+ "arkham-compose",
+ "arkham-config",
+ "arkham-ebpf",
+ "arkham-fnox",
+ "arkham-pki",
+ "arkham-proxy",
+ "arkham-tproxy",
+ "arkham-tun",
+ "clap",
+ "confique",
+ "dirs 6.0.0",
+ "eyre",
+ "libc",
+ "miette",
+ "mimalloc",
+ "pretty_assertions",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "arkham-compose"
+version = "0.1.16"
+dependencies = [
+ "arkham-config",
+ "arkham-fnox",
+ "arkham-pki",
+ "base64 0.22.1",
+ "clap",
+ "dirs 6.0.0",
+ "gix-config",
+ "gix-discover",
+ "libc",
+ "pretty_assertions",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "shellexpand",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.8.23",
+ "toml_edit 0.25.15+spec-1.1.0",
+ "tracing",
+ "url",
+ "xpanda",
+]
+
+[[package]]
+name = "arkham-config"
+version = "0.1.16"
+dependencies = [
+ "base62",
+ "clap",
+ "code-workspace",
+ "confique",
+ "dirs 6.0.0",
+ "hex",
+ "pretty_assertions",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
+ "tracing",
+ "url",
+ "validator",
+]
+
+[[package]]
+name = "arkham-ebpf"
+version = "0.1.16"
+dependencies = [
+ "arkham-config",
+ "arkham-pki",
+ "arkham-proxy",
+ "aya",
+ "aya-build",
+ "aya-obj",
+ "dashmap",
+ "libc",
+ "rustls 0.23.45",
+ "secrecy",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tracing",
+]
+
+[[package]]
+name = "arkham-ebpf-programs"
+version = "0.1.16"
+dependencies = [
+ "aya-ebpf",
+]
+
+[[package]]
+name = "arkham-fnox"
+version = "0.1.16"
+dependencies = [
+ "arkham-config",
+ "fnox-core",
+ "miette",
+ "pretty_assertions",
+ "secrecy",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.8.23",
+ "toml_edit 0.25.15+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "arkham-pki"
+version = "0.1.16"
+dependencies = [
+ "pretty_assertions",
+ "rama",
+ "rand 0.8.8",
+ "rcgen",
+ "russh",
+ "rustls 0.23.45",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+]
+
+[[package]]
+name = "arkham-plugin"
+version = "0.1.16"
+dependencies = [
+ "arkham-config",
+ "pretty_assertions",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "wasmtime",
+ "wasmtime-wasi",
+]
+
+[[package]]
+name = "arkham-proxy"
+version = "0.1.16"
+dependencies = [
+ "arkham-config",
+ "arkham-pki",
+ "arkham-plugin",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "dashmap",
+ "futures",
+ "h2 0.4.19",
+ "httlib-hpack",
+ "http-body-util",
+ "httparse",
+ "hyper 1.11.1",
+ "hyper-util",
+ "pgwire",
+ "pretty_assertions",
+ "proptest",
+ "rama",
+ "russh",
+ "rustls 0.23.45",
+ "rustls-native-certs",
+ "secrecy",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls 0.26.6",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "arkham-tproxy"
+version = "0.1.16"
+dependencies = [
+ "arkham-config",
+ "arkham-pki",
+ "arkham-proxy",
+ "futures-util",
+ "libc",
+ "netlink-packet-core",
+ "netlink-packet-netfilter",
+ "netlink-sys 0.8.8",
+ "pretty_assertions",
+ "rama",
+ "rtnetlink",
+ "rustls 0.23.45",
+ "secrecy",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tracing",
+]
+
+[[package]]
+name = "arkham-tun"
+version = "0.1.16"
+dependencies = [
+ "arkham-config",
+ "arkham-pki",
+ "arkham-proxy",
+ "futures-sink",
+ "futures-util",
+ "pretty_assertions",
+ "rtnetlink",
+ "rustls 0.23.45",
+ "secrecy",
+ "smoltcp",
+ "socket2 0.6.5",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-util",
+ "tracing",
+ "tun",
+]
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4149,243 +4386,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
-]
-
-[[package]]
-name = "hodor"
-version = "0.3.9"
-dependencies = [
- "clap",
- "confique",
- "dirs 6.0.0",
- "eyre",
- "hodor-compose",
- "hodor-config",
- "hodor-ebpf",
- "hodor-fnox",
- "hodor-pki",
- "hodor-proxy",
- "hodor-tproxy",
- "hodor-tun",
- "libc",
- "miette",
- "mimalloc",
- "pretty_assertions",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "hodor-compose"
-version = "0.1.16"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "dirs 6.0.0",
- "gix-config",
- "gix-discover",
- "hodor-config",
- "hodor-fnox",
- "hodor-pki",
- "libc",
- "pretty_assertions",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "shellexpand",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml 0.8.23",
- "toml_edit 0.25.15+spec-1.1.0",
- "tracing",
- "url",
- "xpanda",
-]
-
-[[package]]
-name = "hodor-config"
-version = "0.1.16"
-dependencies = [
- "base62",
- "clap",
- "code-workspace",
- "confique",
- "dirs 6.0.0",
- "hex",
- "pretty_assertions",
- "secrecy",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.21",
- "toml 0.8.23",
- "tracing",
- "url",
- "validator",
-]
-
-[[package]]
-name = "hodor-ebpf"
-version = "0.1.16"
-dependencies = [
- "aya",
- "aya-build",
- "aya-obj",
- "dashmap",
- "hodor-config",
- "hodor-pki",
- "hodor-proxy",
- "libc",
- "rustls 0.23.45",
- "secrecy",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls 0.26.6",
- "tracing",
-]
-
-[[package]]
-name = "hodor-ebpf-programs"
-version = "0.1.16"
-dependencies = [
- "aya-ebpf",
-]
-
-[[package]]
-name = "hodor-fnox"
-version = "0.1.16"
-dependencies = [
- "fnox-core",
- "hodor-config",
- "miette",
- "pretty_assertions",
- "secrecy",
- "serde",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml 0.8.23",
- "toml_edit 0.25.15+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
-name = "hodor-pki"
-version = "0.1.16"
-dependencies = [
- "pretty_assertions",
- "rama",
- "rand 0.8.8",
- "rcgen",
- "russh",
- "rustls 0.23.45",
- "tempfile",
- "thiserror 2.0.21",
- "time",
- "tracing",
-]
-
-[[package]]
-name = "hodor-plugin"
-version = "0.1.16"
-dependencies = [
- "hodor-config",
- "pretty_assertions",
- "tempfile",
- "thiserror 2.0.21",
- "tracing",
- "wasmtime",
- "wasmtime-wasi",
-]
-
-[[package]]
-name = "hodor-proxy"
-version = "0.1.16"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "dashmap",
- "futures",
- "h2 0.4.19",
- "hodor-config",
- "hodor-pki",
- "hodor-plugin",
- "httlib-hpack",
- "http-body-util",
- "httparse",
- "hyper 1.11.1",
- "hyper-util",
- "pgwire",
- "pretty_assertions",
- "proptest",
- "rama",
- "russh",
- "rustls 0.23.45",
- "rustls-native-certs",
- "secrecy",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-postgres",
- "tokio-rustls 0.26.6",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "hodor-tproxy"
-version = "0.1.16"
-dependencies = [
- "futures-util",
- "hodor-config",
- "hodor-pki",
- "hodor-proxy",
- "libc",
- "netlink-packet-core",
- "netlink-packet-netfilter",
- "netlink-sys 0.8.8",
- "pretty_assertions",
- "rama",
- "rtnetlink",
- "rustls 0.23.45",
- "secrecy",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls 0.26.6",
- "tracing",
-]
-
-[[package]]
-name = "hodor-tun"
-version = "0.1.16"
-dependencies = [
- "futures-sink",
- "futures-util",
- "hodor-config",
- "hodor-pki",
- "hodor-proxy",
- "pretty_assertions",
- "rtnetlink",
- "rustls 0.23.45",
- "secrecy",
- "smoltcp",
- "socket2 0.6.5",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls 0.26.6",
- "tokio-util",
- "tracing",
- "tun",
 ]
 
 [[package]]

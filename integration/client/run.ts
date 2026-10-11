@@ -1,14 +1,14 @@
-// Demo client. Shares hodor's network namespace; hodor's transparent capture
+// Demo client. Shares arkham's network namespace; arkham's transparent capture
 // takes every connection. The client knows nothing about the proxy:
 // it just talks to api by hostname. It holds ONLY the fake token; every
-// passing scenario proves hodor swapped it for the real one (and redacted
+// passing scenario proves arkham swapped it for the real one (and redacted
 // replies). Hard bounds everywhere: 5s per network await, 20s per scenario,
 // 90s for the whole run — the demo never sits silent.
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile } from "node:fs/promises";
 
-const FAKE = process.env.HODOR_FAKE ?? "";
+const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
 const CERT_DIR = process.env.CERT_DIR ?? "/certs";
 const PG_URL = process.env.DATABASE_URL ?? ""; // the fake connection string
@@ -18,7 +18,7 @@ const TOTAL_BUDGET_MS = 90000;
 const DEADLINE = Date.now() + TOTAL_BUDGET_MS;
 
 if (!FAKE || !OIDC_FAKE_SECRET) {
-  console.error("HODOR_FAKE or OIDC_FAKE_SECRET not set");
+  console.error("ARKHAM_FAKE or OIDC_FAKE_SECRET not set");
   process.exit(1);
 }
 
@@ -155,7 +155,7 @@ await retry("tcp over tls mitm substitutes both directions", async () => {
   return (await exchange(tls, `AUTH ${FAKE}\n`)) === `OK ${FAKE}\n`;
 });
 
-// 5. No grant: hodor never terminates the TLS, the handshake passes through
+// 5. No grant: arkham never terminates the TLS, the handshake passes through
 //    to the api server (its own CA-signed leaf verifies), and the fake
 //    arrives untouched, so the server rejects it.
 await retry("grantless tls splices untouched", async () => {
@@ -166,11 +166,11 @@ await retry("grantless tls splices untouched", async () => {
 // 6. Database rule against real PostgreSQL (the compose demo only — bwrap
 //    has no postgres, so no DATABASE_URL means the scenario is skipped).
 //    The client consumes exactly what the guest holds: its DATABASE_URL,
-//    the rule's stated FAKE connection string. Hodor captures the dial,
+//    the rule's stated FAKE connection string. Arkham captures the dial,
 //    matches the rule on the fake string's port, and swaps the fake
 //    password for the real one from the secret source. PostgreSQL rejects
 //    the fake password, so an opened session proves the swap. The guest
-//    dials by the URL's hostname, and hodor mints the leaf for that name,
+//    dials by the URL's hostname, and arkham mints the leaf for that name,
 //    so full hostname verification stays on — no IPs anywhere.
 if (PG_URL) {
 
@@ -220,7 +220,7 @@ if (PG_URL) {
       tls.once("secureConnect", () => resolve());
       tls.once("error", reject);
     }));
-    stage("pg tls ok (hodor's minted leaf)");
+    stage("pg tls ok (arkham's minted leaf)");
     tls.write(pgStartup({ user: db.username, database: db.pathname.slice(1) }));
     const auth = await pgRead(tls, 9);
     if (auth[0] !== 0x52 || auth.readUInt32BE(5) !== 3) throw new Error(`expected cleartext password auth, got ${auth.toString("latin1")}`);
@@ -285,8 +285,8 @@ await retry("oauth2 token endpoint mints and the minted decoy substitutes", asyn
 
 // 8. SSH: a plain openssh binary, the decoy identity, and nothing else.
 // Options inline (no config file): strict checking with accept-new and a
-// writable known_hosts of its own, so the first connection records hodor's
-// host key — ssh's mechanism is the allowlist, hodor adds no pins.
+// writable known_hosts of its own, so the first connection records arkham's
+// host key — ssh's mechanism is the allowlist, arkham adds no pins.
 const SSH_DST = process.env.SSH_DST ?? "";
 const SSH_KNOWN_HOSTS = "/tmp/known_hosts";
 const sshCommand = [
@@ -320,13 +320,13 @@ if (SSH_DST) {
       return false;
     }
     // Debian hashes known_hosts entries, so assert on the recorded key
-    // blob: it must be hodor's host key, proving the client verified and
+    // blob: it must be arkham's host key, proving the client verified and
     // stored it via its own accept-new — never a pre-mounted pin.
-    const [known, hodorHost] = await Promise.all([
+    const [known, arkhamHost] = await Promise.all([
       readFile(SSH_KNOWN_HOSTS, "utf8"),
-      readFile("/certs/ssh/hodor_host.pub", "utf8"),
+      readFile("/certs/ssh/arkham_host.pub", "utf8"),
     ]);
-    return known.includes(hodorHost.trim().split(" ")[1] ?? "");
+    return known.includes(arkhamHost.trim().split(" ")[1] ?? "");
   });
 } else {
   stage("ssh scenario skipped: no SSH_DST (bwrap)");

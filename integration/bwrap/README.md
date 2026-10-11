@@ -1,10 +1,10 @@
 # bwrap demo (transparent capture without docker)
 
 Same proof as the [docker demo](../README.md), minus the docker daemon: a
-network namespace with a veth up to the host, `hodor serve --proxy-backend tproxy`
+network namespace with a veth up to the host, `arkham serve --proxy-backend tproxy`
 capturing inside it, and the client sandboxed by [bubblewrap] while
 sharing the netns — proxy-unaware, fake-token-holding, captured on the way
-out. Set `HODOR_BACKEND=ebpf` to run the same scenarios over the eBPF
+out. Set `ARKHAM_BACKEND=ebpf` to run the same scenarios over the eBPF
 backend instead.
 
 [bubblewrap]: https://github.com/containers/bubblewrap
@@ -16,7 +16,7 @@ backend instead.
 
 The api server is the docker demo's `integration/api/server.ts`; the CA and
 api leaf come from `integration/gen-certs.sh`; the fake is the deterministic
-`hodor fake GH_TOKEN`. hodor installs its own nft TPROXY rules and policy
+`arkham fake GH_TOKEN`. arkham installs its own nft TPROXY rules and policy
 routes inside the namespace over netlink — the host only carries a small
 masquerade table for the veth, removed on exit.
 
@@ -33,11 +33,11 @@ script (netns, veth, host NAT) via sudo, with a confirmation prompt;
 To assert the same scenarios over the eBPF backend:
 
 ```sh
-HODOR_BACKEND=ebpf mise run demo:bwrap
+ARKHAM_BACKEND=ebpf mise run demo:bwrap
 ```
 
 That needs a cgroup v2 hierarchy. The
-script creates `/sys/fs/cgroup/hodor-bwrap`, starts hodor outside it, and
+script creates `/sys/fs/cgroup/arkham-bwrap`, starts arkham outside it, and
 migrates the client into it before the client runs — no nft rules are
 installed for the capture, only the veth masquerade table.
 

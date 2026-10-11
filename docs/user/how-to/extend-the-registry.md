@@ -1,22 +1,22 @@
 # How to extend the known-host registry
 
-This guide shows you how to teach hodor about a private API endpoint, a self-hosted control plane, or a token shape it does not know. You need the env var name, the host that may receive the real value, and roughly what the token looks like.
+This guide shows you how to teach arkham about a private API endpoint, a self-hosted control plane, or a token shape it does not know. You need the env var name, the host that may receive the real value, and roughly what the token looks like.
 
-hodor ships a bundled table mapping known services to their env names, API hosts, and token shapes, so most rules need nothing beyond `env`. When a name is not in the table, or the table is wrong for your deployment, override it with a `rules.d` file rather than repeating `allow` in every rule.
+arkham ships a bundled table mapping known services to their env names, API hosts, and token shapes, so most rules need nothing beyond `env`. When a name is not in the table, or the table is wrong for your deployment, override it with a `rules.d` file rather than repeating `allow` in every rule.
 
 ## 1. Pick the file location
 
 Two override directories, both loaded in filename order:
 
-- Global: `<config-dir>/hodor/rules.d/*.toml`, beside the global config file. Applies to every workspace.
-- Project: `<workspace-root>/.config/hodor/rules.d/*.toml`. Applies to one workspace.
+- Global: `<config-dir>/arkham/rules.d/*.toml`, beside the global config file. Applies to every workspace.
+- Project: `<workspace-root>/.config/arkham/rules.d/*.toml`. Applies to one workspace.
 
 Project entries override global ones, which override the bundled table.
 
 ## 2. Add a provider entry
 
 ```toml
-# <config-dir>/hodor/rules.d/acme.toml
+# <config-dir>/arkham/rules.d/acme.toml
 [providers.acme]
 env = ["ACME_API_KEY"]
 hosts = ["https://api.acme.example.com"]
@@ -55,10 +55,10 @@ The two curation commands turn a vendor's own documents into the entry:
 
 ```sh
 # OIDC discovery: fetch and save the document, then map it
-hodor registry from-oidc issuer.json example EXAMPLE_TOKEN
+arkham registry from-oidc issuer.json example EXAMPLE_TOKEN
 
 # OpenAPI: map every `type: oauth2` security scheme
-hodor registry from-openapi openapi.json example EXAMPLE_TOKEN
+arkham registry from-openapi openapi.json example EXAMPLE_TOKEN
 ```
 
 Both print a `rules.d` TOML fragment to stdout. Review it, then drop it into `rules.d`. They never fetch at runtime and never touch the bundled table.
@@ -79,10 +79,10 @@ With the flow declared, the proxy terminates TLS on the token endpoint and rewri
 
 ## 5. Preview the decoy
 
-`hodor fake` uses the same table, so the override is visible without running a proxy:
+`arkham fake` uses the same table, so the override is visible without running a proxy:
 
 ```sh
-hodor fake ACME_API_KEY
+arkham fake ACME_API_KEY
 # acme_1f4a9c...  (matches the pattern above)
 ```
 

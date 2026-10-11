@@ -7,13 +7,13 @@ local rust_steps = new Mapping<String, Step> {
     // `--workspace` because the root package doubles as the workspace root, so
     // a bare `cargo check --all-targets` would cover only the root binary:
     // every crate's unit tests would go unchecked.
-    // `--exclude hodor-ebpf-programs` because that crate is a workspace member
+    // `--exclude arkham-ebpf-programs` because that crate is a workspace member
     // only so `aya-build` can resolve it with `--package`; it compiles for the
     // `bpf` target alone, and building it for the host fails on the panic
-    // handler. `aya-build` builds it as part of `hodor-ebpf`, so the gate still
+    // handler. `aya-build` builds it as part of `arkham-ebpf`, so the gate still
     // covers it.
-    check = "cargo check --workspace --exclude hodor-ebpf-programs --all-targets"
-    fix = "cargo check --workspace --exclude hodor-ebpf-programs --all-targets"
+    check = "cargo check --workspace --exclude arkham-ebpf-programs --all-targets"
+    fix = "cargo check --workspace --exclude arkham-ebpf-programs --all-targets"
     depends = "rustfmt"
     check_first = true
   }
@@ -21,8 +21,8 @@ local rust_steps = new Mapping<String, Step> {
   ["cargo-clippy"] = new Step {
     glob = List("**/*.rs")
     stage = List("**/*.rs")
-    check = "cargo clippy --workspace --exclude hodor-ebpf-programs --all-targets -- -D warnings"
-    fix = "cargo clippy --workspace --exclude hodor-ebpf-programs --all-targets --fix --allow-dirty --allow-staged -- -D warnings"
+    check = "cargo clippy --workspace --exclude arkham-ebpf-programs --all-targets -- -D warnings"
+    fix = "cargo clippy --workspace --exclude arkham-ebpf-programs --all-targets --fix --allow-dirty --allow-staged -- -D warnings"
     check_first = true
     depends = "cargo-check"
   }

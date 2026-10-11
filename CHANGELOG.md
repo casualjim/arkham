@@ -135,7 +135,7 @@
 - Release
 - Update changelog for v0.4.0 [ci skip]
 - Release
-- Release hodor version 0.2.3
+- Release arkham version 0.2.3
 - Update changelog for v0.2.4 [ci skip]
 - Release
 ## [0.2.2] - 2026-09-27
@@ -241,7 +241,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.16 [ci skip]
-- Release hodor version 0.1.16
+- Release arkham version 0.1.16
 ## [0.1.15] - 2026-09-16
 
 ### 🚀 Features
@@ -258,7 +258,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.15 [ci skip]
-- Release hodor version 0.1.15
+- Release arkham version 0.1.15
 ## [0.1.14] - 2026-09-14
 
 ### 🚀 Features
@@ -272,7 +272,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.14 [ci skip]
-- Release hodor version 0.1.14
+- Release arkham version 0.1.14
 ## [0.1.13] - 2026-09-13
 
 ### 🚀 Features
@@ -283,7 +283,7 @@
 
 - *(mise)* Restructure task files into namespaced dirs
 - Update changelog for v0.1.13 [ci skip]
-- Release hodor version 0.1.13
+- Release arkham version 0.1.13
 ## [0.1.12] - 2026-09-12
 
 ### 🐛 Bug Fixes
@@ -293,7 +293,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.12 [ci skip]
-- Release hodor version 0.1.12
+- Release arkham version 0.1.12
 ## [0.1.11] - 2026-09-12
 
 ### 🚀 Features
@@ -327,7 +327,7 @@
 
 - *(mise)* Pin node lts in the toolchain
 - Update changelog for v0.1.11 [ci skip]
-- Release hodor version 0.1.11
+- Release arkham version 0.1.11
 ## [0.1.10] - 2026-09-11
 
 ### 🐛 Bug Fixes
@@ -337,7 +337,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.10 [ci skip]
-- Release hodor version 0.1.10
+- Release arkham version 0.1.10
 ## [0.1.9] - 2026-09-11
 
 ### 🚀 Features
@@ -348,14 +348,14 @@
 
 - *(heimdall)* Point the policy messages at the format task
 - Update changelog for v0.1.9 [ci skip]
-- Release hodor version 0.1.9
+- Release arkham version 0.1.9
 ## [0.1.8] - 2026-09-11
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Use current action majors in the hand-written workflows
 - Update changelog for v0.1.8 [ci skip]
-- Release hodor version 0.1.8
+- Release arkham version 0.1.8
 ## [0.1.7] - 2026-09-11
 
 ### 🐛 Bug Fixes
@@ -365,7 +365,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.7 [ci skip]
-- Release hodor version 0.1.7
+- Release arkham version 0.1.7
 ## [0.1.6] - 2026-09-11
 
 ### 🐛 Bug Fixes
@@ -375,7 +375,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.6 [ci skip]
-- Release hodor version 0.1.6
+- Release arkham version 0.1.6
 ## [0.1.5] - 2026-09-11
 
 ### 🐛 Bug Fixes
@@ -385,7 +385,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.5 [ci skip]
-- Release hodor version 0.1.5
+- Release arkham version 0.1.5
 ## [0.1.4] - 2026-09-11
 
 ### 🐛 Bug Fixes
@@ -395,7 +395,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.1.4 [ci skip]
-- Release hodor version 0.1.4
+- Release arkham version 0.1.4
 ## [0.1.3] - 2026-09-11
 
 ### 🐛 Bug Fixes
@@ -412,10 +412,10 @@
 - *(mise)* Split tun test task into user build + root exec
 - Initial import
 - Update changelog for v0.1.1 [ci skip]
-- Release hodor version 0.1.1
+- Release arkham version 0.1.1
 - Update changelog for v0.1.2 [ci skip]
-- Release hodor version 0.1.2
+- Release arkham version 0.1.2
 - Publish the image on main and use it in the example
 - Build the image from the repo root with an explicit Dockerfile
 - Update changelog for v0.1.3 [ci skip]
-- Release hodor version 0.1.3
+- Release arkham version 0.1.3

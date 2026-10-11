@@ -13,11 +13,11 @@ set -euo pipefail
 # Build the test binary as the current user so target/ stays user-owned.
 # Building this package is also what runs its `build.rs`, and therefore
 # `aya-build`, so the BPF programs are compiled here.
-cargo nextest run --locked --no-run --cargo-quiet --package hodor-ebpf
+cargo nextest run --locked --no-run --cargo-quiet --package arkham-ebpf
 
-# Locate `hodor-ebpf`'s own test binary: the workspace has many, so the package
+# Locate `arkham-ebpf`'s own test binary: the workspace has many, so the package
 # filter is what makes the "exactly one" assertion meaningful.
-test_bin=$(cargo nextest list --package hodor-ebpf --message-format json |
+test_bin=$(cargo nextest list --package arkham-ebpf --message-format json |
   jq -r '.["rust-suites"] |
   if length == 1 then first(.[]) | .["binary-path"] else error("expected 1 test binary, got \(length)") end')
 

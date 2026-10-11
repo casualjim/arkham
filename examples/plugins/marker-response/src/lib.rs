@@ -2,7 +2,7 @@ use wit_bindgen::generate;
 
 generate!({
   world: "response",
-  path: "../../../crates/hodor-plugin/wit",
+  path: "../../../crates/arkham-plugin/wit",
 });
 
 struct MarkerResponse;
@@ -10,7 +10,7 @@ struct MarkerResponse;
 impl Guest for MarkerResponse {
   fn rewrite_response_head(mut head: ResponseHead) -> Result<ResponseHead, String> {
     head.headers.push(Header {
-      name: "x-hodor-response-plugin".to_string(),
+      name: "x-arkham-response-plugin".to_string(),
       value: b"marker".to_vec(),
     });
     Ok(head)

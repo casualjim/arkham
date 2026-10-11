@@ -1,14 +1,14 @@
-//! `hodor fwd`: exposure sidecar of the generated compose stack.
+//! `arkham fwd`: exposure sidecar of the generated compose stack.
 //!
-//! The agent service shares hodor's network namespace, so a loopback-bound
+//! The agent service shares arkham's network namespace, so a loopback-bound
 //! listener inside the agent is invisible to the host — only the shared
 //! namespace's own wildcard-bound listeners are directly reachable at the
 //! compose bridge IP. A container cannot publish ports for a netns it merely
-//! joins, and the publishings that exist belong to the hodor service and are
+//! joins, and the publishings that exist belong to the arkham service and are
 //! fixed at create, so ad-hoc dev-server ports need a forwarder.
 //!
 //! This sidecar is that forwarder, and a sidecar is all it is: the generated
-//! stack runs `hodor fwd` with `network_mode: "service:hodor"` (the shared
+//! stack runs `arkham fwd` with `network_mode: "service:arkham"` (the shared
 //! netns, whose every listener shows up in `/proc/net/tcp`) and
 //! `pid: "service:agent"` (only the agent's processes are visible, so only
 //! they can ever be attributed a listener). Every poll it:
@@ -16,7 +16,7 @@
 //! 1. collects the LISTEN rows of `/proc/net/tcp` and `/proc/net/tcp6` whose
 //!    local address is loopback;
 //! 2. attributes each socket inode through `/proc/<pid>/fd`, which covers
-//!    agent-side processes only because of the PID namespace — hodor's
+//!    agent-side processes only because of the PID namespace — arkham's
 //!    capture and explicit-proxy listeners and docker's embedded DNS are
 //!    structurally unattributable here and are never forwarded, without any
 //!    port having to be named;
@@ -344,7 +344,7 @@ fn parse_table(path: &str) -> eyre::Result<Vec<Row>> {
     };
     // The kernel prints each 32-bit group of the address as the native
     // integer read from memory, so every group is byte-reversed from the
-    // numeric address — the same encoding `hodor-ebpf`'s `decode_addr`
+    // numeric address — the same encoding `arkham-ebpf`'s `decode_addr`
     // spells out.
     let addr = match addr_hex.len() {
       8 => {
@@ -385,7 +385,7 @@ fn parse_table(path: &str) -> eyre::Result<Vec<Row>> {
 /// Whether the agent's processes — the only ones this sidecar can see, being
 /// inside their PID namespace — hold the socket `inode`.
 ///
-/// Anything unattributable is never forwarded: hodor's capture and
+/// Anything unattributable is never forwarded: arkham's capture and
 /// explicit-proxy listeners and docker's embedded DNS are held by processes
 /// no `/proc/<pid>/fd` scan can reach from here.
 fn attributable(inode: u64) -> bool {

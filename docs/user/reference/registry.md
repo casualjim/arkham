@@ -1,6 +1,6 @@
 # Registry reference
 
-The bundled known-host registry: environment names, API hosts, and token shapes for the services hodor knows out of the box. The table lives in [`rules/registry.toml`](https://raw.githubusercontent.com/casualjim/hodor/main/rules/registry.toml) in the repository; this page documents the format, which is the same for the bundled table and for overrides.
+The bundled known-host registry: environment names, API hosts, and token shapes for the services arkham knows out of the box. The table lives in [`rules/registry.toml`](https://raw.githubusercontent.com/casualjim/arkham/main/rules/registry.toml) in the repository; this page documents the format, which is the same for the bundled table and for overrides.
 
 ## Tables
 
@@ -52,7 +52,7 @@ token_fields = []                                  # optional, default = RFC 674
 | `rotates_refresh` | `true` when the issuer issues a new `refresh_token` on every refresh (RFC 6749 §6). Each rotated value mints its own decoy. |
 | `token_fields` | Response body fields to mint. Default follows the flow; override only for deviant envelopes (e.g. a wrapped `{"data": {...}}` body). |
 
-The flow block overrides across layers like the other fields: `replace = true` discards an earlier layer's flow, and a later file's flow wins. A rule's own `oauth2` block (in `hodor.toml`) overrides the registry's.
+The flow block overrides across layers like the other fields: `replace = true` discards an earlier layer's flow, and a later file's flow wins. A rule's own `oauth2` block (in `arkham.toml`) overrides the registry's.
 
 ### `[names.<ENV>]`
 
@@ -67,8 +67,8 @@ hosts = ["https://ghe.corp.example"]
 
 Two override directories, both loaded in filename order; project entries override global ones, which override the bundled table:
 
-- Global: `<config-dir>/hodor/rules.d/*.toml`
-- Project: `<workspace-root>/.config/hodor/rules.d/*.toml`
+- Global: `<config-dir>/arkham/rules.d/*.toml`
+- Project: `<workspace-root>/.config/arkham/rules.d/*.toml`
 
 ## Resolution rules
 
@@ -76,4 +76,4 @@ The pattern for a name resolves: rule `pattern`, then `[names.<ENV>]`, then the 
 
 Hosts union across layers unless `replace = true` discards the earlier layers' hosts for those names.
 
-`hodor fake <ENV>` uses the same table, so overrides preview without running a proxy. See [how to extend the registry](../how-to/extend-the-registry.md) for the workflow.
+`arkham fake <ENV>` uses the same table, so overrides preview without running a proxy. See [how to extend the registry](../how-to/extend-the-registry.md) for the workflow.

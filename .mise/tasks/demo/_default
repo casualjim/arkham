@@ -9,7 +9,7 @@ set -euo pipefail
 
 mise run build
 mkdir -p integration/docker
-cp target/release/hodor integration/docker/hodor
+cp target/release/arkham integration/docker/arkham
 
 compose="docker compose -f integration/compose.yaml"
 trap '$compose down --remove-orphans -v --timeout 3' EXIT
@@ -17,7 +17,7 @@ trap '$compose down --remove-orphans -v --timeout 3' EXIT
 # netns-sharing client; drive the lifecycle directly instead.
 $compose up -d --build
 
-client=hodor-integration-client-1
+client=arkham-integration-client-1
 state=running
 for _ in $(seq 1 60); do
   state=$(docker inspect -f '{{.State.Status}}' "$client" 2>/dev/null || echo missing)

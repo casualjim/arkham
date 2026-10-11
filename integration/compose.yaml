@@ -1,14 +1,14 @@
-name: hodor-integration
+name: arkham-integration
 
-# Transparent capture topology: the client container shares hodor's network
-# namespace (network_mode: service:hodor). hodor runs --proxy-backend tproxy and installs its
+# Transparent capture topology: the client container shares arkham's network
+# namespace (network_mode: service:arkham). arkham runs --proxy-backend tproxy and installs its
 # policy routing inside that shared netns, so every client connection is
 # captured without any proxy configuration on the client — LAN included.
-# hodor's marked upstream dials bypass the capture (fwmark rule).
+# arkham's marked upstream dials bypass the capture (fwmark rule).
 #
 # tproxy, not ebpf: the eBPF backend captures by cgroup membership, and a
 # compose service's cgroup path is not something this file can pin. Use
-# `HODOR_BACKEND=ebpf mise run demo:bwrap` for the same scenarios over eBPF.
+# `ARKHAM_BACKEND=ebpf mise run demo:bwrap` for the same scenarios over eBPF.
 services:
   certs:
     image: oven/bun:1
@@ -16,20 +16,20 @@ services:
       [
         "bash",
         "-c",
-        "apt-get update -qq && apt-get install -qq -y openssh-client && /srv/gen-certs.sh /certs && /srv/gen-secrets.sh /hodor-config",
+        "apt-get update -qq && apt-get install -qq -y openssh-client && /srv/gen-certs.sh /certs && /srv/gen-secrets.sh /arkham-config",
       ]
     environment:
-      HODOR_REAL: ${HODOR_REAL:?copy integration/.env.example to integration/.env}
-      HODOR_DB_REAL: ${HODOR_DB_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_REAL: ${ARKHAM_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_DB_REAL: ${ARKHAM_DB_REAL:?copy integration/.env.example to integration/.env}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?copy integration/.env.example to integration/.env}
     volumes:
       - ./gen-certs.sh:/srv/gen-certs.sh:ro
       - ./gen-secrets.sh:/srv/gen-secrets.sh:ro
       - certs:/certs
-      - hodor-config:/hodor-config
+      - arkham-config:/arkham-config
     restart: "no"
 
-  hodor:
+  arkham:
     build:
       context: ./docker
       dockerfile: ../../Dockerfile
@@ -37,20 +37,20 @@ services:
       [
         "serve",
         "--proxy-backend",
-        "${HODOR_BACKEND:-tproxy}",
+        "${ARKHAM_BACKEND:-tproxy}",
         "--config",
-        "/etc/hodor/hodor.toml",
+        "/etc/arkham/arkham.toml",
       ]
     environment:
       RUST_LOG: debug
-      # The guest leg's host key and hodor's own upstream known_hosts
+      # The guest leg's host key and arkham's own upstream known_hosts
       # (accept-new): both live in the certs volume gen-certs.sh seeded.
-      HODOR_SSH_HOST_KEY: /certs/ssh/hodor_host
-      HODOR_SSH_KNOWN_HOSTS: /var/lib/hodor/ssh_known_hosts
+      ARKHAM_SSH_HOST_KEY: /certs/ssh/arkham_host
+      ARKHAM_SSH_KNOWN_HOSTS: /var/lib/arkham/ssh_known_hosts
       # The mounted volume is the config dir: it holds the config anchor
       # plus fnox.toml, the secret source gen-secrets.sh rendered from the
       # environment. No committed file carries a real value.
-      HODOR_CONFIG: /hodor-config/config.toml
+      ARKHAM_CONFIG: /arkham-config/config.toml
     stop_grace_period: 1s
     cap_add:
       - NET_ADMIN
@@ -58,9 +58,9 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
-      - ./hodor.toml:/etc/hodor/hodor.toml:ro
+      - ./arkham.toml:/etc/arkham/arkham.toml:ro
       - certs:/certs:ro
-      - hodor-config:/hodor-config:ro
+      - arkham-config:/arkham-config:ro
     networks:
       default: {}
       server:
@@ -74,7 +74,7 @@ services:
     working_dir: /srv
     command: ["run", "server.ts"]
     environment:
-      HODOR_REAL: ${HODOR_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_REAL: ${ARKHAM_REAL:?copy integration/.env.example to integration/.env}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?copy integration/.env.example to integration/.env}
       OIDC_ACCESS_TOKEN: ${OIDC_ACCESS_TOKEN:?copy integration/.env.example to integration/.env}
     volumes:
@@ -90,7 +90,7 @@ services:
   db:
     image: postgres:17-alpine
     # `POSTGRES_HOST_AUTH_METHOD=password` keeps auth to the cleartext
-    # PasswordMessage inside TLS — the exact bytes hodor's machine rewrites;
+    # PasswordMessage inside TLS — the exact bytes arkham's machine rewrites;
     # scram's challenge dance would hide them. The key is copied out of the
     # shared volume and re-owned: postgres refuses a private key it does not
     # own, and the volume file is root-owned.
@@ -99,12 +99,12 @@ services:
       - -c
       - cp /certs/pg.key /tmp/pg.key && chown postgres:postgres /tmp/pg.key && chmod 600 /tmp/pg.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/pg.crt -c ssl_key_file=/tmp/pg.key
     environment:
-      POSTGRES_USER: hodor
-      POSTGRES_PASSWORD: hodor_real_password_01
+      POSTGRES_USER: arkham
+      POSTGRES_PASSWORD: arkham_real_password_01
       POSTGRES_DB: demo
       POSTGRES_HOST_AUTH_METHOD: password
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hodor -d demo"]
+      test: ["CMD-SHELL", "pg_isready -U arkham -d demo"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -118,8 +118,8 @@ services:
         ipv4_address: 10.202.0.30
 
   # A plain openssh-server. It admits exactly the real identity's public
-  # half; the decoy never authenticates here. hodor dials it on the server
-  # net, and its host key rides accept-new into hodor's known_hosts.
+  # half; the decoy never authenticates here. arkham dials it on the server
+  # net, and its host key rides accept-new into arkham's known_hosts.
   sshd:
     image: alpine:3.22
     entrypoint:
@@ -155,16 +155,16 @@ services:
         "apt-get update -qq && apt-get install -qq -y openssh-client && exec bun run run.ts",
       ]
     environment:
-      HODOR_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `hodor fake GH_TOKEN`, not a credential
-      DATABASE_URL: postgres://hodor:hodor_fake_password_01@db:5432/demo?sslmode=require # nosemgrep: deterministic demo decoy, not a credential
-      OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `hodor fake OIDC_CLIENT_SECRET`, not a credential
+      ARKHAM_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `arkham fake GH_TOKEN`, not a credential
+      DATABASE_URL: postgres://arkham:arkham_fake_password_01@db:5432/demo?sslmode=require # nosemgrep: deterministic demo decoy, not a credential
+      OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `arkham fake OIDC_CLIENT_SECRET`, not a credential
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
-    network_mode: service:hodor
+    network_mode: service:arkham
     depends_on:
-      hodor:
+      arkham:
         condition: service_started
       api:
         condition: service_started
@@ -181,4 +181,4 @@ networks:
 
 volumes:
   certs: {}
-  hodor-config: {}
+  arkham-config: {}

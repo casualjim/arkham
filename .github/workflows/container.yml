@@ -45,25 +45,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir ctx
-          asset="hodor-${{ matrix.target }}.tar.xz"
+          asset="arkham-${{ matrix.target }}.tar.xz"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$asset" -O bundle.tar.xz
           # dist nests the contents under a root dir named after the archive.
           tar xJf bundle.tar.xz -C ctx --strip-components=1
-          test -x ctx/hodor
+          test -x ctx/arkham
 
       - name: Assert the binary carries transparent capture
         run: |
           # dist silently ignores build settings it does not recognize, and a
           # binary built without capture only fails at runtime, in production.
           # Each marker is a static string that only exists when its backend is
-          # compiled in: the TUN device path (hodor-tun), the unscoped-capture
-          # guard message (hodor-tproxy), and the eBPF program name inside the
-          # embedded BPF object (hodor-ebpf-programs). The per-backend failure
+          # compiled in: the TUN device path (arkham-tun), the unscoped-capture
+          # guard message (arkham-tproxy), and the eBPF program name inside the
+          # embedded BPF object (arkham-ebpf-programs). The per-backend failure
           # messages are runtime format strings ("{name} capture failed: ..."),
           # so they never appear verbatim in the binary.
           for marker in '/dev/net/tun' 'refusing to install unscoped TPROXY capture' 'capture_egress'; do
-            if ! grep -aq -- "$marker" ctx/hodor; then
-              echo "::error::ctx/hodor was built without transparent capture ($marker)"
+            if ! grep -aq -- "$marker" ctx/arkham; then
+              echo "::error::ctx/arkham was built without transparent capture ($marker)"
               exit 1
             fi
           done

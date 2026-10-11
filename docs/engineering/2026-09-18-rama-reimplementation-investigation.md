@@ -1,16 +1,16 @@
-# Can `hodor-proxy` be reimplemented on `rama`
+# Can `arkham-proxy` be reimplemented on `rama`
 
 Date: 2026-09-18
 
 ## Question
 
-Whether `crates/hodor-proxy` can be rebuilt on `~/github/plabayo/rama` (`rama` 0.5.0), and what such a rewrite would actually delete.
+Whether `crates/arkham-proxy` can be rebuilt on `~/github/plabayo/rama` (`rama` 0.5.0), and what such a rewrite would actually delete.
 
 Short answer: the transport around the substitution engine can move to `rama`. The substitution engine is the product and stays hand written. A full replacement would cost the byte-for-byte splice guarantee and the fail-closed latch, which are the two properties the credential swap rests on.
 
 ## Where the logic lives
 
-Line census over `crates/hodor-proxy/src`, implementation lines only, excluding `#[cfg(test)]` blocks:
+Line census over `crates/arkham-proxy/src`, implementation lines only, excluding `#[cfg(test)]` blocks:
 
 | File | Impl | Test |
 | --- | --- | --- |
@@ -30,19 +30,19 @@ So the replaceable half is the smaller half. That framing matters more than any 
 
 ### Transparent and explicit ingress
 
-`serve` (`crates/hodor-proxy/src/lib.rs:204`), `handle_conn` (`:216`), `handle_connect` (`:235`), `handle_forward` (`:598`), `read_head` (`:635`), and `parse_authority` (`:665`) are head parsing plus CONNECT plus absolute-form forwarding. `rama` covers this with `HttpServer::auto`, `UpgradeLayer` with `MethodMatcher::CONNECT`, and `EagerHttpProxyConnector`. See `examples/src/http_connect_proxy.rs` and the stack assembly in `examples/src/http_mitm_proxy_boring.rs:93-151`.
+`serve` (`crates/arkham-proxy/src/lib.rs:204`), `handle_conn` (`:216`), `handle_connect` (`:235`), `handle_forward` (`:598`), `read_head` (`:635`), and `parse_authority` (`:665`) are head parsing plus CONNECT plus absolute-form forwarding. `rama` covers this with `HttpServer::auto`, `UpgradeLayer` with `MethodMatcher::CONNECT`, and `EagerHttpProxyConnector`. See `examples/src/http_connect_proxy.rs` and the stack assembly in `examples/src/http_mitm_proxy_boring.rs:93-151`.
 
-`IP_TRANSPARENT` capture and original-destination recovery map to `rama-net/src/socket/linux/tproxy.rs`, where `ConnectorTargetFromGetSocketnameLayer` reads the socket name into a `ConnectorTarget`. `examples/src/linux_tproxy_tcp.rs` walks the full setup, including a dual-stack listener. This is a direct match for the `tproxy` backend's `stream.local_addr()` use at `crates/hodor-tproxy/src/tproxy.rs:201`.
+`IP_TRANSPARENT` capture and original-destination recovery map to `rama-net/src/socket/linux/tproxy.rs`, where `ConnectorTargetFromGetSocketnameLayer` reads the socket name into a `ConnectorTarget`. `examples/src/linux_tproxy_tcp.rs` walks the full setup, including a dual-stack listener. This is a direct match for the `tproxy` backend's `stream.local_addr()` use at `crates/arkham-tproxy/src/tproxy.rs:201`.
 
-The upstream `SO_MARK` path maps to `SocketOptions::mark` (`rama-net/src/socket/opts.rs:908`) wired through `TcpConnector::with_connector` with a `TcpStreamConnector` built from `Arc<SocketOptions>` (`rama-tcp/src/client/connect.rs:79`, `:121`). That replaces `dial_one` (`crates/hodor-proxy/src/lib.rs:493`) and its `socket2` socket, while the DNS and total-budget logic in `dial_marked` (`:467`) stays.
+The upstream `SO_MARK` path maps to `SocketOptions::mark` (`rama-net/src/socket/opts.rs:908`) wired through `TcpConnector::with_connector` with a `TcpStreamConnector` built from `Arc<SocketOptions>` (`rama-tcp/src/client/connect.rs:79`, `:121`). That replaces `dial_one` (`crates/arkham-proxy/src/lib.rs:493`) and its `socket2` socket, while the DNS and total-budget logic in `dial_marked` (`:467`) stays.
 
 What does not move: the TUN userspace stack, the eBPF programs and their map ABI, the nft and policy-route netlink code, and the UDP handling in each backend. `rama` supplies TPROXY ingress and nothing else here.
 
 ### ClientHello sniffing and protocol peek
 
-`sniff_stream` (`crates/hodor-proxy/src/sniff.rs:24`) and `peek_mode` (`crates/hodor-proxy/src/lib.rs:529`) are hand rolled. `rama` has `PeekTlsClientHelloService` and `InputWithClientHello` (`rama-tls/src/server/peek_client_hello.rs:42`, `:281`), plus `TlsPeekRouter` and `HttpPeekRouter`. The policy decision on the peeked SNI has an existing shape at `rama-cli/src/cmd/serve/proxy/mod.rs:713-770`, where `TlsHelloMitmPolicyService` chooses inspect or passthrough from `MitmPolicy`.
+`sniff_stream` (`crates/arkham-proxy/src/sniff.rs:24`) and `peek_mode` (`crates/arkham-proxy/src/lib.rs:529`) are hand rolled. `rama` has `PeekTlsClientHelloService` and `InputWithClientHello` (`rama-tls/src/server/peek_client_hello.rs:42`, `:281`), plus `TlsPeekRouter` and `HttpPeekRouter`. The policy decision on the peeked SNI has an existing shape at `rama-cli/src/cmd/serve/proxy/mod.rs:713-770`, where `TlsHelloMitmPolicyService` chooses inspect or passthrough from `MitmPolicy`.
 
-That maps onto hodor's gate well. `intercept_candidate` and `https_eligible` (`crates/hodor-config/src/grants.rs:232`, `:242`) become a policy predicate over the SNI, and `MitmPolicy` already models allow, deny, wildcard, and leading-dot rules (`rama-http/src/inspect/mitm_policy.rs:152`, tests at `:272-375`).
+That maps onto arkham's gate well. `intercept_candidate` and `https_eligible` (`crates/arkham-config/src/grants.rs:232`, `:242`) become a policy predicate over the SNI, and `MitmPolicy` already models allow, deny, wildcard, and leading-dot rules (`rama-http/src/inspect/mitm_policy.rs:152`, tests at `:272-375`).
 
 This is a real win. It deletes a hand written ClientHello parser and its size and timeout edge cases.
 
@@ -54,17 +54,17 @@ The rustls route is `RustlsServerConfigExt::modify_rustls_config` (`rama-tls-rus
 
 The boring route is `TlsMitmRelay` (`rama-tls-boring/src/proxy/mitm/mod.rs:106`) with a `DynamicCertIssuer` (`rama-tls/src/server/config.rs:245`) and a moka-backed issued-cert cache (`rama-tls-boring/src/server/cert_issuer.rs:23`, `:91`).
 
-Either way, `crates/hodor-pki/src/ca.rs` keeps the CA. `generate_domain_cert` (`:304`) and the PEM load path (`:84`) are `rcgen` plus `rustls` types and port cleanly. The cache semantics do not port for free. hodor's `CertCache` (`:344`) is a `DashMap` with lazy expiry rotation on lookup (`get`, `:367`), pre-generated exact-host and wildcard leaves at `ProxyState::new` (`crates/hodor-proxy/src/lib.rs:62-77`), and a mint budget of `MINT_BURST 20` per `MINT_WINDOW_SECS 10` with `CACHE_CAPACITY 1000` (`crates/hodor-pki/src/ca.rs:16-24`). `rama`'s cache has no TTL by default and rejects expired leaves by reissuing (`rama-tls-boring/README.md:117`). The pre-generation and the rate limit would have to be re-implemented on top, so this slice moves partially.
+Either way, `crates/arkham-pki/src/ca.rs` keeps the CA. `generate_domain_cert` (`:304`) and the PEM load path (`:84`) are `rcgen` plus `rustls` types and port cleanly. The cache semantics do not port for free. arkham's `CertCache` (`:344`) is a `DashMap` with lazy expiry rotation on lookup (`get`, `:367`), pre-generated exact-host and wildcard leaves at `ProxyState::new` (`crates/arkham-proxy/src/lib.rs:62-77`), and a mint budget of `MINT_BURST 20` per `MINT_WINDOW_SECS 10` with `CACHE_CAPACITY 1000` (`crates/arkham-pki/src/ca.rs:16-24`). `rama`'s cache has no TTL by default and rejects expired leaves by reissuing (`rama-tls-boring/README.md:117`). The pre-generation and the rate limit would have to be re-implemented on top, so this slice moves partially.
 
 ### TLS termination relay
 
-`mitm_tls_stream` (`crates/hodor-proxy/src/lib.rs:385`) plus `relay_guarded` (`crates/hodor-proxy/src/relay.rs:12`) is one guest TLS session paired with one upstream TLS session, pumped per direction. `rama`'s `HttpMitmRelay` implements `Service<BridgeIo<Ingress, Egress>>` (`rama-http-backend/src/proxy/mitm.rs:237`) and takes HTTP middleware via `with_http_middleware` (`:189`). The boring path is the paired one that keeps a single upstream connection across the CONNECT handshake.
+`mitm_tls_stream` (`crates/arkham-proxy/src/lib.rs:385`) plus `relay_guarded` (`crates/arkham-proxy/src/relay.rs:12`) is one guest TLS session paired with one upstream TLS session, pumped per direction. `rama`'s `HttpMitmRelay` implements `Service<BridgeIo<Ingress, Egress>>` (`rama-http-backend/src/proxy/mitm.rs:237`) and takes HTTP middleware via `with_http_middleware` (`:189`). The boring path is the paired one that keeps a single upstream connection across the CONNECT handshake.
 
 ## What cannot be replaced
 
 ### The substitution engine is the product
 
-`SubMachine` (`crates/hodor-proxy/src/substitute/mod.rs:152`) is a synchronous, byte-slice, per-direction machine:
+`SubMachine` (`crates/arkham-proxy/src/substitute/mod.rs:152`) is a synchronous, byte-slice, per-direction machine:
 
 ```rust
 fn substitute<'b>(&mut self, chunk: &'b [u8]) -> (Cow<'b, [u8]>, Vec<Hit>);
@@ -86,13 +86,13 @@ Cross-chunk matching. `scan_with_tail` (`substitute/mod.rs:208`) and `find_cross
 
 The specific reason the H1 machine cannot simply become `rama` middleware is the pass-through contract. `HttpMitmRelay`'s middleware is bounded by `Layer<HttpClientService<Body>>` (`rama-http-backend/src/proxy/mitm.rs:241`), so a middleware receives a decoded `Request` or `Response` and returns one. That value is re-serialised by the HTTP codec on the way out.
 
-hodor's contract is the opposite. Non-granted traffic and granted-but-secretless traffic must be byte-identical. The suite pins this in `mitm_terminates_both_ends_verbatim` (`crates/hodor-proxy/src/lib.rs:964`), `absolute_form_forwards_head_verbatim` (`:917`), `connect_splices_bytes_verbatim` (`:880`), `absolute_form_ungranted_chunked_splices_byte_identical` (`:1245`), and `tls_through_splice_leaves_fake_untouched` (`:1141`). A chunked body that rama re-frames is not byte-identical, even when no secret is present.
+arkham's contract is the opposite. Non-granted traffic and granted-but-secretless traffic must be byte-identical. The suite pins this in `mitm_terminates_both_ends_verbatim` (`crates/arkham-proxy/src/lib.rs:964`), `absolute_form_forwards_head_verbatim` (`:917`), `connect_splices_bytes_verbatim` (`:880`), `absolute_form_ungranted_chunked_splices_byte_identical` (`:1245`), and `tls_through_splice_leaves_fake_untouched` (`:1141`). A chunked body that rama re-frames is not byte-identical, even when no secret is present.
 
 So middleware is not a superset of the machine. It is a different guarantee, and a strictly weaker one for this use.
 
 ### Where rama's own reference code disagrees
 
-`examples/src/http_mitm_proxy_boring.rs:234-266` mutates decoded `WebSocketRelayMessage::Text` and maps `Binary` to an empty vector, which drops it. hodor's rule is forward unchanged and scan, never drop silently. Any port has to supply a passthrough fallback service rather than take the stock relay's default handling.
+`examples/src/http_mitm_proxy_boring.rs:234-266` mutates decoded `WebSocketRelayMessage::Text` and maps `Binary` to an empty vector, which drops it. arkham's rule is forward unchanged and scan, never drop silently. Any port has to supply a passthrough fallback service rather than take the stock relay's default handling.
 
 `rama-proxy` itself is not inbound MITM. Its crate docs (`rama-proxy/src/lib.rs:1-9`) describe an outbound proxy database used by connection pools. Wrong crate for this job.
 
@@ -112,13 +112,13 @@ TLS backend. Keep `rustls` plus `aws_lc_rs` and stay off the boring C dependency
 
 Scope. Ingress, sniff, and TLS only, leaving the relay and machines untouched. Or ingress and sniff only, which touches no dependency and no trust model. Or stop, and keep the hand written core.
 
-Machine port. Port the H1 HTTP framing states to middleware and accept the loss of the verbatim guarantee, which no hodor test currently allows. Or keep the machines and treat `rama` as ingress only. The second is the only version that preserves the existing test suite without weakening it.
+Machine port. Port the H1 HTTP framing states to middleware and accept the loss of the verbatim guarantee, which no arkham test currently allows. Or keep the machines and treat `rama` as ingress only. The second is the only version that preserves the existing test suite without weakening it.
 
 ## Method and evidence
 
-All repository paths and symbols in this document were read in this session: `crates/hodor-proxy`, `crates/hodor-pki`, `crates/hodor-config/src/grants.rs`, `crates/hodor-tproxy/src/tproxy.rs`, `crates/hodor-tun/src/tun.rs`, and `crates/hodor-ebpf/src/tcp.rs` on the hodor side; `rama-net`, `rama-tcp`, `rama-tls`, `rama-tls-rustls`, `rama-tls-boring`, `rama-http`, `rama-http-backend`, `rama-proxy`, `rama-cli`, and `examples/src` on the rama side.
+All repository paths and symbols in this document were read in this session: `crates/arkham-proxy`, `crates/arkham-pki`, `crates/arkham-config/src/grants.rs`, `crates/arkham-tproxy/src/tproxy.rs`, `crates/arkham-tun/src/tun.rs`, and `crates/arkham-ebpf/src/tcp.rs` on the arkham side; `rama-net`, `rama-tcp`, `rama-tls`, `rama-tls-rustls`, `rama-tls-boring`, `rama-http`, `rama-http-backend`, `rama-proxy`, `rama-cli`, and `examples/src` on the rama side.
 
-Both repositories are indexed in the codebase memory graph with clean coverage for the hodor-side files cited (`index_status` ready, `check_index_coverage` reporting `no_recorded_issue` for all thirteen). The rama index reports 43 partial-parse files and 4 unusable ones, none of them cited here.
+Both repositories are indexed in the codebase memory graph with clean coverage for the arkham-side files cited (`index_status` ready, `check_index_coverage` reporting `no_recorded_issue` for all thirteen). The rama index reports 43 partial-parse files and 4 unusable ones, none of them cited here.
 
 Line counts come from `wc -l` plus the first `#[cfg(test)]` line in each file. The test split counts the `mod tests` block from its attribute line, so a file with tests above the attribute would be miscounted; none of these six have any.
 

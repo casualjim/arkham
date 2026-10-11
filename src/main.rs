@@ -1,4 +1,4 @@
-//! `hodor`: grant-scoped MITM proxy.
+//! `arkham`: grant-scoped MITM proxy.
 //!
 //! Terminates client TLS with per-domain leaf certificates, swaps
 //! format-valid decoy fakes for real secret values only on URI-grant
@@ -10,16 +10,16 @@ mod fwd;
 
 use std::path::{Path, PathBuf};
 
+use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
+use arkham_fnox::FnoxSource;
 use clap::{Parser, Subcommand};
-use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
-use hodor_fnox::FnoxSource;
 
+use arkham_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
 use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, ServeArgs};
-use hodor_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
 
 #[derive(Parser, Debug)]
-#[command(name = "hodor", about = "grant-scoped MITM proxy", version)]
-struct HodorCli {
+#[command(name = "arkham", about = "grant-scoped MITM proxy", version)]
+struct ArkhamCli {
   /// Global flags: the highest-precedence config layer.
   #[command(flatten)]
   globals: Cli,
@@ -65,19 +65,19 @@ enum Command {
   /// Forward agent-owned loopback listeners to the wildcard interface.
   ///
   /// A sidecar of the generated compose stack, not a user command: it shares
-  /// the agent's PID namespace and hodor's network namespace, so it sees every
+  /// the agent's PID namespace and arkham's network namespace, so it sees every
   /// listener of the shared namespace and can attribute the ones the agent's
-  /// own processes hold. Anything else — hodor's capture and explicit-proxy
+  /// own processes hold. Anything else — arkham's capture and explicit-proxy
   /// listeners, docker's embedded DNS — is never attributable from here and
   /// is never forwarded. Raw bytes only: payloads are never inspected.
   Fwd(FwdArgs),
-  /// Start the layered compose project `hodor init` generated.
+  /// Start the layered compose project `arkham init` generated.
   Up(UpArgs),
   /// Publish an agent port on the host, claiming the host port across
-  /// workspaces: `hodor expose <port> [--host <host-port>]` appends the
+  /// workspaces: `arkham expose <port> [--host <host-port>]` appends the
   /// `[[workspace.expose]]` mapping, regenerates, and `up`s (recreating the
-  /// hodor service, so exec sessions drop). A host port another workspace
-  /// claimed fails naming that workspace. `hodor expose --list` reports
+  /// arkham service, so exec sessions drop). A host port another workspace
+  /// claimed fails naming that workspace. `arkham expose --list` reports
   /// this workspace's publishings plus every workspace's claims.
   Expose(ExposeArgs),
   /// Stop the layered compose project.
@@ -91,8 +91,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Resolve the CA file path: config `ca_file` if set, else `/certs/ca.pem`
 /// when the generated stack mounted it there, else the default
-/// `<config-dir>/hodor/ca.pem`.
-fn ca_path(proxy: &hodor_config::config::ProxyCfg) -> eyre::Result<PathBuf> {
+/// `<config-dir>/arkham/ca.pem`.
+fn ca_path(proxy: &arkham_config::config::ProxyCfg) -> eyre::Result<PathBuf> {
   if let Some(path) = proxy.ca_file.clone() {
     return Ok(path);
   }
@@ -101,36 +101,36 @@ fn ca_path(proxy: &hodor_config::config::ProxyCfg) -> eyre::Result<PathBuf> {
     return Ok(mounted.to_path_buf());
   }
   dirs::config_dir()
-    .map(|dir: PathBuf| dir.join("hodor").join("ca.pem"))
+    .map(|dir: PathBuf| dir.join("arkham").join("ca.pem"))
     .ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))
 }
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-  hodor_pki::ca::install_crypto_provider();
+  arkham_pki::ca::install_crypto_provider();
   tracing_subscriber::fmt()
     .pretty()
     .with_line_number(true)
     .with_thread_names(true)
     .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
     .init();
-  let HodorCli { globals: cli, command } = HodorCli::parse();
+  let ArkhamCli { globals: cli, command } = ArkhamCli::parse();
   let command = command.unwrap_or(Command::Serve(ServeArgs::default()));
-  let hodor_version = env!("CARGO_PKG_VERSION");
+  let arkham_version = env!("CARGO_PKG_VERSION");
   match command {
-    Command::Serve(args) => args.run(&cli, hodor_version).await?,
-    Command::Fake(args) => args.run(&cli, hodor_version).await?,
-    Command::Ca(args) => args.run(&cli, hodor_version).await?,
-    Command::Rules(args) => args.run(&cli, hodor_version).await?,
-    Command::Config(args) => args.run(&cli, hodor_version).await?,
-    Command::Registry(args) => args.run(&cli, hodor_version).await?,
-    Command::Init(args) => args.run(&cli, hodor_version).await?,
-    Command::Agent(args) => args.run(&cli, hodor_version).await?,
-    Command::Fwd(args) => args.run(&cli, hodor_version).await?,
-    Command::Up(args) => args.run(&cli, hodor_version).await?,
-    Command::Expose(args) => args.run(&cli, hodor_version).await?,
-    Command::Down(args) => args.run(&cli, hodor_version).await?,
-    Command::Logs(args) => args.run(&cli, hodor_version).await?,
+    Command::Serve(args) => args.run(&cli, arkham_version).await?,
+    Command::Fake(args) => args.run(&cli, arkham_version).await?,
+    Command::Ca(args) => args.run(&cli, arkham_version).await?,
+    Command::Rules(args) => args.run(&cli, arkham_version).await?,
+    Command::Config(args) => args.run(&cli, arkham_version).await?,
+    Command::Registry(args) => args.run(&cli, arkham_version).await?,
+    Command::Init(args) => args.run(&cli, arkham_version).await?,
+    Command::Agent(args) => args.run(&cli, arkham_version).await?,
+    Command::Fwd(args) => args.run(&cli, arkham_version).await?,
+    Command::Up(args) => args.run(&cli, arkham_version).await?,
+    Command::Expose(args) => args.run(&cli, arkham_version).await?,
+    Command::Down(args) => args.run(&cli, arkham_version).await?,
+    Command::Logs(args) => args.run(&cli, arkham_version).await?,
   }
   Ok(())
 }
@@ -138,14 +138,14 @@ async fn main() -> eyre::Result<()> {
 /// The registry the value-resolving commands run with: the bundled table,
 /// the global `rules.d`, then the workspace's own when one encloses the
 /// working directory.
-fn generation_registry() -> eyre::Result<hodor_config::registry::Registry> {
-  Ok(hodor_config::registry::Registry::load_union(
-    hodor_config::config::rules_dir().as_deref(),
-    hodor_config::config::cwd_project_rules_dir().as_deref(),
+fn generation_registry() -> eyre::Result<arkham_config::registry::Registry> {
+  Ok(arkham_config::registry::Registry::load_union(
+    arkham_config::config::rules_dir().as_deref(),
+    arkham_config::config::cwd_project_rules_dir().as_deref(),
   )?)
 }
 
-/// `hodor serve`: bind the explicit listener, then run the selected capture
+/// `arkham serve`: bind the explicit listener, then run the selected capture
 /// backend alongside it.
 async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   #[cfg(not(target_os = "linux"))]
@@ -153,11 +153,11 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     eyre::bail!("transparent capture (--proxy-backend) is only supported on Linux");
   }
   // No default cgroup: attaching to the root cgroup would capture every
-  // process on the machine, hodor's own upstream dials included.
+  // process on the machine, arkham's own upstream dials included.
   if args.proxy_backend == ProxyBackend::Ebpf && args.ebpf_cgroup.is_none() {
     eyre::bail!("--ebpf-cgroup is required for --proxy-backend ebpf");
   }
-  let (mut config, workspace) = hodor_config::config::load(cli, Some(&args.proxy))?;
+  let (mut config, workspace) = arkham_config::config::load(cli, Some(&args.proxy))?;
   let registry = generation_registry()?;
   // fnox always opens: it is the value source and the rule catalog —
   // derivation needs the declared names even with no config rule — and
@@ -166,12 +166,12 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   // environment that started this process.
   let fnox = FnoxSource::open()?;
   if let Some(source) = &fnox {
-    for name in hodor_fnox::export_provider_env(source).await {
+    for name in arkham_fnox::export_provider_env(source).await {
       tracing::debug!(name, "provider credential taken from fnox");
     }
   }
-  hodor_fnox::resolve(&mut config, &registry, fnox).await?;
-  let resolved = hodor_config::grants::resolve(&config)?;
+  arkham_fnox::resolve(&mut config, &registry, fnox).await?;
+  let resolved = arkham_config::grants::resolve(&config)?;
   if let Some(ws) = &workspace {
     tracing::info!(
       root = %ws.root().display(),
@@ -182,7 +182,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   } else {
     tracing::debug!("no workspace root, global config only");
   }
-  let ca = hodor_pki::ca::load_or_generate(&ca_path(&resolved.proxy)?)?;
+  let ca = arkham_pki::ca::load_or_generate(&ca_path(&resolved.proxy)?)?;
   let listen_addr = resolved.proxy.listen;
   let grant_count = resolved.grants.len();
   #[cfg(target_os = "linux")]
@@ -190,21 +190,21 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     // eBPF needs no fwmark: exclusion is cgroup membership plus the proxy PID
     // the programs compare against, not a routing loop to break.
     ProxyBackend::None | ProxyBackend::Ebpf => None,
-    ProxyBackend::Tproxy => Some(hodor_tproxy::EGRESS_MARK),
-    ProxyBackend::Tun => Some(hodor_tun::FWMARK),
+    ProxyBackend::Tproxy => Some(arkham_tproxy::EGRESS_MARK),
+    ProxyBackend::Tun => Some(arkham_tun::FWMARK),
   };
   #[cfg(not(target_os = "linux"))]
   let fwmark = None;
   #[cfg(target_os = "linux")]
   let state = std::sync::Arc::new(match fwmark {
-    Some(mark) => hodor_proxy::ProxyState::new(resolved, &ca)?.with_fwmark(mark),
-    None => hodor_proxy::ProxyState::new(resolved, &ca)?,
+    Some(mark) => arkham_proxy::ProxyState::new(resolved, &ca)?.with_fwmark(mark),
+    None => arkham_proxy::ProxyState::new(resolved, &ca)?,
   });
   #[cfg(not(target_os = "linux"))]
-  let state = std::sync::Arc::new(hodor_proxy::ProxyState::new(resolved, &ca)?);
+  let state = std::sync::Arc::new(arkham_proxy::ProxyState::new(resolved, &ca)?);
   // Bind before capture side effects: a bad listen addr must fail
   // before nft rules and routes touch the host.
-  let listener = hodor_proxy::bind_explicit(listen_addr).await?;
+  let listener = arkham_proxy::bind_explicit(listen_addr).await?;
   if !listen_addr.ip().is_loopback() {
     tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
   }
@@ -215,7 +215,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     // Dropping the task runs its teardown guard, which removes the policy
     // routes; a leaked default route in the capture table blackholes all egress.
     return with_capture(listener, state, "TUN", async move {
-      hodor_tun::run_tun(capture).await.map_err(eyre::Report::from)
+      arkham_tun::run_tun(capture).await.map_err(eyre::Report::from)
     })
     .await;
   }
@@ -224,7 +224,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let capture = std::sync::Arc::clone(&state);
     let allow_root_netns = args.tproxy_allow_root_netns;
     return with_capture(listener, state, "TPROXY", async move {
-      hodor_tproxy::run_tproxy(capture, allow_root_netns)
+      arkham_tproxy::run_tproxy(capture, allow_root_netns)
         .await
         .map_err(eyre::Report::from)
     })
@@ -240,13 +240,13 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let bypass = args.ebpf_bypass.clone();
     let bypass_file = args.ebpf_bypass_file.clone();
     return with_capture(listener, state, "eBPF", async move {
-      hodor_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file)
+      arkham_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file)
         .await
         .map_err(eyre::Report::from)
     })
     .await;
   }
-  hodor_proxy::serve(listener, state).await;
+  arkham_proxy::serve(listener, state).await;
   Ok(())
 }
 
@@ -258,8 +258,8 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
 /// lives here, at process level, never inside the capture task: aborting the
 /// task is what runs its teardown, and every backend has host state to unwind.
 async fn with_capture<F>(
-  listener: hodor_proxy::RamaTcpListener,
-  state: std::sync::Arc<hodor_proxy::ProxyState>,
+  listener: arkham_proxy::RamaTcpListener,
+  state: std::sync::Arc<arkham_proxy::ProxyState>,
   name: &'static str,
   capture: F,
 ) -> eyre::Result<()>
@@ -268,7 +268,7 @@ where
 {
   let mut handle = tokio::spawn(capture);
   tokio::select! {
-    () = hodor_proxy::serve(listener, state) => Ok(()),
+    () = arkham_proxy::serve(listener, state) => Ok(()),
     capture_result = &mut handle => match capture_result {
       Ok(inner) => inner.map_err(|err| eyre::eyre!("{name} capture failed: {err:?}")),
       Err(err) => Err(eyre::eyre!("{name} task failed: {err}")),

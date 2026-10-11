@@ -1,20 +1,20 @@
 # Tutorial: your first credential swap
 
-This tutorial walks you through one full round trip with hodor. You will start a proxy, send a request carrying a decoy token, and prove two things: the upstream received the real value, and the client only ever saw the decoy. You will then repeat it over HTTPS so you exercise the CA trust step every real deployment needs.
+This tutorial walks you through one full round trip with arkham. You will start a proxy, send a request carrying a decoy token, and prove two things: the upstream received the real value, and the client only ever saw the decoy. You will then repeat it over HTTPS so you exercise the CA trust step every real deployment needs.
 
-Time needed: about ten minutes. You need a shell, `curl`, `python3`, and a hodor binary. If you do not have one yet, follow [the install steps in the README](../../README.md#install) first.
+Time needed: about ten minutes. You need a shell, `curl`, `python3`, and a arkham binary. If you do not have one yet, follow [the install steps in the README](../../README.md#install) first.
 
 ## What you will build
 
 ```text
-  curl (holds the decoy) ---> hodor :8080 ---> upstream :8000 (receives the real value)
+  curl (holds the decoy) ---> arkham :8080 ---> upstream :8000 (receives the real value)
 ```
 
-hodor sits between a client and an upstream. The client holds a fake but format-valid token. When the destination matches a rule's allow entry, hodor swaps the fake for the real value on the way out, and swaps it back on the way in.
+arkham sits between a client and an upstream. The client holds a fake but format-valid token. When the destination matches a rule's allow entry, arkham swaps the fake for the real value on the way out, and swaps it back on the way in.
 
 ## 1. Write the config
 
-Create an empty directory and save this as `hodor.toml`:
+Create an empty directory and save this as `arkham.toml`:
 
 ```toml
 [proxy]
@@ -32,7 +32,7 @@ The rule says: the token seeded from `DEMO_TOKEN` may be swapped in only for `ht
 ## 2. Get the decoy
 
 ```sh
-hodor fake DEMO_TOKEN
+arkham fake DEMO_TOKEN
 ```
 
 ```
@@ -75,13 +75,13 @@ python3 upstream.py
 
 ## 4. Start the proxy
 
-In a second terminal, from the directory holding `hodor.toml`:
+In a second terminal, from the directory holding `arkham.toml`:
 
 ```sh
-hodor serve --config hodor.toml
+arkham serve --config arkham.toml
 ```
 
-hodor logs the listen address and the grant count:
+arkham logs the listen address and the grant count:
 
 ```
 serving, listen: 127.0.0.1:8080, grants: 1
@@ -128,15 +128,15 @@ The proxy log records a splice, not a substitution, and the request carries the 
 
 ## 7. Do it over HTTPS
 
-Real secrets go to real hosts over TLS. To intercept a granted HTTPS connection, hodor terminates TLS with a certificate signed by its own CA, and the client must trust that CA.
+Real secrets go to real hosts over TLS. To intercept a granted HTTPS connection, arkham terminates TLS with a certificate signed by its own CA, and the client must trust that CA.
 
 Generate the CA and print the certificate:
 
 ```sh
-hodor ca --config hodor.toml
+arkham ca --config arkham.toml
 ```
 
-One run writes three files beside the config's `ca_file`: `ca.pem` (certificate plus key, what hodor reads), `ca.crt` (certificate alone, what clients trust), and `ca.key` (key alone).
+One run writes three files beside the config's `ca_file`: `ca.pem` (certificate plus key, what arkham reads), `ca.crt` (certificate alone, what clients trust), and `ca.key` (key alone).
 
 Add an HTTPS-capable upstream. Simplest check that needs no server certificate of its own: any public HTTPS host will do for observing the trust failure and success. First, try the swap against a granted HTTPS host without trusting the CA:
 
@@ -147,25 +147,25 @@ value = "real-secret-value-xyz"
 allow = ["http://127.0.0.1:8000", "https://example.com"]
 ```
 
-Restart `hodor serve`, then:
+Restart `arkham serve`, then:
 
 ```sh
 curl -x http://127.0.0.1:8080 https://example.com/ \
   -H 'Authorization: Bearer fd0c437df7ae3abca3e37d89840b4503'
 ```
 
-curl reports a certificate verification failure: the client does not yet trust hodor's CA. Retry with the CA trusted for this one command:
+curl reports a certificate verification failure: the client does not yet trust arkham's CA. Retry with the CA trusted for this one command:
 
 ```sh
 curl --cacert ca.crt -x http://127.0.0.1:8080 https://example.com/ \
   -H 'Authorization: Bearer fd0c437df7ae3abca3e37d89840b4503'
 ```
 
-The request now completes. hodor terminated the TLS connection, substituted the header, and redacted any occurrence of the real value in the response back to the decoy.
+The request now completes. arkham terminated the TLS connection, substituted the header, and redacted any occurrence of the real value in the response back to the decoy.
 
 ## Where to go next
 
 - [Secure your workspace](how-to/confine-a-workspace.md) to run a coding agent with decoys only.
 - [Capture traffic transparently](how-to/capture-traffic-transparently.md) so clients need no proxy setting.
 - [The configuration reference](reference/configuration.md) for every key.
-- [How hodor works](explanation/how-it-works.md) when you want the machinery behind the swap.
+- [How arkham works](explanation/how-it-works.md) when you want the machinery behind the swap.

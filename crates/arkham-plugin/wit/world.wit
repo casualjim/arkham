@@ -1,0 +1,38 @@
+package arkham:rewrite@0.1.0;
+
+interface types {
+  record header {
+    name: string,
+    value: list<u8>,
+  }
+
+  record request-head {
+    method: string,
+    path-with-query: string,
+    headers: list<header>,
+  }
+
+  record response-head {
+    status: u16,
+    headers: list<header>,
+  }
+
+  record body-chunk {
+    data: list<u8>,
+    eof: bool,
+  }
+}
+
+world request {
+  use types.{request-head, body-chunk, header};
+  export rewrite-request-head: func(head: request-head) -> result<request-head, string>;
+  export rewrite-request-trailers: func(headers: list<header>) -> result<list<header>, string>;
+  export rewrite-request-chunk: func(chunk: body-chunk) -> result<list<u8>, string>;
+}
+
+world response {
+  use types.{response-head, body-chunk, header};
+  export rewrite-response-head: func(head: response-head) -> result<response-head, string>;
+  export rewrite-response-trailers: func(headers: list<header>) -> result<list<header>, string>;
+  export rewrite-response-chunk: func(chunk: body-chunk) -> result<list<u8>, string>;
+}

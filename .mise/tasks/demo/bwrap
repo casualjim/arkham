@@ -16,7 +16,7 @@ if [ "${usage_use_sudo:-false}" = "true" ]; then
   sudo bash integration/bwrap/run.sh
 else
   if ! gum confirm "The bwrap demo needs root (netns, veth, nft); escalate with sudo?"; then
-    echo "escalation declined; built binary: target/release/hodor" >&2
+    echo "escalation declined; built binary: target/release/arkham" >&2
     exit 1
   fi
   sudo bash integration/bwrap/run.sh
