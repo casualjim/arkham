@@ -1020,38 +1020,469 @@ hosts = ["https://api.example/path"]
     assert!(err.to_string().contains("duplicate `token_fields` entry"), "{err:?}");
   }
 
+  const SIGNING_SECRETS: &[&str] = &[
+    "AWS_SECRET_ACCESS_KEY",
+    "EXOSCALE_SECRET_KEY",
+    "EXOSCALE_SECRET",
+    "POLYMARKET_SECRET",
+    "POLYMARKET_SECRET_KEY",
+    "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+    "ALICLOUD_ACCESS_KEY_SECRET",
+    "ALICLOUD_SECRET_KEY",
+    "OVH_APPLICATION_SECRET",
+    "OVH_APP_SECRET",
+    "BINANCE_API_SECRET",
+    "BINANCE_PRIVATE_KEY",
+    "BINANCE_SECRET",
+    "BINANCE_SECRET_KEY",
+    "BINANCECOINM_API_SECRET",
+    "BINANCECOINM_PRIVATE_KEY",
+    "BINANCECOINM_SECRET",
+    "BINANCECOINM_SECRET_KEY",
+    "BINANCEUS_API_SECRET",
+    "BINANCEUS_PRIVATE_KEY",
+    "BINANCEUS_SECRET",
+    "BINANCEUS_SECRET_KEY",
+    "BINANCEUSDM_API_SECRET",
+    "BINANCEUSDM_PRIVATE_KEY",
+    "BINANCEUSDM_SECRET",
+    "BINANCEUSDM_SECRET_KEY",
+    "OKX_API_SECRET",
+    "OKX_PRIVATE_KEY",
+    "OKX_SECRET",
+    "OKX_SECRET_KEY",
+    "OKXUS_API_SECRET",
+    "OKXUS_PRIVATE_KEY",
+    "OKXUS_SECRET",
+    "OKXUS_SECRET_KEY",
+    "MYOKX_API_SECRET",
+    "MYOKX_PRIVATE_KEY",
+    "MYOKX_SECRET",
+    "MYOKX_SECRET_KEY",
+    "BYBIT_API_SECRET",
+    "BYBIT_PRIVATE_KEY",
+    "BYBIT_SECRET",
+    "BYBIT_SECRET_KEY",
+    "BYBITEU_API_SECRET",
+    "BYBITEU_PRIVATE_KEY",
+    "BYBITEU_SECRET",
+    "BYBITEU_SECRET_KEY",
+    "KUCOIN_API_SECRET",
+    "KUCOIN_PRIVATE_KEY",
+    "KUCOIN_SECRET",
+    "KUCOIN_SECRET_KEY",
+    "KUCOINFUTURES_API_SECRET",
+    "KUCOINFUTURES_PRIVATE_KEY",
+    "KUCOINFUTURES_SECRET",
+    "KUCOINFUTURES_SECRET_KEY",
+    "KRAKEN_API_SECRET",
+    "KRAKEN_PRIVATE_KEY",
+    "KRAKEN_SECRET",
+    "KRAKEN_SECRET_KEY",
+    "COINBASE_API_SECRET",
+    "COINBASE_PRIVATE_KEY",
+    "COINBASE_SECRET",
+    "COINBASE_SECRET_KEY",
+    "COINBASEEXCHANGE_API_SECRET",
+    "COINBASEEXCHANGE_PRIVATE_KEY",
+    "COINBASEEXCHANGE_SECRET",
+    "COINBASEEXCHANGE_SECRET_KEY",
+    "COINBASE_EXCHANGE_API_SECRET",
+    "COINBASEINTERNATIONAL_API_SECRET",
+    "COINBASEINTERNATIONAL_PRIVATE_KEY",
+    "COINBASEINTERNATIONAL_SECRET",
+    "COINBASEINTERNATIONAL_SECRET_KEY",
+    "BITFINEX_API_SECRET",
+    "BITFINEX_PRIVATE_KEY",
+    "BITFINEX_SECRET",
+    "BITFINEX_SECRET_KEY",
+    "BITSTAMP_API_SECRET",
+    "BITSTAMP_PRIVATE_KEY",
+    "BITSTAMP_SECRET",
+    "BITSTAMP_SECRET_KEY",
+    "GEMINI_API_SECRET",
+    "GEMINI_PRIVATE_KEY",
+    "GEMINI_SECRET",
+    "GEMINI_SECRET_KEY",
+    "GATE_API_SECRET",
+    "GATE_PRIVATE_KEY",
+    "GATE_SECRET",
+    "GATE_SECRET_KEY",
+    "GATEEU_API_SECRET",
+    "GATEEU_PRIVATE_KEY",
+    "GATEEU_SECRET",
+    "GATEEU_SECRET_KEY",
+    "MEXC_API_SECRET",
+    "MEXC_PRIVATE_KEY",
+    "MEXC_SECRET",
+    "MEXC_SECRET_KEY",
+    "BITGET_API_SECRET",
+    "BITGET_PRIVATE_KEY",
+    "BITGET_SECRET",
+    "BITGET_SECRET_KEY",
+    "HTX_API_SECRET",
+    "HTX_PRIVATE_KEY",
+    "HTX_SECRET",
+    "HTX_SECRET_KEY",
+    "UPBIT_API_SECRET",
+    "UPBIT_PRIVATE_KEY",
+    "UPBIT_SECRET",
+    "UPBIT_SECRET_KEY",
+    "BITHUMB_API_SECRET",
+    "BITHUMB_PRIVATE_KEY",
+    "BITHUMB_SECRET",
+    "BITHUMB_SECRET_KEY",
+    "DERIBIT_API_SECRET",
+    "DERIBIT_PRIVATE_KEY",
+    "DERIBIT_SECRET",
+    "DERIBIT_SECRET_KEY",
+    "BITMEX_API_SECRET",
+    "BITMEX_PRIVATE_KEY",
+    "BITMEX_SECRET",
+    "BITMEX_SECRET_KEY",
+    "CRYPTOCOM_API_SECRET",
+    "CRYPTOCOM_PRIVATE_KEY",
+    "CRYPTOCOM_SECRET",
+    "CRYPTOCOM_SECRET_KEY",
+  ];
+
+  const SIGNING_VENDOR_KEYS: &[(&[&str], &str)] = &[
+    (
+      &["ALIBABA_CLOUD_ACCESS_KEY_ID", "ALICLOUD_ACCESS_KEY_ID", "ALICLOUD_ACCESS_KEY"],
+      "ecs.cn-shanghai.aliyuncs.com",
+    ),
+    (&["ALIBABA_CLOUD_SECURITY_TOKEN", "ALICLOUD_SECURITY_TOKEN"], "sts.aliyuncs.com"),
+    (&["OVH_APPLICATION_KEY", "OVH_APP_KEY", "OVH_CONSUMER_KEY"], "eu.api.ovh.com"),
+    (&["GEMINI_API_KEY", "GOOGLE_API_KEY"], "api.gemini.com"),
+    (
+      &[
+        "BITFINEX_API_KEY",
+        "BITFINEX_API_TOKEN",
+        "BITFINEX_APIKEY",
+        "BITFINEX_TOKEN",
+        "BITFINEX_ACCESS_TOKEN",
+        "BITFINEX_AUTH_TOKEN",
+        "BITFINEX_KEY",
+      ],
+      "api.bitfinex.com",
+    ),
+    (
+      &[
+        "KRAKEN_API_KEY",
+        "KRAKEN_API_TOKEN",
+        "KRAKEN_APIKEY",
+        "KRAKEN_TOKEN",
+        "KRAKEN_ACCESS_TOKEN",
+        "KRAKEN_AUTH_TOKEN",
+        "KRAKEN_KEY",
+      ],
+      "api.kraken.com",
+    ),
+    (
+      &[
+        "KUCOIN_API_KEY",
+        "KUCOIN_API_TOKEN",
+        "KUCOIN_APIKEY",
+        "KUCOIN_TOKEN",
+        "KUCOIN_ACCESS_TOKEN",
+        "KUCOIN_AUTH_TOKEN",
+        "KUCOIN_KEY",
+        "KUCOIN_PASSPHRASE",
+        "KUCOIN_API_PASSPHRASE",
+      ],
+      "api.kucoin.com",
+    ),
+    (
+      &[
+        "BINANCE_ACCESS_KEY",
+        "BINANCE_APIKEY",
+        "BINANCE_API_KEY",
+        "BINANCE_API_TOKEN",
+        "BINANCE_KEY",
+      ],
+      "api.binance.com",
+    ),
+    (
+      &[
+        "BINANCECOINM_ACCESS_KEY",
+        "BINANCECOINM_APIKEY",
+        "BINANCECOINM_API_KEY",
+        "BINANCECOINM_API_TOKEN",
+        "BINANCECOINM_KEY",
+      ],
+      "dapi.binance.com",
+    ),
+    (
+      &[
+        "BINANCEUS_ACCESS_KEY",
+        "BINANCEUS_APIKEY",
+        "BINANCEUS_API_KEY",
+        "BINANCEUS_API_TOKEN",
+        "BINANCEUS_KEY",
+      ],
+      "api.binance.us",
+    ),
+    (
+      &[
+        "BINANCEUSDM_ACCESS_KEY",
+        "BINANCEUSDM_APIKEY",
+        "BINANCEUSDM_API_KEY",
+        "BINANCEUSDM_API_TOKEN",
+        "BINANCEUSDM_KEY",
+      ],
+      "fapi.binance.com",
+    ),
+    (
+      &[
+        "BITGET_ACCESS_KEY",
+        "BITGET_APIKEY",
+        "BITGET_API_KEY",
+        "BITGET_API_TOKEN",
+        "BITGET_KEY",
+        "BITGET_PASSPHRASE",
+        "BITGET_API_PASSPHRASE",
+      ],
+      "api.bitget.com",
+    ),
+    (
+      &[
+        "BITHUMB_ACCESS_KEY",
+        "BITHUMB_APIKEY",
+        "BITHUMB_API_KEY",
+        "BITHUMB_API_TOKEN",
+        "BITHUMB_KEY",
+      ],
+      "api.bithumb.com",
+    ),
+    (
+      &[
+        "BITMEX_ACCESS_KEY",
+        "BITMEX_APIKEY",
+        "BITMEX_API_KEY",
+        "BITMEX_API_TOKEN",
+        "BITMEX_KEY",
+      ],
+      "www.bitmex.com",
+    ),
+    (
+      &[
+        "BITSTAMP_ACCESS_KEY",
+        "BITSTAMP_APIKEY",
+        "BITSTAMP_API_KEY",
+        "BITSTAMP_API_TOKEN",
+        "BITSTAMP_KEY",
+      ],
+      "www.bitstamp.net",
+    ),
+    (
+      &["BYBIT_ACCESS_KEY", "BYBIT_APIKEY", "BYBIT_API_KEY", "BYBIT_API_TOKEN", "BYBIT_KEY"],
+      "api.bybit.com",
+    ),
+    (
+      &[
+        "BYBITEU_ACCESS_KEY",
+        "BYBITEU_APIKEY",
+        "BYBITEU_API_KEY",
+        "BYBITEU_API_TOKEN",
+        "BYBITEU_KEY",
+      ],
+      "api.bybit.eu",
+    ),
+    (
+      &[
+        "COINBASE_ACCESS_KEY",
+        "COINBASE_APIKEY",
+        "COINBASE_API_KEY",
+        "COINBASE_API_TOKEN",
+        "COINBASE_KEY",
+      ],
+      "api.coinbase.com",
+    ),
+    (
+      &[
+        "COINBASEEXCHANGE_ACCESS_KEY",
+        "COINBASEEXCHANGE_APIKEY",
+        "COINBASEEXCHANGE_API_KEY",
+        "COINBASEEXCHANGE_API_TOKEN",
+        "COINBASEEXCHANGE_KEY",
+        "COINBASE_EXCHANGE_API_KEY",
+        "COINBASEEXCHANGE_PASSPHRASE",
+        "COINBASE_EXCHANGE_PASSPHRASE",
+      ],
+      "api.exchange.coinbase.com",
+    ),
+    (
+      &[
+        "COINBASEINTERNATIONAL_ACCESS_KEY",
+        "COINBASEINTERNATIONAL_APIKEY",
+        "COINBASEINTERNATIONAL_API_KEY",
+        "COINBASEINTERNATIONAL_API_TOKEN",
+        "COINBASEINTERNATIONAL_KEY",
+        "COINBASEINTERNATIONAL_PASSPHRASE",
+      ],
+      "api.international.coinbase.com",
+    ),
+    (
+      &[
+        "CRYPTOCOM_ACCESS_KEY",
+        "CRYPTOCOM_APIKEY",
+        "CRYPTOCOM_API_KEY",
+        "CRYPTOCOM_API_TOKEN",
+        "CRYPTOCOM_KEY",
+      ],
+      "api.crypto.com",
+    ),
+    (
+      &[
+        "DERIBIT_ACCESS_KEY",
+        "DERIBIT_APIKEY",
+        "DERIBIT_API_KEY",
+        "DERIBIT_API_TOKEN",
+        "DERIBIT_KEY",
+      ],
+      "www.deribit.com",
+    ),
+    (
+      &["GATE_ACCESS_KEY", "GATE_APIKEY", "GATE_API_KEY", "GATE_API_TOKEN", "GATE_KEY"],
+      "api.gateio.ws",
+    ),
+    (
+      &[
+        "GATEEU_ACCESS_KEY",
+        "GATEEU_APIKEY",
+        "GATEEU_API_KEY",
+        "GATEEU_API_TOKEN",
+        "GATEEU_KEY",
+      ],
+      "api.gateeu.com",
+    ),
+    (
+      &["HTX_ACCESS_KEY", "HTX_APIKEY", "HTX_API_KEY", "HTX_API_TOKEN", "HTX_KEY"],
+      "api.huobi.pro",
+    ),
+    (
+      &[
+        "KUCOINFUTURES_ACCESS_KEY",
+        "KUCOINFUTURES_APIKEY",
+        "KUCOINFUTURES_API_KEY",
+        "KUCOINFUTURES_API_TOKEN",
+        "KUCOINFUTURES_KEY",
+        "KUCOINFUTURES_PASSPHRASE",
+        "KUCOINFUTURES_API_PASSPHRASE",
+      ],
+      "api-futures.kucoin.com",
+    ),
+    (
+      &["MEXC_ACCESS_KEY", "MEXC_APIKEY", "MEXC_API_KEY", "MEXC_API_TOKEN", "MEXC_KEY"],
+      "api.mexc.com",
+    ),
+    (
+      &[
+        "MYOKX_ACCESS_KEY",
+        "MYOKX_APIKEY",
+        "MYOKX_API_KEY",
+        "MYOKX_API_TOKEN",
+        "MYOKX_KEY",
+        "MYOKX_PASSPHRASE",
+        "MYOKX_API_PASSPHRASE",
+      ],
+      "eea.okx.com",
+    ),
+    (
+      &[
+        "OKX_ACCESS_KEY",
+        "OKX_APIKEY",
+        "OKX_API_KEY",
+        "OKX_API_TOKEN",
+        "OKX_KEY",
+        "OKX_PASSPHRASE",
+        "OKX_API_PASSPHRASE",
+      ],
+      "www.okx.com",
+    ),
+    (
+      &[
+        "OKXUS_ACCESS_KEY",
+        "OKXUS_APIKEY",
+        "OKXUS_API_KEY",
+        "OKXUS_API_TOKEN",
+        "OKXUS_KEY",
+        "OKXUS_PASSPHRASE",
+        "OKXUS_API_PASSPHRASE",
+      ],
+      "us.okx.com",
+    ),
+    (
+      &["UPBIT_ACCESS_KEY", "UPBIT_APIKEY", "UPBIT_API_KEY", "UPBIT_API_TOKEN", "UPBIT_KEY"],
+      "api.upbit.com",
+    ),
+  ];
+
+  fn host_grants(known: &KnownHosts, host: &str) -> bool {
+    known.hosts.iter().any(|entry| {
+      entry
+        .parse::<EndpointScope>()
+        .is_ok_and(|scope| uri_match(std::slice::from_ref(&scope), Scheme::Https, host, 443))
+    })
+  }
+
+  /// A concrete hostname the entry must grant: the exact host, or one
+  /// subdomain when the entry is a wildcard.
+  fn concrete_host(pat: &HostPat) -> String {
+    match pat {
+      HostPat::Exact(host) => host.clone(),
+      HostPat::Wildcard(pattern) => {
+        let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
+        format!("a.{suffix}")
+      }
+      HostPat::Any => "example.com".to_string(),
+    }
+  }
+
   #[test]
   fn signing_only_secrets_have_no_hosts() {
     let registry = Registry::load(None).unwrap();
-    // Known signing-only secrets: HMAC/SigV4 inputs that never reach the wire.
-    // These must have no hosts (no rule), only decoy shape.
-    // See https://github.com/casualjim/arkham/issues/14 and #19.
-    for env in [
-      "AWS_SECRET_ACCESS_KEY",
-      "EXOSCALE_SECRET_KEY",
-      "EXOSCALE_SECRET",
-      "POLYMARKET_SECRET",
-      "POLYMARKET_SECRET_KEY",
-      // Exchange secrets (spot check a few)
-      "BINANCE_API_SECRET",
-      "BINANCE_SECRET",
-      "OKX_API_SECRET",
-      "KRAKEN_API_SECRET",
-    ] {
-      let known = registry.lookup(env);
-      match known {
-        None => {
-          // Acceptable: no registry entry at all means no rule
-        }
-        Some(entry) => {
+    // Every signing secret from #14 and #19. The value is an HMAC or JWT
+    // signing input and never reaches the wire, so the entry is a decoy
+    // shape with no hosts and therefore no grant.
+    for env in SIGNING_SECRETS {
+      let known = registry
+        .lookup(env)
+        .unwrap_or_else(|| panic!("{env} missing from the bundled registry"));
+      assert!(
+        known.hosts.is_empty(),
+        "{env} is a signing-only secret but has hosts: {:?}",
+        known.hosts
+      );
+      assert_eq!(
+        registry.template(env, None).as_ref(),
+        DEFAULT_PATTERN,
+        "{env} must keep the default decoy shape and no explicit pattern"
+      );
+    }
+  }
+
+  #[test]
+  fn signing_vendor_keys_parse_and_match_their_hosts() {
+    let registry = Registry::load(None).unwrap();
+    for (envs, host) in SIGNING_VENDOR_KEYS {
+      for env in *envs {
+        let known = registry
+          .lookup(env)
+          .unwrap_or_else(|| panic!("{env} missing from the bundled registry"));
+        assert!(known.pattern.is_some(), "{env} has no decoy shape");
+        assert!(!known.hosts.is_empty(), "{env} has no hosts");
+        for entry in &known.hosts {
+          let scope = entry
+            .parse::<EndpointScope>()
+            .unwrap_or_else(|err| panic!("{env} host {entry} does not parse: {err}"));
+          let concrete = concrete_host(&scope.host);
           assert!(
-            entry.hosts.is_empty(),
-            "{env} is a signing-only secret but has hosts: {:?}. \
-             Signing secrets never reach the wire and must not have hosts \
-             (they can have a pattern for decoy shape only).",
-            entry.hosts
+            uri_match(std::slice::from_ref(&scope), scope.scheme, &concrete, scope.port),
+            "{env} host {entry} does not match {concrete}"
           );
         }
+        assert!(host_grants(known, host), "{env} hosts {:?} do not grant {host}", known.hosts);
       }
     }
   }
