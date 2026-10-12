@@ -238,7 +238,6 @@ impl Transport for RedisTransport {
       state,
       snapshot,
       host,
-      raw_host,
       port,
       initial,
       ..
@@ -263,9 +262,16 @@ impl Transport for RedisTransport {
     // The real string states the far end: the dial follows its host and
     // port, not the destination the guest aimed at.
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
+    // Transparent capture knows the destination address, not the name in
+    // the connection string. The scope was already chosen by port; keying
+    // the swap on that address would miss the grant and forward the fake
+    // password unchanged.
+    let matched_name = server_name
+      .as_deref()
+      .filter(|name| scope.downstream.host.eq_ignore_ascii_case(name));
     let ctx = PairCtx {
       grants: &snapshot.grants,
-      host: server_name.as_deref().unwrap_or(raw_host),
+      host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
       mint: Some(state.mint_handle()),
