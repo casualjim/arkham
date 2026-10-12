@@ -2485,17 +2485,18 @@ mod tests {
 
       let mut roots = rustls::RootCertStore::empty();
       roots.add(ca.cert_der().clone()).unwrap();
-      let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+      let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
       // The guest checks the grant host and sends no SNI, the same shape as
       // Bun's Redis client on the transparent path.
       config.enable_sni = false;
       let name = ServerName::try_from("localhost".to_string()).unwrap();
-      let mut tls = tokio::time::timeout(Duration::from_secs(10), TlsConnector::from(Arc::new(config)).connect(name, client_end))
-        .await
-        .unwrap()
-        .unwrap();
+      let mut tls = tokio::time::timeout(
+        Duration::from_secs(10),
+        TlsConnector::from(Arc::new(config)).connect(name, client_end),
+      )
+      .await
+      .unwrap()
+      .unwrap();
       tls.write_all(auth_frame(FAKE).as_bytes()).await.unwrap();
       let mut ok = [0u8; 5];
       tls.read_exact(&mut ok).await.unwrap();
