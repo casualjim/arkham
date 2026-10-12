@@ -1,8 +1,0 @@
-{
-  "name": "arkham-integration-client",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "ioredis": "^5.4.1"
-  }
-}

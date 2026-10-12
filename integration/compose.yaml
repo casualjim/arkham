@@ -193,7 +193,7 @@ services:
       [
         "bash",
         "-c",
-        "apt-get update -qq && apt-get install -qq -y openssh-client && mkdir -p /tmp/client && cp /srv/package.json /srv/bun.lock /srv/run.ts /tmp/client/ && cd /tmp/client && bun install --frozen-lockfile --silent && exec bun run run.ts",
+        "apt-get update -qq && apt-get install -qq -y openssh-client && exec bun /srv/run.ts",
       ]
     environment:
       ARKHAM_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `arkham fake GH_TOKEN`, not a credential

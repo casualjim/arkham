@@ -7,7 +7,7 @@
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile } from "node:fs/promises";
-import Redis from "ioredis";
+import { RedisClient } from "bun";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
@@ -335,279 +335,153 @@ if (SSH_DST) {
   stage("ssh scenario skipped: no SSH_DST (bwrap)");
 }
 
-// ioredis 5 parses RESP2 only. Redis answers a successful HELLO 3 with a
-// RESP3 map, whose type byte is `%`. A rejected password is a RESP2 error
-// line, which ioredis surfaces as WRONGPASS rather than a parser error.
-// ioredis emits the Redis reply on the error event, then rejects connect()
-// with "Connection is closed". Both have to be read.
-async function authFailureText(client: Redis): Promise<string> {
-  const messages: string[] = [];
-  client.on("error", (err: Error) => {
-    messages.push(String(err));
-  });
+// Bun's Redis client speaks RESP3. On connect it sends
+// `HELLO 3 AUTH <user> <password>`, using the user `default` when the URL
+// omits one. Commands issued together are pipelined. The proxy swaps the
+// fake password; this process only holds the decoy URL.
+function openRedis(raw: string, tls: boolean): RedisClient {
+  const options: {
+    connectionTimeout: number;
+    autoReconnect: boolean;
+    maxRetries: number;
+    enableOfflineQueue: boolean;
+    tls?: {
+      ca: ReturnType<typeof Bun.file>;
+      rejectUnauthorized: boolean;
+    };
+  } = {
+    connectionTimeout: ATTEMPT_TIMEOUT_MS,
+    autoReconnect: false,
+    maxRetries: 0,
+    enableOfflineQueue: false,
+  };
+  if (tls) {
+    options.tls = {
+      ca: Bun.file(`${CERT_DIR}/ca.crt`),
+      rejectUnauthorized: true,
+    };
+  }
+  return new RedisClient(raw, options);
+}
+
+function passwordOnly(raw: string): string {
+  const url = new URL(raw);
+  url.username = "";
+  return url.toString();
+}
+
+function withPassword(raw: string, password: string): string {
+  const url = new URL(raw);
+  url.password = password;
+  return url.toString();
+}
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) {
+    const code = "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
+    return `${code} ${err.message}`.trim();
+  }
+  return String(err);
+}
+
+async function redisFailureText(raw: string, tls: boolean): Promise<string> {
+  const client = openRedis(raw, tls);
   try {
     await client.connect();
+    await client.ping();
+    return "connected";
   } catch (err) {
-    messages.push(String(err));
+    return errorText(err);
+  } finally {
+    client.close();
   }
-  client.disconnect();
-  return messages.join(" ");
 }
 
-function helloAccepted(reply: unknown, err: unknown): boolean {
-  if (Array.isArray(reply) && reply.includes("proto") && reply.includes(3)) {
-    return true;
+function helloHasProto3(reply: unknown): boolean {
+  if (reply === null || typeof reply !== "object" || Array.isArray(reply)) {
+    return false;
   }
-  const errMsg = String(err ?? "");
-  return errMsg.includes('got "%"') && !errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
+  const proto = (reply as { proto?: unknown }).proto;
+  return proto === 3 || proto === "3";
 }
 
-// 9. Redis plaintext: requirepass AUTH over cleartext TCP, plus ACL
-//    username/password, HELLO 3 AUTH, pipelined commands after auth,
-//    and WRONGPASS failure without leaking the real password.
-//    Uses ioredis, a maintained Redis client library.
-if (REDIS_URL) {
-  await retry("redis plaintext requirepass auth swaps password", async () => {
-    const redis_url = new URL(REDIS_URL);
-    stage(`redis ${redis_url.hostname}:${redis_url.port || 6379} connecting`);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6379),
-      password: redis_url.password,
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-    });
+// 9 and 10. Redis plaintext and TLS. requirepass uses a password-only URL
+// (HELLO AUTH default). ACL uses the username in the URL. A later HELLO,
+// pipelined PING and SET, and a rejected password follow the same client.
+async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
+  const tls = kind === "tls";
+  const requirepass =
+    kind === "plaintext" ? "redis plaintext requirepass auth swaps password" : "redis tls requirepass auth over arkham MITM";
+  const hello = kind === "plaintext" ? "redis plaintext HELLO 3 AUTH via send" : "redis tls HELLO 3 AUTH via send";
+  const pipelined = kind === "plaintext" ? "redis plaintext pipelined PING and SET" : "redis tls pipelined PING and SET";
+  const key = kind === "tls" ? "tls_test_key" : "test_key";
+  const value = kind === "tls" ? "tls_test_value" : "test_value";
+
+  await retry(requirepass, async () => {
+    const client = openRedis(passwordOnly(raw), tls);
     try {
       await client.connect();
-      stage("redis AUTH (requirepass) OK");
       const pong = await client.ping();
-      await client.quit();
-      stage(`redis PING reply: ${pong}`);
+      stage(`redis ${kind} PING reply: ${pong}`);
       return pong === "PONG";
-    } catch (err) {
-      await client.disconnect();
-      throw err;
+    } finally {
+      client.close();
     }
   });
 
-  await retry("redis plaintext ACL username+password", async () => {
-    const redis_url = new URL(REDIS_URL);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6379),
-      username: redis_url.username,
-      password: redis_url.password,
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-    });
+  await retry(`redis ${kind} ACL username+password`, async () => {
+    const client = openRedis(raw, tls);
     try {
       await client.connect();
-      stage("redis ACL auth OK");
-      const result = await client.set("test_key", "test_value");
-      await client.quit();
-      stage(`redis SET reply: ${result}`);
+      const result = await client.set(key, value);
+      stage(`redis ${kind} SET reply: ${result}`);
       return result === "OK";
-    } catch (err) {
-      await client.disconnect();
-      throw err;
+    } finally {
+      client.close();
     }
   });
 
-  await retry("redis plaintext HELLO 3 AUTH via sendCommand", async () => {
-    const redis_url = new URL(REDIS_URL);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6379),
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-      enableAutoPipelining: false,
-      // Connect before AUTH. The ready check's INFO is rejected until then.
-      enableReadyCheck: false,
-    });
+  await retry(hello, async () => {
+    const redisUrl = new URL(raw);
+    const client = openRedis(raw, tls);
     try {
       await client.connect();
-      const hello = await client.call("HELLO", "3", "AUTH", redis_url.username, redis_url.password);
-      await client.quit();
-      stage(`redis HELLO 3 reply: ${JSON.stringify(hello)}`);
-      return helloAccepted(hello, undefined);
-    } catch (err) {
-      await client.disconnect();
-      stage(`redis HELLO 3 error: ${String(err)}`);
-      return helloAccepted(undefined, err);
+      const reply = await client.send("HELLO", ["3", "AUTH", redisUrl.username, redisUrl.password]);
+      const text = JSON.stringify(reply);
+      stage(`redis ${kind} HELLO 3 reply: ${text}`);
+      return helloHasProto3(reply) && !text.includes("arkham_real_redis_pass");
+    } finally {
+      client.close();
     }
   });
 
-  await retry("redis plaintext pipelined AUTH then PING", async () => {
-    const redis_url = new URL(REDIS_URL);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6379),
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-      // Connect before AUTH. The ready check's INFO is rejected until then.
-      enableReadyCheck: false,
-    });
+  await retry(pipelined, async () => {
+    const client = openRedis(raw, tls);
     try {
       await client.connect();
-      const pipeline = client.pipeline();
-      pipeline.auth(redis_url.username, redis_url.password ?? "");
-      pipeline.ping();
-      const results = await pipeline.exec();
-      await client.quit();
-      stage(`redis pipelined results: ${JSON.stringify(results)}`);
-      return results?.[0]?.[0] === null && results?.[1]?.[1] === "PONG";
-    } catch (err) {
-      await client.disconnect();
-      throw err;
+      const [pong, stored] = await Promise.all([client.ping(), client.set("pipeline_key", "pipeline_value")]);
+      stage(`redis ${kind} pipelined results: ${JSON.stringify([pong, stored])}`);
+      return pong === "PONG" && stored === "OK";
+    } finally {
+      client.close();
     }
   });
 
-  await retry("redis plaintext WRONGPASS without real secret leak", async () => {
-    const client = new Redis({
-      host: new URL(REDIS_URL).hostname,
-      port: Number(new URL(REDIS_URL).port || 6379),
-      password: "wrong_password",
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-    });
-    const errMsg = await authFailureText(client);
-    stage(`redis WRONGPASS error: ${errMsg}`);
+  await retry(`redis ${kind} WRONGPASS without real secret leak`, async () => {
+    const errMsg = await redisFailureText(withPassword(raw, "wrong_password"), tls);
+    stage(`redis ${kind} WRONGPASS error: ${errMsg}`);
     return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
   });
+}
+
+if (REDIS_URL) {
+  await redisScenarios("plaintext", REDIS_URL);
 } else {
   stage("redis plaintext scenarios skipped: no REDIS_URL");
 }
 
-// 10. Redis over TLS: the same auth patterns over rediss://, arkham
-//     terminates the guest TLS with a minted leaf and dials upstream TLS.
-//     Uses ioredis with TLS configuration.
 if (REDIS_TLS_URL) {
-  await retry("redis tls requirepass auth over arkham MITM", async () => {
-    const redis_url = new URL(REDIS_TLS_URL);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6380),
-      password: redis_url.password,
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-      tls: {
-        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
-        rejectUnauthorized: true,
-      },
-    });
-    try {
-      await client.connect();
-      stage("redis tls AUTH OK");
-      const pong = await client.ping();
-      await client.quit();
-      stage(`redis tls PING reply: ${pong}`);
-      return pong === "PONG";
-    } catch (err) {
-      await client.disconnect();
-      throw err;
-    }
-  });
-
-  await retry("redis tls ACL username+password", async () => {
-    const redis_url = new URL(REDIS_TLS_URL);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6380),
-      username: redis_url.username,
-      password: redis_url.password,
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-      tls: {
-        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
-        rejectUnauthorized: true,
-      },
-    });
-    try {
-      await client.connect();
-      stage("redis tls ACL auth OK");
-      const result = await client.set("tls_test_key", "tls_test_value");
-      await client.quit();
-      stage(`redis tls SET reply: ${result}`);
-      return result === "OK";
-    } catch (err) {
-      await client.disconnect();
-      throw err;
-    }
-  });
-
-  await retry("redis tls HELLO 3 AUTH via sendCommand", async () => {
-    const redis_url = new URL(REDIS_TLS_URL);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6380),
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-      enableAutoPipelining: false,
-      // Connect before AUTH. The ready check's INFO is rejected until then.
-      enableReadyCheck: false,
-      tls: {
-        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
-        rejectUnauthorized: true,
-      },
-    });
-    try {
-      await client.connect();
-      const hello = await client.call("HELLO", "3", "AUTH", redis_url.username, redis_url.password);
-      await client.quit();
-      stage(`redis tls HELLO 3 reply: ${JSON.stringify(hello)}`);
-      return helloAccepted(hello, undefined);
-    } catch (err) {
-      await client.disconnect();
-      stage(`redis tls HELLO 3 error: ${String(err)}`);
-      return helloAccepted(undefined, err);
-    }
-  });
-
-  await retry("redis tls pipelined AUTH then SET", async () => {
-    const redis_url = new URL(REDIS_TLS_URL);
-    const client = new Redis({
-      host: redis_url.hostname,
-      port: Number(redis_url.port || 6380),
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-      // Connect before AUTH. The ready check's INFO is rejected until then.
-      enableReadyCheck: false,
-      tls: {
-        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
-        rejectUnauthorized: true,
-      },
-    });
-    try {
-      await client.connect();
-      const pipeline = client.pipeline();
-      pipeline.auth(redis_url.username, redis_url.password ?? "");
-      pipeline.set("pipeline_key", "pipeline_value");
-      const results = await pipeline.exec();
-      await client.quit();
-      stage(`redis tls pipelined results: ${JSON.stringify(results)}`);
-      return results?.[0]?.[0] === null && results?.[1]?.[1] === "OK";
-    } catch (err) {
-      await client.disconnect();
-      throw err;
-    }
-  });
-
-  await retry("redis tls WRONGPASS without real secret leak", async () => {
-    const client = new Redis({
-      host: new URL(REDIS_TLS_URL).hostname,
-      port: Number(new URL(REDIS_TLS_URL).port || 6380),
-      password: "wrong_password",
-      lazyConnect: true,
-      connectTimeout: ATTEMPT_TIMEOUT_MS,
-      tls: {
-        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
-        rejectUnauthorized: true,
-      },
-    });
-    const errMsg = await authFailureText(client);
-    stage(`redis tls WRONGPASS error: ${errMsg}`);
-    return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
-  });
+  await redisScenarios("tls", REDIS_TLS_URL);
 } else {
   stage("redis tls scenarios skipped: no REDIS_TLS_URL");
 }
