@@ -1,7 +1,7 @@
 //! End-to-end proxy tests: real clients through the MITM against real
 //! stub servers, per protocol and per transport.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use arkham_config::grants::{ResolvedConfig, Scheme};
@@ -1446,6 +1446,80 @@ mod tests {
       body.extend_from_slice(&chunk[..n]);
     }
     assert_eq!(body, expect.as_bytes());
+    serve.await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn transparent_tls_mitm_uses_captured_ip_when_hello_has_no_sni() {
+    const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+    let upstream_ca = CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("upstream-ca.pem");
+    std::fs::write(&bundle, upstream_ca.cert_pem()).unwrap();
+    let ca_der = ca.cert_der().clone();
+    let stub_cert = upstream_ca.generate_domain_cert("127.0.0.1").unwrap();
+    let stub_acceptor = TlsAcceptor::from(Arc::new(stub_server_config(&stub_cert.server_config, Alpn::Http1)));
+    let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = local_addr(&stub).port();
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec![EndpointScope {
+        scheme: Scheme::Https,
+        host: "127.0.0.1".parse().unwrap(),
+        port: stub_port,
+        client_cert: None,
+        client_key: None,
+        root_cert: Some(bundle),
+        guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+      }],
+      pattern: None,
+      oauth2: None,
+    }];
+    let state = test_state_with(grants, &ca);
+    let snapshot = state.snapshot();
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      let head = read_head_from(&mut tls).await;
+      let head_str = String::from_utf8(head).unwrap();
+      assert!(head_str.contains(&format!("Bearer {VALUE}")), "{head_str}");
+      let body = format!("echo:{VALUE}");
+      tls
+        .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+        .await
+        .unwrap();
+    });
+    let (guest, client_end) = tokio::io::duplex(64 * 1024);
+    let serve = tokio::spawn({
+      let state = Arc::clone(&state);
+      let snapshot = Arc::clone(&snapshot);
+      // IP-literal client: the captured destination is the identity.
+      async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
+    });
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_der).unwrap();
+    let connector = TlsConnector::from(guest_client_config(roots, Alpn::Http1));
+    // IpAddress sends no SNI extension, like kubectl against an address.
+    let server_name = ServerName::IpAddress("127.0.0.1".parse::<IpAddr>().unwrap().into());
+    let mut tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, client_end))
+      .await
+      .unwrap()
+      .unwrap();
+    tls
+      .write_all(format!("GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {FAKE}\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    stub_task.await.unwrap();
+    let head = read_head_from(&mut tls).await;
+    let expect = format!("echo:{FAKE}");
+    assert_eq!(read_body(&mut tls, &head, expect.len()).await, expect.as_bytes());
     serve.await.unwrap().unwrap();
   }
 
