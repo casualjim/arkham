@@ -164,6 +164,10 @@ services:
         tls-cert-file /certs/redis.crt
         tls-key-file /tmp/redis.key
         tls-ca-cert-file /certs/ca.crt
+        # A CA file makes Redis require a client certificate. This demo
+        # authenticates with AUTH passwords, and the proxy has no client cert,
+        # so Redis was closing the upstream leg (peer did not return a certificate).
+        tls-auth-clients no
         EOF
         exec redis-server /tmp/redis.conf
     healthcheck:
