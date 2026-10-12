@@ -16,6 +16,7 @@ Underneath sits a grant-scoped proxy. A workload can also point its proxy settin
 | HTTP/2 | Same rewriting over HPACK heads and DATA frames, picked by ALPN. |
 | SSH | Terminates on decoy keys, presents the real identity upstream, never opens forwarding. |
 | PostgreSQL | Negotiation answered here, startup identity swapped, steady state equal-length relay. |
+| Redis | RESP `AUTH` and `HELLO` passwords swapped. A TLS leaf is minted for the scope host when the client sends no SNI. |
 | Raw TCP | Equal-length byte swap that never reframes; everything else splices untouched. |
 
 ## Install
@@ -106,7 +107,7 @@ Everything lives under [docs/user](docs/user/README.md), arranged by what you ne
 Two runnable examples ship in the repository:
 
 - [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to secure with `arkham up`: one arkham container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
-- [integration](integration/README.md) — the compose demo behind `mise run demo`, asserting four substitution scenarios and one splice scenario.
+- [integration](integration/README.md) — the compose demo behind `mise run demo`. The scenario table there is what the client asserts.
 
 ## Where the limits are
 

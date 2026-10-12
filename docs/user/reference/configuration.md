@@ -20,7 +20,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 | `listen` | `127.0.0.1:8080` | `ARKHAM_LISTEN` | Address the explicit proxy listens on. |
 | `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/arkham/ca.pem` | `ARKHAM_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `arkham ca` also writes `ca.crt` and `ca.key` beside it. |
 | `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
-| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, and the upstream `SSLRequest` answer all share this budget. |
+| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, and the upstream `SSLRequest` answer all share this budget. |
 
 ## `[rules.<label>]`
 
@@ -69,6 +69,28 @@ The connection strings carry the upstream TLS policy as libpq parameters: `sslmo
 env = "DATABASE_URL"
 value = "postgres://app:decoy@db.internal:5432/app"
 ```
+
+### Redis rules
+
+A rule whose `value` states a `redis://` or `rediss://` connection string is a Redis rule. The rule states the FAKE string in `value` (a proper URL, so the env var holds a URL the client can dial). The REAL string resolves from the secret source under `env`/`fnox_key` into `real`. No `allow` entries: the connection string is the grant, matched on the fake string's port.
+
+`redis://` is cleartext. `rediss://` is TLS. The scheme states the transport; a `sslmode` or `sslnegotiation` query is rejected. The default port is `6379`. The real `rediss://` string may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together (the upstream client certificate). Arkham reads that query and removes it before dialing. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`.
+
+The wire machine swaps the fake password for the real one on `AUTH` and `HELLO`. When the two strings name different users, the user swaps too.
+
+```toml
+[rules.cache]
+env = "REDIS_URL"
+value = "redis://app:decoy@cache.internal:6379/0"
+```
+
+```toml
+[rules.cache_tls]
+env = "REDIS_TLS_URL"
+value = "rediss://app:decoy@cache.internal:6380/0"
+```
+
+The real `rediss://` value in fnox carries the trust anchor, for example `rediss://app:real@cache.internal:6380/0?sslrootcert=/path/ca.pem`.
 
 ## `[rules.<label>.tls."<entry>"]`
 

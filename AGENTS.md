@@ -172,10 +172,11 @@ Do:
 
 - Reuse the owning boundary: grants from `arkham-config`, leaves from `arkham-pki`, streams from `arkham-proxy::serve_transparent_stream`, stack pieces from `arkham-compose`.
 - Keep the smallest diff that fixes the root cause where all callers route through.
+- Adding a credential-rewriting protocol: follow [`.agents/skills/add-protocol/SKILL.md`](.agents/skills/add-protocol/SKILL.md).
 
 When adding a capture backend: add an arm to the face dispatch plus one crate that depends on proxy/config only, reusing `serve_transparent_stream`; never copy the `with_capture` block.
 
-When adding a wire protocol: add a `arkham-proxy/src/wire/` leg behind the existing sniff dispatch with quiet-close on malformed input and opaque-forward on framing uncertainty.
+When adding a wire protocol: follow [`.agents/skills/add-protocol/SKILL.md`](.agents/skills/add-protocol/SKILL.md). Redis (PR #44, `11ce4a8`) is the worked example: a vertical under `crates/arkham-proxy/src/transports/`, grant types in `arkham-config`, and a compose scenario the protocol-coverage test requires.
 
 When adding a WIT world or plugin hook: extend `arkham-plugin/wit/world.wit` plus the `arkham-plugin` host, keep grant ownership in config and secret ownership in the relay, and fail guest errors closed to `Verdict::Close`.
 

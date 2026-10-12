@@ -36,6 +36,9 @@ Topology:
 | 5 | TLS line protocol to `api:9444` | none | tunnel splices untouched: fake arrives as-is, server rejects |
 | 6 | Postgres wire protocol driven by the client's own `DATABASE_URL` (the rule's stated fake string): SSLRequest, TLS, cleartext password auth, `SELECT` | `[rules.db]`: `env = "DATABASE_URL"`, `value` the fake URL; the real URL in fnox | the fake password authenticates against real PostgreSQL — arkham swapped the real one in from the secret source — and the query row comes back |
 | 7 | OAuth2 `client_credentials` POST `api:8000/token` with the fake client secret, then GET with the minted token | `[rules.oidc]` + `oauth2` block | issuer saw the real client secret, the client received a minted decoy access token (never the real one), and the decoy swapped back to the real access token on the API call |
+| 8 | OpenSSH client with the decoy identity to `10.202.0.40` | `[rules.ssh]` `ssh://10.202.0.40:22` | `echo ssh-ok`, and `known_hosts` records arkham's host key |
+| 9 | Redis RESP via Bun's `RedisClient` to `redis:6379`: requirepass, ACL user, `HELLO 3 AUTH`, a pipeline, and `WRONGPASS` | `[rules.redis_plain]`: fake `redis://` URL; real URL rendered into fnox by `gen-secrets.sh` | official Redis accepts the swapped password; the real password is absent from the client error |
+| 10 | Same client to `redis:6380` over TLS. Bun sends no SNI | `[rules.redis_tls]`: fake `rediss://` URL; real URL carries `sslrootcert` | same swap. The guest leaf is minted for the scope host. Redis is started with `tls-auth-clients no` |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -57,6 +60,12 @@ Scenario 7 exercises runtime token minting
 substitution (`arkham fake OIDC_CLIENT_SECRET`, pinned in
 `compose.yaml`), and the access token is minted per issue, so no real
 access token ever reaches the client container.
+Scenarios 9 and 10 are the official `redis:7-alpine` image and Bun's
+`RedisClient`. The proxy is the only code we wrote on that path. A
+`tls-ca-cert-file` makes Redis require a client certificate; this demo
+authenticates with passwords and the upstream client has no certificate,
+so the server is started with `tls-auth-clients no`. The bwrap demo has
+no Redis and no `REDIS_URL`, so those scenarios are skipped there.
 
 ## Run
 
