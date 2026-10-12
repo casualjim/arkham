@@ -9,3 +9,11 @@ type = "plain"
 [secrets.DATABASE_URL]
 provider = "plain"
 value = "postgres://arkham:arkham_real_password_01@db:5432/demo?sslmode=require"
+
+[secrets.REDIS_URL]
+provider = "plain"
+value = "redis://arkham_user:arkham_real_redis_pass@redis:6379/0"
+
+[secrets.REDIS_TLS_URL]
+provider = "plain"
+value = "rediss://arkham_user:arkham_real_redis_pass@redis:6380/0?sslrootcert=/certs/ca.crt"

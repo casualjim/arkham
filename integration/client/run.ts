@@ -12,6 +12,8 @@ const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
 const CERT_DIR = process.env.CERT_DIR ?? "/certs";
 const PG_URL = process.env.DATABASE_URL ?? ""; // the fake connection string
+const REDIS_URL = process.env.REDIS_URL ?? "";
+const REDIS_TLS_URL = process.env.REDIS_TLS_URL ?? "";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -330,6 +332,186 @@ if (SSH_DST) {
   });
 } else {
   stage("ssh scenario skipped: no SSH_DST (bwrap)");
+}
+
+// 9. Redis plaintext: requirepass AUTH over cleartext TCP, plus ACL
+//    username/password via HELLO 3 AUTH, pipelined commands after auth,
+//    and WRONGPASS failure without leaking the real password.
+if (REDIS_URL) {
+  function redisCommand(parts: string[]): Buffer {
+    const bulk = parts.map((part) => `$${Buffer.byteLength(part)}\r\n${part}\r\n`).join("");
+    return Buffer.from(`*${parts.length}\r\n${bulk}`, "utf8");
+  }
+  function redisRead(sock: Socket | TLSSocket): Promise<string> {
+    return race("redis reply", new Promise<string>((resolve, reject) => {
+      let buf = "";
+      const onData = (chunk: Buffer) => {
+        buf += chunk.toString("utf8");
+        if (buf.includes("\r\n")) {
+          sock.off("data", onData);
+          resolve(buf);
+        }
+      };
+      sock.on("data", onData);
+      sock.once("error", reject);
+    }));
+  }
+  await retry("redis plaintext requirepass auth swaps password", async () => {
+    const redis_url = new URL(REDIS_URL);
+    stage(`redis ${redis_url.hostname}:${redis_url.port || 6379} connecting`);
+    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
+      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
+      s.once("connect", () => resolve(s));
+      s.once("error", reject);
+    }));
+    stage("redis AUTH (requirepass)");
+    sock.write(redisCommand(["AUTH", redis_url.password ?? ""]));
+    const reply = await redisRead(sock);
+    sock.destroy();
+    stage(`redis AUTH reply: ${JSON.stringify(reply)}`);
+    return reply.startsWith("+OK");
+  });
+
+  await retry("redis plaintext ACL username+password via HELLO 3", async () => {
+    const redis_url = new URL(REDIS_URL);
+    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
+      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
+      s.once("connect", () => resolve(s));
+      s.once("error", reject);
+    }));
+    stage("redis HELLO 3 AUTH user pass");
+    sock.write(redisCommand(["HELLO", "3", "AUTH", redis_url.username, redis_url.password ?? ""]));
+    const reply = await redisRead(sock);
+    sock.destroy();
+    stage(`redis HELLO reply: ${JSON.stringify(reply.slice(0, 50))}`);
+    return reply.includes("proto") && reply.includes("3");
+  });
+
+  await retry("redis plaintext pipelined AUTH then PING", async () => {
+    const redis_url = new URL(REDIS_URL);
+    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
+      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
+      s.once("connect", () => resolve(s));
+      s.once("error", reject);
+    }));
+    stage("redis pipelined AUTH + PING");
+    const auth = redisCommand(["AUTH", redis_url.username, redis_url.password ?? ""]);
+    const ping = redisCommand(["PING"]);
+    sock.write(Buffer.concat([auth, ping]));
+    const reply = await race("redis pipelined reply", new Promise<string>((resolve, reject) => {
+      let buf = "";
+      const onData = (chunk: Buffer) => {
+        buf += chunk.toString("utf8");
+        if (buf.split("\r\n").length >= 4) {
+          sock.off("data", onData);
+          resolve(buf);
+        }
+      };
+      sock.on("data", onData);
+      sock.once("error", reject);
+    }));
+    sock.destroy();
+    stage(`redis pipelined reply: ${JSON.stringify(reply)}`);
+    return reply.includes("+OK") && reply.includes("+PONG");
+  });
+
+  await retry("redis plaintext WRONGPASS without real secret leak", async () => {
+    const redis_url = new URL(REDIS_URL);
+    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
+      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
+      s.once("connect", () => resolve(s));
+      s.once("error", reject);
+    }));
+    stage("redis AUTH with wrong password");
+    sock.write(redisCommand(["AUTH", "wrong_password"]));
+    const reply = await redisRead(sock);
+    sock.destroy();
+    stage(`redis WRONGPASS reply: ${JSON.stringify(reply)}`);
+    return reply.includes("-WRONGPASS") && !reply.includes("arkham_real_redis_pass");
+  });
+} else {
+  stage("redis plaintext scenarios skipped: no REDIS_URL");
+}
+
+// 10. Redis over TLS: the same auth patterns over rediss://, arkham
+//     terminates the guest TLS with a minted leaf and dials upstream TLS.
+if (REDIS_TLS_URL) {
+  function redisCommand(parts: string[]): Buffer {
+    const bulk = parts.map((part) => `$${Buffer.byteLength(part)}\r\n${part}\r\n`).join("");
+    return Buffer.from(`*${parts.length}\r\n${bulk}`, "utf8");
+  }
+  function redisReadTls(tls: TLSSocket): Promise<string> {
+    return race("redis tls reply", new Promise<string>((resolve, reject) => {
+      let buf = "";
+      const onData = (chunk: Buffer) => {
+        buf += chunk.toString("utf8");
+        if (buf.includes("\r\n")) {
+          tls.off("data", onData);
+          resolve(buf);
+        }
+      };
+      tls.on("data", onData);
+      tls.once("error", reject);
+    }));
+  }
+  await retry("redis tls requirepass auth over arkham MITM", async () => {
+    const redis_url = new URL(REDIS_TLS_URL);
+    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
+    stage("redis tls AUTH");
+    tls.write(redisCommand(["AUTH", redis_url.password ?? ""]));
+    const reply = await redisReadTls(tls);
+    tls.destroy();
+    stage(`redis tls AUTH reply: ${JSON.stringify(reply)}`);
+    return reply.startsWith("+OK");
+  });
+
+  await retry("redis tls ACL via HELLO 3", async () => {
+    const redis_url = new URL(REDIS_TLS_URL);
+    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
+    stage("redis tls HELLO 3 AUTH");
+    tls.write(redisCommand(["HELLO", "3", "AUTH", redis_url.username, redis_url.password ?? ""]));
+    const reply = await redisReadTls(tls);
+    tls.destroy();
+    stage(`redis tls HELLO reply: ${JSON.stringify(reply.slice(0, 50))}`);
+    return reply.includes("proto") && reply.includes("3");
+  });
+
+  await retry("redis tls pipelined AUTH then SET", async () => {
+    const redis_url = new URL(REDIS_TLS_URL);
+    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
+    stage("redis tls pipelined AUTH + SET");
+    const auth = redisCommand(["AUTH", redis_url.username, redis_url.password ?? ""]);
+    const set = redisCommand(["SET", "test_key", "test_value"]);
+    tls.write(Buffer.concat([auth, set]));
+    const reply = await race("redis tls pipelined reply", new Promise<string>((resolve, reject) => {
+      let buf = "";
+      const onData = (chunk: Buffer) => {
+        buf += chunk.toString("utf8");
+        if (buf.split("\r\n").length >= 4) {
+          tls.off("data", onData);
+          resolve(buf);
+        }
+      };
+      tls.on("data", onData);
+      tls.once("error", reject);
+    }));
+    tls.destroy();
+    stage(`redis tls pipelined reply: ${JSON.stringify(reply)}`);
+    return reply.includes("+OK");
+  });
+
+  await retry("redis tls WRONGPASS without real secret leak", async () => {
+    const redis_url = new URL(REDIS_TLS_URL);
+    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
+    stage("redis tls AUTH with wrong password");
+    tls.write(redisCommand(["AUTH", "wrong_password"]));
+    const reply = await redisReadTls(tls);
+    tls.destroy();
+    stage(`redis tls WRONGPASS reply: ${JSON.stringify(reply)}`);
+    return reply.includes("-WRONGPASS") && !reply.includes("arkham_real_redis_pass");
+  });
+} else {
+  stage("redis tls scenarios skipped: no REDIS_TLS_URL");
 }
 
 console.log("all scenarios passed");

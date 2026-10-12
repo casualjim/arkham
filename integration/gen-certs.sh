@@ -28,6 +28,13 @@ printf "subjectAltName=IP:10.202.0.30,DNS:db\n" >"$dir/pg.ext"
 openssl x509 -req -in "$dir/pg.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
   -CAcreateserial -out "$dir/pg.crt" -days 2 -extfile "$dir/pg.ext"
 
+# Redis TLS: the same pattern, SAN carries both the static IP and hostname.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/redis.key"
+openssl req -new -key "$dir/redis.key" -out "$dir/redis.csr" -subj "/CN=redis"
+printf "subjectAltName=IP:10.202.0.50,DNS:redis\n" >"$dir/redis.ext"
+openssl x509 -req -in "$dir/redis.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+  -CAcreateserial -out "$dir/redis.crt" -days 2 -extfile "$dir/redis.ext"
+
 cat "$dir/ca.crt" "$dir/ca.key" >"$dir/ca.pem"
 chmod 600 "$dir/ca.key" "$dir/ca.pem"
 

@@ -143,6 +143,41 @@ services:
       certs:
         condition: service_completed_successfully
 
+  # Official Redis 7 server with requirepass plus ACL user; listens on both
+  # plaintext (6379) and TLS (6380). TLS uses a CA-signed leaf; ACL admits
+  # one username+password pair. arkham captures the client's connection,
+  # swaps credentials, and tests AUTH/HELLO plus pipelining over both legs.
+  redis:
+    image: redis:7-alpine
+    command:
+      - sh
+      - -c
+      - |
+        cp /certs/redis.key /tmp/redis.key && chmod 600 /tmp/redis.key && chown redis:redis /tmp/redis.key
+        cat > /tmp/redis.conf <<'EOF'
+        requirepass arkham_real_redis_pass
+        user arkham_user on >arkham_real_redis_pass ~* &* +@all
+        port 6379
+        tls-port 6380
+        tls-cert-file /certs/redis.crt
+        tls-key-file /tmp/redis.key
+        tls-ca-cert-file /certs/ca.crt
+        EOF
+        exec redis-server /tmp/redis.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a arkham_real_redis_pass PING"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - certs:/certs:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.50
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
   client:
     image: oven/bun:1
     working_dir: /srv
@@ -158,6 +193,8 @@ services:
       ARKHAM_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `arkham fake GH_TOKEN`, not a credential
       DATABASE_URL: postgres://arkham:arkham_fake_password_01@db:5432/demo?sslmode=require # nosemgrep: deterministic demo decoy, not a credential
       OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `arkham fake OIDC_CLIENT_SECRET`, not a credential
+      REDIS_URL: redis://arkham_user:arkham_fake_redis_pass@redis:6379/0 # nosemgrep: deterministic demo decoy, not a credential
+      REDIS_TLS_URL: rediss://arkham_user:arkham_fake_redis_pass@redis:6380/0 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
@@ -171,6 +208,8 @@ services:
       sshd:
         condition: service_healthy
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 networks:
