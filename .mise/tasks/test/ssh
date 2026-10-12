@@ -57,6 +57,14 @@ for backend in $backends; do
     code=124
   fi
   docker logs "$client" || true
+  # Capture every service, arkham especially, before teardown. The CI
+  # failure step prints this file; compose down would otherwise erase it.
+  if [ "$code" != 0 ]; then
+    {
+      echo "=== compose logs (backend $backend, client exit $code) ==="
+      $compose logs --no-color || true
+    } | tee -a /tmp/arkham-integration-compose.log
+  fi
   $compose down --remove-orphans -v --timeout 3
   if [ "$code" != 0 ]; then
     echo "=== backend $backend FAILED (exit $code) ==="

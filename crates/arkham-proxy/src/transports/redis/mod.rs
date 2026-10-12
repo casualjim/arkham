@@ -238,7 +238,6 @@ impl Transport for RedisTransport {
       state,
       snapshot,
       host,
-      raw_host,
       port,
       initial,
       ..
@@ -248,7 +247,12 @@ impl Transport for RedisTransport {
     let guest_head = initial.to_vec();
     let mut guest_tls: Option<(Vec<u8>, String)> = None;
     if scope.is_downstream_tls {
-      let Some((hello_buf, identity, sni_name)) = guest_tls_opening(&mut guest, initial, budget, host, &state.mint).await? else {
+      // Transparent capture has no CONNECT authority. A ClientHello with no
+      // SNI — Bun's Redis client sends none — would otherwise close here.
+      // The scope was already chosen by port, and its downstream host is the
+      // name that client checks the leaf against.
+      let authority = host.or(Some(scope.downstream.host.as_str()));
+      let Some((hello_buf, identity, sni_name)) = guest_tls_opening(&mut guest, initial, budget, authority, &state.mint).await? else {
         return Ok(());
       };
       server_name = Some(sni_name);
@@ -263,9 +267,16 @@ impl Transport for RedisTransport {
     // The real string states the far end: the dial follows its host and
     // port, not the destination the guest aimed at.
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
+    // Transparent capture knows the destination address, not the name in
+    // the connection string. The scope was already chosen by port; keying
+    // the swap on that address would miss the grant and forward the fake
+    // password unchanged.
+    let matched_name = server_name
+      .as_deref()
+      .filter(|name| scope.downstream.host.eq_ignore_ascii_case(name));
     let ctx = PairCtx {
       grants: &snapshot.grants,
-      host: server_name.as_deref().unwrap_or(raw_host),
+      host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
       mint: Some(state.mint_handle()),

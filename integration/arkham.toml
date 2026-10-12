@@ -66,3 +66,16 @@ allow = ["http://api:8000"]
 [rules.oidc.oauth2]
 flow = "client_credentials"
 token_url = "http://api:8000/token"
+
+# Redis plaintext: requirepass-style auth plus ACL username/password,
+# matched on the fake string's port. Both passwords are the same length.
+[rules.redis_plain]
+env = "REDIS_URL"
+value = "redis://arkham_user:arkham_fake_redis_pass@redis:6379/0"
+
+# Redis over TLS: the same auth patterns, but rediss:// states TLS on
+# both legs. The upstream string carries trust; the guest leg uses the
+# arkham-minted leaf.
+[rules.redis_tls]
+env = "REDIS_TLS_URL"
+value = "rediss://arkham_user:arkham_fake_redis_pass@redis:6380/0"

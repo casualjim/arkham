@@ -2449,6 +2449,70 @@ mod tests {
       );
       proxy.abort();
     }
+
+    #[tokio::test]
+    async fn redis_tls_without_sni_mints_for_the_grant_host() {
+      install_crypto_provider();
+      let ca = CertAuthority::generate().unwrap();
+      let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+      let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+      let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let stub_port = local_addr(&stub).port();
+      let bundle_dir = tempfile::tempdir().unwrap();
+      let bundle = bundle_dir.path().join("ca.pem");
+      std::fs::write(&bundle, ca.cert_pem()).unwrap();
+      let grants = vec![redis_grant(
+        &format!("rediss://app:{FAKE}@localhost:{stub_port}/0"),
+        &format!("rediss://app:{VALUE}@localhost:{stub_port}/0?sslrootcert={}", bundle.display()),
+      )];
+      let state = test_state_with(grants, &ca);
+      let snapshot = state.snapshot();
+
+      let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+      let stub_seen = Arc::clone(&seen);
+      let stub_task = tokio::spawn(async move {
+        let (conn, _) = stub.accept().await.unwrap();
+        let tls = acceptor.accept(conn).await.unwrap();
+        serve_redis(tls, stub_seen).await;
+      });
+
+      let (guest, client_end) = tokio::io::duplex(64 * 1024);
+      let serve = tokio::spawn({
+        let state = Arc::clone(&state);
+        let snapshot = Arc::clone(&snapshot);
+        async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
+      });
+
+      let mut roots = rustls::RootCertStore::empty();
+      roots.add(ca.cert_der().clone()).unwrap();
+      let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+      // The guest checks the grant host and sends no SNI, the same shape as
+      // Bun's Redis client on the transparent path.
+      config.enable_sni = false;
+      let name = ServerName::try_from("localhost".to_string()).unwrap();
+      let mut tls = tokio::time::timeout(
+        Duration::from_secs(10),
+        TlsConnector::from(Arc::new(config)).connect(name, client_end),
+      )
+      .await
+      .unwrap()
+      .unwrap();
+      tls.write_all(auth_frame(FAKE).as_bytes()).await.unwrap();
+      let mut ok = [0u8; 5];
+      tls.read_exact(&mut ok).await.unwrap();
+      assert_eq!(&ok, b"+OK\r\n");
+      tls.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+      let mut pong = [0u8; 7];
+      tls.read_exact(&mut pong).await.unwrap();
+      assert_eq!(&pong, b"+PONG\r\n");
+      drop(tls);
+      let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+      assert_eq!(
+        String::from_utf8_lossy(&seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
+        auth_frame(VALUE)
+      );
+      serve.await.unwrap().unwrap();
+    }
   }
   /// Real TLS Postgres on both ends: a TLS-capable client against a TLS-capable
   /// server, for each handshake shape the entry URL and the guest can ask for.
