@@ -247,7 +247,12 @@ impl Transport for RedisTransport {
     let guest_head = initial.to_vec();
     let mut guest_tls: Option<(Vec<u8>, String)> = None;
     if scope.is_downstream_tls {
-      let Some((hello_buf, identity, sni_name)) = guest_tls_opening(&mut guest, initial, budget, host, &state.mint).await? else {
+      // Transparent capture has no CONNECT authority. A ClientHello with no
+      // SNI — Bun's Redis client sends none — would otherwise close here.
+      // The scope was already chosen by port, and its downstream host is the
+      // name that client checks the leaf against.
+      let authority = host.or(Some(scope.downstream.host.as_str()));
+      let Some((hello_buf, identity, sni_name)) = guest_tls_opening(&mut guest, initial, budget, authority, &state.mint).await? else {
         return Ok(());
       };
       server_name = Some(sni_name);
