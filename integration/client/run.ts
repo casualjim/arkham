@@ -7,6 +7,7 @@
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile } from "node:fs/promises";
+import Redis from "ioredis";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
@@ -335,99 +336,118 @@ if (SSH_DST) {
 }
 
 // 9. Redis plaintext: requirepass AUTH over cleartext TCP, plus ACL
-//    username/password via HELLO 3 AUTH, pipelined commands after auth,
+//    username/password, HELLO 3 AUTH, pipelined commands after auth,
 //    and WRONGPASS failure without leaking the real password.
+//    Uses ioredis, a maintained Redis client library.
 if (REDIS_URL) {
-  function redisCommand(parts: string[]): Buffer {
-    const bulk = parts.map((part) => `$${Buffer.byteLength(part)}\r\n${part}\r\n`).join("");
-    return Buffer.from(`*${parts.length}\r\n${bulk}`, "utf8");
-  }
-  function redisRead(sock: Socket | TLSSocket): Promise<string> {
-    return race("redis reply", new Promise<string>((resolve, reject) => {
-      let buf = "";
-      const onData = (chunk: Buffer) => {
-        buf += chunk.toString("utf8");
-        if (buf.includes("\r\n")) {
-          sock.off("data", onData);
-          resolve(buf);
-        }
-      };
-      sock.on("data", onData);
-      sock.once("error", reject);
-    }));
-  }
   await retry("redis plaintext requirepass auth swaps password", async () => {
     const redis_url = new URL(REDIS_URL);
     stage(`redis ${redis_url.hostname}:${redis_url.port || 6379} connecting`);
-    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
-      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
-      s.once("connect", () => resolve(s));
-      s.once("error", reject);
-    }));
-    stage("redis AUTH (requirepass)");
-    sock.write(redisCommand(["AUTH", redis_url.password ?? ""]));
-    const reply = await redisRead(sock);
-    sock.destroy();
-    stage(`redis AUTH reply: ${JSON.stringify(reply)}`);
-    return reply.startsWith("+OK");
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6379),
+      password: redis_url.password,
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+    });
+    try {
+      await client.connect();
+      stage("redis AUTH (requirepass) OK");
+      const pong = await client.ping();
+      await client.quit();
+      stage(`redis PING reply: ${pong}`);
+      return pong === "PONG";
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
   });
 
-  await retry("redis plaintext ACL username+password via HELLO 3", async () => {
+  await retry("redis plaintext ACL username+password", async () => {
     const redis_url = new URL(REDIS_URL);
-    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
-      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
-      s.once("connect", () => resolve(s));
-      s.once("error", reject);
-    }));
-    stage("redis HELLO 3 AUTH user pass");
-    sock.write(redisCommand(["HELLO", "3", "AUTH", redis_url.username, redis_url.password ?? ""]));
-    const reply = await redisRead(sock);
-    sock.destroy();
-    stage(`redis HELLO reply: ${JSON.stringify(reply.slice(0, 50))}`);
-    return reply.includes("proto") && reply.includes("3");
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6379),
+      username: redis_url.username,
+      password: redis_url.password,
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+    });
+    try {
+      await client.connect();
+      stage("redis ACL auth OK");
+      const result = await client.set("test_key", "test_value");
+      await client.quit();
+      stage(`redis SET reply: ${result}`);
+      return result === "OK";
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
+  });
+
+  await retry("redis plaintext HELLO 3 AUTH via sendCommand", async () => {
+    const redis_url = new URL(REDIS_URL);
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6379),
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+      enableAutoPipelining: false,
+    });
+    try {
+      await client.connect();
+      const hello = await client.call("HELLO", "3", "AUTH", redis_url.username, redis_url.password);
+      await client.quit();
+      stage(`redis HELLO 3 reply: ${JSON.stringify(hello)}`);
+      return Array.isArray(hello) && hello.includes("proto") && hello.includes(3);
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
   });
 
   await retry("redis plaintext pipelined AUTH then PING", async () => {
     const redis_url = new URL(REDIS_URL);
-    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
-      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
-      s.once("connect", () => resolve(s));
-      s.once("error", reject);
-    }));
-    stage("redis pipelined AUTH + PING");
-    const auth = redisCommand(["AUTH", redis_url.username, redis_url.password ?? ""]);
-    const ping = redisCommand(["PING"]);
-    sock.write(Buffer.concat([auth, ping]));
-    const reply = await race("redis pipelined reply", new Promise<string>((resolve, reject) => {
-      let buf = "";
-      const onData = (chunk: Buffer) => {
-        buf += chunk.toString("utf8");
-        if (buf.split("\r\n").length >= 4) {
-          sock.off("data", onData);
-          resolve(buf);
-        }
-      };
-      sock.on("data", onData);
-      sock.once("error", reject);
-    }));
-    sock.destroy();
-    stage(`redis pipelined reply: ${JSON.stringify(reply)}`);
-    return reply.includes("+OK") && reply.includes("+PONG");
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6379),
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+    });
+    try {
+      await client.connect();
+      const pipeline = client.pipeline();
+      pipeline.auth(redis_url.username, redis_url.password ?? "");
+      pipeline.ping();
+      const results = await pipeline.exec();
+      await client.quit();
+      stage(`redis pipelined results: ${JSON.stringify(results)}`);
+      return results?.[0]?.[0] === null && results?.[1]?.[1] === "PONG";
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
   });
 
   await retry("redis plaintext WRONGPASS without real secret leak", async () => {
-    const redis_url = new URL(REDIS_URL);
-    const sock = await race("redis connect", new Promise<Socket>((resolve, reject) => {
-      const s = connect(Number(redis_url.port || 6379), redis_url.hostname);
-      s.once("connect", () => resolve(s));
-      s.once("error", reject);
-    }));
-    stage("redis AUTH with wrong password");
-    sock.write(redisCommand(["AUTH", "wrong_password"]));
-    const reply = await redisRead(sock);
-    sock.destroy();
-    stage(`redis WRONGPASS reply: ${JSON.stringify(reply)}`);
-    return reply.includes("-WRONGPASS") && !reply.includes("arkham_real_redis_pass");
+    const client = new Redis({
+      host: new URL(REDIS_URL).hostname,
+      port: Number(new URL(REDIS_URL).port || 6379),
+      password: "wrong_password",
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+    });
+    try {
+      await client.connect();
+      await client.disconnect();
+      return false;
+    } catch (err: any) {
+      await client.disconnect();
+      const errMsg = String(err);
+      stage(`redis WRONGPASS error: ${errMsg}`);
+      return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
+    }
   });
 } else {
   stage("redis plaintext scenarios skipped: no REDIS_URL");
@@ -435,80 +455,135 @@ if (REDIS_URL) {
 
 // 10. Redis over TLS: the same auth patterns over rediss://, arkham
 //     terminates the guest TLS with a minted leaf and dials upstream TLS.
+//     Uses ioredis with TLS configuration.
 if (REDIS_TLS_URL) {
-  function redisCommand(parts: string[]): Buffer {
-    const bulk = parts.map((part) => `$${Buffer.byteLength(part)}\r\n${part}\r\n`).join("");
-    return Buffer.from(`*${parts.length}\r\n${bulk}`, "utf8");
-  }
-  function redisReadTls(tls: TLSSocket): Promise<string> {
-    return race("redis tls reply", new Promise<string>((resolve, reject) => {
-      let buf = "";
-      const onData = (chunk: Buffer) => {
-        buf += chunk.toString("utf8");
-        if (buf.includes("\r\n")) {
-          tls.off("data", onData);
-          resolve(buf);
-        }
-      };
-      tls.on("data", onData);
-      tls.once("error", reject);
-    }));
-  }
   await retry("redis tls requirepass auth over arkham MITM", async () => {
     const redis_url = new URL(REDIS_TLS_URL);
-    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
-    stage("redis tls AUTH");
-    tls.write(redisCommand(["AUTH", redis_url.password ?? ""]));
-    const reply = await redisReadTls(tls);
-    tls.destroy();
-    stage(`redis tls AUTH reply: ${JSON.stringify(reply)}`);
-    return reply.startsWith("+OK");
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6380),
+      password: redis_url.password,
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+      tls: {
+        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
+        rejectUnauthorized: true,
+      },
+    });
+    try {
+      await client.connect();
+      stage("redis tls AUTH OK");
+      const pong = await client.ping();
+      await client.quit();
+      stage(`redis tls PING reply: ${pong}`);
+      return pong === "PONG";
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
   });
 
-  await retry("redis tls ACL via HELLO 3", async () => {
+  await retry("redis tls ACL username+password", async () => {
     const redis_url = new URL(REDIS_TLS_URL);
-    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
-    stage("redis tls HELLO 3 AUTH");
-    tls.write(redisCommand(["HELLO", "3", "AUTH", redis_url.username, redis_url.password ?? ""]));
-    const reply = await redisReadTls(tls);
-    tls.destroy();
-    stage(`redis tls HELLO reply: ${JSON.stringify(reply.slice(0, 50))}`);
-    return reply.includes("proto") && reply.includes("3");
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6380),
+      username: redis_url.username,
+      password: redis_url.password,
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+      tls: {
+        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
+        rejectUnauthorized: true,
+      },
+    });
+    try {
+      await client.connect();
+      stage("redis tls ACL auth OK");
+      const result = await client.set("tls_test_key", "tls_test_value");
+      await client.quit();
+      stage(`redis tls SET reply: ${result}`);
+      return result === "OK";
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
+  });
+
+  await retry("redis tls HELLO 3 AUTH via sendCommand", async () => {
+    const redis_url = new URL(REDIS_TLS_URL);
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6380),
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+      enableAutoPipelining: false,
+      tls: {
+        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
+        rejectUnauthorized: true,
+      },
+    });
+    try {
+      await client.connect();
+      const hello = await client.call("HELLO", "3", "AUTH", redis_url.username, redis_url.password);
+      await client.quit();
+      stage(`redis tls HELLO 3 reply: ${JSON.stringify(hello)}`);
+      return Array.isArray(hello) && hello.includes("proto") && hello.includes(3);
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
   });
 
   await retry("redis tls pipelined AUTH then SET", async () => {
     const redis_url = new URL(REDIS_TLS_URL);
-    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
-    stage("redis tls pipelined AUTH + SET");
-    const auth = redisCommand(["AUTH", redis_url.username, redis_url.password ?? ""]);
-    const set = redisCommand(["SET", "test_key", "test_value"]);
-    tls.write(Buffer.concat([auth, set]));
-    const reply = await race("redis tls pipelined reply", new Promise<string>((resolve, reject) => {
-      let buf = "";
-      const onData = (chunk: Buffer) => {
-        buf += chunk.toString("utf8");
-        if (buf.split("\r\n").length >= 4) {
-          tls.off("data", onData);
-          resolve(buf);
-        }
-      };
-      tls.on("data", onData);
-      tls.once("error", reject);
-    }));
-    tls.destroy();
-    stage(`redis tls pipelined reply: ${JSON.stringify(reply)}`);
-    return reply.includes("+OK");
+    const client = new Redis({
+      host: redis_url.hostname,
+      port: Number(redis_url.port || 6380),
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+      tls: {
+        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
+        rejectUnauthorized: true,
+      },
+    });
+    try {
+      await client.connect();
+      const pipeline = client.pipeline();
+      pipeline.auth(redis_url.username, redis_url.password ?? "");
+      pipeline.set("pipeline_key", "pipeline_value");
+      const results = await pipeline.exec();
+      await client.quit();
+      stage(`redis tls pipelined results: ${JSON.stringify(results)}`);
+      return results?.[0]?.[0] === null && results?.[1]?.[1] === "OK";
+    } catch (err) {
+      await client.disconnect();
+      throw err;
+    }
   });
 
   await retry("redis tls WRONGPASS without real secret leak", async () => {
-    const redis_url = new URL(REDIS_TLS_URL);
-    const tls = await tlsTo(redis_url.hostname, Number(redis_url.port || 6380), ca);
-    stage("redis tls AUTH with wrong password");
-    tls.write(redisCommand(["AUTH", "wrong_password"]));
-    const reply = await redisReadTls(tls);
-    tls.destroy();
-    stage(`redis tls WRONGPASS reply: ${JSON.stringify(reply)}`);
-    return reply.includes("-WRONGPASS") && !reply.includes("arkham_real_redis_pass");
+    const client = new Redis({
+      host: new URL(REDIS_TLS_URL).hostname,
+      port: Number(new URL(REDIS_TLS_URL).port || 6380),
+      password: "wrong_password",
+      lazyConnect: true,
+      connectTimeout: ATTEMPT_TIMEOUT_MS,
+      tls: {
+        ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
+        rejectUnauthorized: true,
+      },
+    });
+    try {
+      await client.connect();
+      await client.disconnect();
+      return false;
+    } catch (err: any) {
+      await client.disconnect();
+      const errMsg = String(err);
+      stage(`redis tls WRONGPASS error: ${errMsg}`);
+      return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
+    }
   });
 } else {
   stage("redis tls scenarios skipped: no REDIS_TLS_URL");
