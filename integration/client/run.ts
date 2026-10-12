@@ -394,6 +394,8 @@ if (REDIS_URL) {
       lazyConnect: true,
       connectTimeout: ATTEMPT_TIMEOUT_MS,
       enableAutoPipelining: false,
+      // Connect before AUTH. The ready check's INFO is rejected until then.
+      enableReadyCheck: false,
     });
     try {
       await client.connect();
@@ -414,6 +416,8 @@ if (REDIS_URL) {
       port: Number(redis_url.port || 6379),
       lazyConnect: true,
       connectTimeout: ATTEMPT_TIMEOUT_MS,
+      // Connect before AUTH. The ready check's INFO is rejected until then.
+      enableReadyCheck: false,
     });
     try {
       await client.connect();
@@ -518,6 +522,8 @@ if (REDIS_TLS_URL) {
       lazyConnect: true,
       connectTimeout: ATTEMPT_TIMEOUT_MS,
       enableAutoPipelining: false,
+      // Connect before AUTH. The ready check's INFO is rejected until then.
+      enableReadyCheck: false,
       tls: {
         ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
         rejectUnauthorized: true,
@@ -542,6 +548,8 @@ if (REDIS_TLS_URL) {
       port: Number(redis_url.port || 6380),
       lazyConnect: true,
       connectTimeout: ATTEMPT_TIMEOUT_MS,
+      // Connect before AUTH. The ready check's INFO is rejected until then.
+      enableReadyCheck: false,
       tls: {
         ca: await readFile(`${CERT_DIR}/ca.crt`, "utf8"),
         rejectUnauthorized: true,
