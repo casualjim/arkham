@@ -370,12 +370,6 @@ function passwordOnly(raw: string): string {
   return url.toString();
 }
 
-function withPassword(raw: string, password: string): string {
-  const url = new URL(raw);
-  url.password = password;
-  return url.toString();
-}
-
 function errorText(err: unknown): string {
   if (err instanceof Error) {
     const code = "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
@@ -384,17 +378,26 @@ function errorText(err: unknown): string {
   return String(err);
 }
 
+// A bad password on the URL makes Bun's HELLO fail, and that rejection is
+// reported as a closed connection. AUTH after a successful handshake is a
+// normal command error, which carries Redis's WRONGPASS text.
 async function redisFailureText(raw: string, tls: boolean): Promise<string> {
+  const url = new URL(raw);
   const client = openRedis(raw, tls);
+  const messages: string[] = [];
+  client.onclose = (err) => {
+    messages.push(errorText(err));
+  };
   try {
     await client.connect();
-    await client.ping();
-    return "connected";
+    const reply = await client.send("AUTH", [url.username, "wrong_password"]);
+    messages.push(JSON.stringify(reply));
   } catch (err) {
-    return errorText(err);
+    messages.push(errorText(err));
   } finally {
     client.close();
   }
+  return messages.join(" ");
 }
 
 function helloHasProto3(reply: unknown): boolean {
@@ -468,7 +471,7 @@ async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
   });
 
   await retry(`redis ${kind} WRONGPASS without real secret leak`, async () => {
-    const errMsg = await redisFailureText(withPassword(raw, "wrong_password"), tls);
+    const errMsg = await redisFailureText(raw, tls);
     stage(`redis ${kind} WRONGPASS error: ${errMsg}`);
     return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
   });
