@@ -335,6 +335,17 @@ if (SSH_DST) {
   stage("ssh scenario skipped: no SSH_DST (bwrap)");
 }
 
+// ioredis 5 parses RESP2 only. Redis answers a successful HELLO 3 with a
+// RESP3 map, whose type byte is `%`. A rejected password is a RESP2 error
+// line, which ioredis surfaces as WRONGPASS rather than a parser error.
+function helloAccepted(reply: unknown, err: unknown): boolean {
+  if (Array.isArray(reply) && reply.includes("proto") && reply.includes(3)) {
+    return true;
+  }
+  const errMsg = String(err ?? "");
+  return errMsg.includes('got "%"') && !errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
+}
+
 // 9. Redis plaintext: requirepass AUTH over cleartext TCP, plus ACL
 //    username/password, HELLO 3 AUTH, pipelined commands after auth,
 //    and WRONGPASS failure without leaking the real password.
@@ -402,10 +413,11 @@ if (REDIS_URL) {
       const hello = await client.call("HELLO", "3", "AUTH", redis_url.username, redis_url.password);
       await client.quit();
       stage(`redis HELLO 3 reply: ${JSON.stringify(hello)}`);
-      return Array.isArray(hello) && hello.includes("proto") && hello.includes(3);
+      return helloAccepted(hello, undefined);
     } catch (err) {
       await client.disconnect();
-      throw err;
+      stage(`redis HELLO 3 error: ${String(err)}`);
+      return helloAccepted(undefined, err);
     }
   });
 
@@ -534,10 +546,11 @@ if (REDIS_TLS_URL) {
       const hello = await client.call("HELLO", "3", "AUTH", redis_url.username, redis_url.password);
       await client.quit();
       stage(`redis tls HELLO 3 reply: ${JSON.stringify(hello)}`);
-      return Array.isArray(hello) && hello.includes("proto") && hello.includes(3);
+      return helloAccepted(hello, undefined);
     } catch (err) {
       await client.disconnect();
-      throw err;
+      stage(`redis tls HELLO 3 error: ${String(err)}`);
+      return helloAccepted(undefined, err);
     }
   });
 
