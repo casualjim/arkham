@@ -338,6 +338,22 @@ if (SSH_DST) {
 // ioredis 5 parses RESP2 only. Redis answers a successful HELLO 3 with a
 // RESP3 map, whose type byte is `%`. A rejected password is a RESP2 error
 // line, which ioredis surfaces as WRONGPASS rather than a parser error.
+// ioredis emits the Redis reply on the error event, then rejects connect()
+// with "Connection is closed". Both have to be read.
+async function authFailureText(client: Redis): Promise<string> {
+  const messages: string[] = [];
+  client.on("error", (err: Error) => {
+    messages.push(String(err));
+  });
+  try {
+    await client.connect();
+  } catch (err) {
+    messages.push(String(err));
+  }
+  await client.disconnect().catch(() => undefined);
+  return messages.join(" ");
+}
+
 function helloAccepted(reply: unknown, err: unknown): boolean {
   if (Array.isArray(reply) && reply.includes("proto") && reply.includes(3)) {
     return true;
@@ -454,16 +470,9 @@ if (REDIS_URL) {
       lazyConnect: true,
       connectTimeout: ATTEMPT_TIMEOUT_MS,
     });
-    try {
-      await client.connect();
-      await client.disconnect();
-      return false;
-    } catch (err: any) {
-      await client.disconnect();
-      const errMsg = String(err);
-      stage(`redis WRONGPASS error: ${errMsg}`);
-      return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
-    }
+    const errMsg = await authFailureText(client);
+    stage(`redis WRONGPASS error: ${errMsg}`);
+    return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
   });
 } else {
   stage("redis plaintext scenarios skipped: no REDIS_URL");
@@ -595,16 +604,9 @@ if (REDIS_TLS_URL) {
         rejectUnauthorized: true,
       },
     });
-    try {
-      await client.connect();
-      await client.disconnect();
-      return false;
-    } catch (err: any) {
-      await client.disconnect();
-      const errMsg = String(err);
-      stage(`redis tls WRONGPASS error: ${errMsg}`);
-      return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
-    }
+    const errMsg = await authFailureText(client);
+    stage(`redis tls WRONGPASS error: ${errMsg}`);
+    return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
   });
 } else {
   stage("redis tls scenarios skipped: no REDIS_TLS_URL");
