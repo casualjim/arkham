@@ -230,12 +230,18 @@ pattern = "{base62:32}"
 # note: no vendor page states a key format; the shape is generic.
 
 [providers.aws]
-env = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+env = ["AWS_ACCESS_KEY_ID"]
 hosts = ["https://*.amazonaws.com"]
 pattern = "AKIA{base62:16}"
 # source: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
 # source: https://docs.aws.amazon.com/general/latest/gr/rande.html
 # note: the `AKIA` prefix comes from the docs' `AKIAIOSFODNN7EXAMPLE`; real key ids are uppercase, which `{base62:N}` approximates.
+# note: AWS_ACCESS_KEY_ID appears in the Authorization header and substitutes; AWS_SECRET_ACCESS_KEY is a SigV4 HMAC signing input and never reaches the wire — see providers.aws-secret.
+
+[providers.aws-secret]
+env = ["AWS_SECRET_ACCESS_KEY"]
+# signing half: a SigV4 HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/14
 
 [providers.azure-cognitive-services]
 env = ["AZURE_COGNITIVE_SERVICES_API_KEY"]
@@ -4302,10 +4308,11 @@ pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/monday/monday.go
 
 [providers.mongodb]
-env = ["MONGODB_API_KEY", "MONGODB_API_TOKEN", "MONGODB_APIKEY", "MONGODB_TOKEN", "MONGODB_ACCESS_TOKEN", "MONGODB_AUTH_TOKEN", "MONGODB_SECRET", "MONGODB_SECRET_KEY", "MONGODB_KEY"]
+env = ["MONGODB_API_KEY", "MONGODB_API_TOKEN", "MONGODB_APIKEY", "MONGODB_TOKEN", "MONGODB_ACCESS_TOKEN", "MONGODB_AUTH_TOKEN", "MONGODB_KEY"]
 hosts = ["https://howtorotate.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/mongodb/mongodb.go
+# note: trufflehog lists a placeholder host; MONGODB_SECRET and MONGODB_SECRET_KEY removed (unclear what MongoDB product they refer to, and Atlas API keys are sent in headers)
 
 [providers.monkeylearn]
 env = ["MONKEYLEARN_API_KEY", "MONKEYLEARN_API_TOKEN", "MONKEYLEARN_APIKEY", "MONKEYLEARN_TOKEN", "MONKEYLEARN_ACCESS_TOKEN", "MONKEYLEARN_AUTH_TOKEN", "MONKEYLEARN_SECRET", "MONKEYLEARN_SECRET_KEY", "MONKEYLEARN_KEY"]
@@ -6157,9 +6164,11 @@ pattern = "{base62:32}"
 # no verification endpoint for. Hosts come from each rule's `validate`
 # expression, which calls the vendor's own API; a rule whose regex states a
 # literal prefix gets that prefix in its pattern.
-# Credentials that are only ever used to sign a request (Alibaba Cloud,
-# OVH application secrets) are left out, as AWS is at the top of this file:
-# their value never reaches the wire, so there is nothing to substitute.
+# Credentials that are only ever used to sign a request (AWS SigV4, Alibaba Cloud,
+# OVH application secrets, Exoscale) are split: the public API key half (which
+# appears in headers) keeps hosts and substitutes, while the secret signing half
+# lives in a hostless `<provider>-secret` entry with no rule — decoy shape only.
+# See https://github.com/casualjim/arkham/issues/14 and https://github.com/casualjim/arkham/issues/19.
 # source: github.com/betterleaks/betterleaks v1.6.1 config/betterleaks.toml
 # ---------------------------------------------------------------------------
 
@@ -6253,11 +6262,17 @@ pattern = "{base62:32}"
 # source: betterleaks v1.6.1 rule `etsy-open-api-key` — its validate expression calls api.etsy.com
 
 [providers.exoscale]
-env = ["EXOSCALE_API_KEY", "EXOSCALE_SECRET_KEY", "EXOSCALE_API_TOKEN", "EXOSCALE_APIKEY", "EXOSCALE_TOKEN", "EXOSCALE_ACCESS_TOKEN", "EXOSCALE_AUTH_TOKEN", "EXOSCALE_SECRET", "EXOSCALE_KEY"]
+env = ["EXOSCALE_API_KEY", "EXOSCALE_API_TOKEN", "EXOSCALE_APIKEY", "EXOSCALE_TOKEN", "EXOSCALE_ACCESS_TOKEN", "EXOSCALE_AUTH_TOKEN", "EXOSCALE_KEY"]
 hosts = ["https://*.exoscale.com"]
 pattern = "{base62:32}"
 # source: betterleaks v1.6.1 rule `exoscale-api-key` — its validate expression calls api-ch-gva-2.exoscale.com
 # note: the validation host is zone-specific (`api-ch-gva-2`), so the host pattern covers every zone; the rule states no key prefix.
+# note: EXOSCALE_API_KEY and variants appear in headers and substitute; EXOSCALE_SECRET_KEY and EXOSCALE_SECRET are HMAC signing inputs — see providers.exoscale-secret.
+
+[providers.exoscale-secret]
+env = ["EXOSCALE_SECRET_KEY", "EXOSCALE_SECRET"]
+# signing half: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 [providers.freshbooks]
 env = ["FRESHBOOKS_ACCESS_TOKEN", "FRESHBOOKS_API_KEY", "FRESHBOOKS_API_TOKEN", "FRESHBOOKS_APIKEY", "FRESHBOOKS_TOKEN", "FRESHBOOKS_AUTH_TOKEN", "FRESHBOOKS_SECRET", "FRESHBOOKS_SECRET_KEY", "FRESHBOOKS_KEY"]
@@ -6299,10 +6314,16 @@ pattern = "{base62:32}"
 # source: betterleaks v1.6.1 rule `lighton-paradigm-api-key` — its validate expression calls paradigm.lighton.ai
 
 [providers.polymarket]
-env = ["POLYMARKET_API_KEY", "POLYMARKET_API_TOKEN", "POLYMARKET_APIKEY", "POLYMARKET_TOKEN", "POLYMARKET_ACCESS_TOKEN", "POLYMARKET_AUTH_TOKEN", "POLYMARKET_SECRET", "POLYMARKET_SECRET_KEY", "POLYMARKET_KEY"]
+env = ["POLYMARKET_API_KEY", "POLYMARKET_API_TOKEN", "POLYMARKET_APIKEY", "POLYMARKET_TOKEN", "POLYMARKET_ACCESS_TOKEN", "POLYMARKET_AUTH_TOKEN", "POLYMARKET_KEY"]
 hosts = ["https://clob.polymarket.com"]
 pattern = "{base62:32}"
 # source: betterleaks v1.6.1 rule `polymarket-api-key` — its validate expression calls clob.polymarket.com
+# note: POLYMARKET_API_KEY and variants appear in headers and substitute; POLYMARKET_SECRET and POLYMARKET_SECRET_KEY are HMAC signing inputs — see providers.polymarket-secret.
+
+[providers.polymarket-secret]
+env = ["POLYMARKET_SECRET", "POLYMARKET_SECRET_KEY"]
+# signing half: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
 
 [providers.upcloud]

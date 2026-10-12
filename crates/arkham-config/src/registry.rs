@@ -1019,4 +1019,40 @@ hosts = ["https://api.example/path"]
     let err = Registry::load(Some(dir.path())).unwrap_err();
     assert!(err.to_string().contains("duplicate `token_fields` entry"), "{err:?}");
   }
+
+  #[test]
+  fn signing_only_secrets_have_no_hosts() {
+    let registry = Registry::load(None).unwrap();
+    // Known signing-only secrets: HMAC/SigV4 inputs that never reach the wire.
+    // These must have no hosts (no rule), only decoy shape.
+    // See https://github.com/casualjim/arkham/issues/14 and #19.
+    for env in [
+      "AWS_SECRET_ACCESS_KEY",
+      "EXOSCALE_SECRET_KEY",
+      "EXOSCALE_SECRET",
+      "POLYMARKET_SECRET",
+      "POLYMARKET_SECRET_KEY",
+      // Exchange secrets (spot check a few)
+      "BINANCE_API_SECRET",
+      "BINANCE_SECRET",
+      "OKX_API_SECRET",
+      "KRAKEN_API_SECRET",
+    ] {
+      let known = registry.lookup(env);
+      match known {
+        None => {
+          // Acceptable: no registry entry at all means no rule
+        }
+        Some(entry) => {
+          assert!(
+            entry.hosts.is_empty(),
+            "{env} is a signing-only secret but has hosts: {:?}. \
+             Signing secrets never reach the wire and must not have hosts \
+             (they can have a pattern for decoy shape only).",
+            entry.hosts
+          );
+        }
+      }
+    }
+  }
 }
