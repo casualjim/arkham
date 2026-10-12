@@ -350,7 +350,7 @@ async function authFailureText(client: Redis): Promise<string> {
   } catch (err) {
     messages.push(String(err));
   }
-  await client.disconnect().catch(() => undefined);
+  client.disconnect();
   return messages.join(" ");
 }
 
