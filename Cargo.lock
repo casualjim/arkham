@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-compose"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "arkham-config",
  "arkham-fnox",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-config"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "base62",
  "clap",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -400,14 +400,14 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf-programs"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "aya-ebpf",
 ]
 
 [[package]]
 name = "arkham-fnox"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "arkham-config",
  "fnox-core",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-pki"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "pretty_assertions",
  "rama",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-plugin"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "arkham-config",
  "pretty_assertions",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-proxy"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tproxy"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tun"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -970,7 +970,7 @@ dependencies = [
  "http 1.5.0",
  "p256",
  "percent-encoding",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "time",
  "tracing",
@@ -3313,7 +3313,7 @@ dependencies = [
  "serde_json",
  "serde_spanned 1.1.2",
  "serde_yaml",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "shellexpand",
  "strsim",
  "strum 0.28.0",
@@ -3972,7 +3972,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -5371,7 +5371,7 @@ dependencies = [
  "salsa20 0.11.0",
  "secrecy",
  "serde",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "twofish",
  "uuid",
@@ -6373,7 +6373,7 @@ dependencies = [
  "futures",
  "log",
  "rand 0.10.3",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "windows 0.62.2",
@@ -6747,7 +6747,7 @@ dependencies = [
  "md-5",
  "memchr",
  "rand 0.10.3",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "stringprep",
 ]
 
@@ -7191,7 +7191,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "time",
  "webpki-root-certs",
  "x509-parser",
@@ -7331,7 +7331,7 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sync_wrapper",
  "tokio",
 ]
@@ -7487,7 +7487,7 @@ dependencies = [
  "rama-utils",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
 ]
 
@@ -7955,7 +7955,7 @@ dependencies = [
  "pkcs1 0.8.0-rc.5",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "signature 3.0.0",
  "zeroize",
 ]
@@ -8140,7 +8140,7 @@ version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d84e8ba78bd384263e5922f084cbe1b081c3b7e69add59c8fb097b879ba968a"
 dependencies = [
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "walkdir",
 ]
 
@@ -8696,9 +8696,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
@@ -11370,7 +11370,7 @@ dependencies = [
  "miette",
  "rand 0.10.3",
  "regex",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "strsim",
  "thiserror 2.0.21",
 ]
