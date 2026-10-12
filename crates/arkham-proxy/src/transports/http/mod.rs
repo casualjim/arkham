@@ -75,11 +75,10 @@ impl Transport for HttpsTransport {
       tracing::debug!(authority, sni, "CONNECT authority differs from SNI; closing");
       return Ok(());
     }
-    let Some(identity) = host.or(sni.as_deref()) else {
-      // Transparent capture with a hello that carries no SNI: there is no
-      // identity to mint for, so the bytes are copied.
-      return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
-    };
+    // Transparent capture of an IP-literal client (kubectl against an
+    // address) carries no SNI, so the captured destination is the identity
+    // to mint for. A grant that does not name it still splices below.
+    let identity = host.or(sni.as_deref()).unwrap_or(dial_host);
     let Some(scope) = snapshot
       .grants
       .iter()
