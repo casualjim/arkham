@@ -1,8 +1,19 @@
+## [0.3.13] - 2026-10-12
+
+### 🐛 Bug Fixes
+
+- *(proxy)* MITM transparent TLS without SNI using captured IP (#45)
+- Split signing-only secrets from substitutable credentials (#43)
 ## [0.3.12] - 2026-10-11
 
 ### 🐛 Bug Fixes
 
 - Convert out of rama TcpStream via From
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.12 [ci skip]
+- Release
 ## [0.3.11] - 2026-10-11
 
 ### 🐛 Bug Fixes
