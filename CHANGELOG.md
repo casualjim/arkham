@@ -1,3 +1,8 @@
+## [0.3.15] - 2026-10-13
+
+### 🐛 Bug Fixes
+
+- Record per-vendor signing decisions for exchange and cloud keys (#46)
 ## [0.3.14] - 2026-10-12
 
 ### 🐛 Bug Fixes
@@ -10,6 +15,8 @@
 - Update changelog for v0.3.13 [ci skip]
 - Release
 - *(release)* Push release tag with a GitHub App token
+- Update changelog for v0.3.14 [ci skip]
+- Release
 ## [0.3.12] - 2026-10-11
 
 ### 🐛 Bug Fixes
