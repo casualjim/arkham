@@ -13,20 +13,44 @@ scratch=$proj_dir/target/k3s-e2e
 arkham=$proj_dir/target/debug/arkham
 serve_pid=""
 
+# The published API's EOF only shows up in the serverlb and server logs.
+# Print them before the trap deletes the cluster.
+dump_k3s_diagnostics() {
+  local name
+  {
+    echo "=== kubeconfig server ==="
+    kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}' 2>/dev/null || true
+    echo
+    echo "=== k3d cluster list ==="
+    k3d cluster list || true
+    echo "=== docker ps (k3d-${cluster}) ==="
+    docker ps -a --filter "name=k3d-${cluster}" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+    for name in "k3d-${cluster}-server-0" "k3d-${cluster}-serverlb"; do
+      echo "=== docker logs ${name} (tail 200) ==="
+      docker logs --tail 200 "$name" 2>&1 || true
+    done
+  } >&2
+}
+
 cleanup() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    dump_k3s_diagnostics
+  fi
   if [ -n "$serve_pid" ]; then
     kill "$serve_pid" 2>/dev/null || true
   fi
   k3d cluster delete "$cluster" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
 rm -rf "$scratch"
 mkdir -p "$scratch" "$scratch/config/arkham"
 
 # Isolation: every k3d/kubectl call in this task sees only task-local
 # kubeconfig files under $scratch; the user's ~/.kube/config is never
 # read, merged, or written.
-export KUBECONFIG="$scratch/task-kubeconfig"
+export KUBECONFIG="$scratch/cert-kubeconfig"
 # Stack generation needs `[workspace] home`, which normally arrives via the
 # user's global config; the hermetic XDG_CONFIG_HOME hides that file, so the
 # task seeds the one value generation requires.
@@ -36,20 +60,65 @@ printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/arkham/config.toml
 # The kubeconfig flags keep k3d from touching ~/.kube/config even if the
 # KUBECONFIG export above were lost.
 k3d cluster delete "$cluster" >/dev/null 2>&1 || true
-k3d cluster create "$cluster" --wait --kubeconfig-update-default=false --kubeconfig-switch-context=false
+# Publish the API on loopback. k3d's default kubeconfig server is 0.0.0.0,
+# a listen address: CI dialed https://0.0.0.0:<port> and the serverlb closed
+# every connection with EOF. `random` is k3d's free-port allocation, and the
+# same address is what it writes into the kubeconfig and the serving cert.
+# --wait returns once the server node has logged readiness and the serverlb
+# container is running. nginx can still accept the host port and EOF until
+# its apiserver upstream is up, so the poll below is the host-side gate.
+k3d cluster create "$cluster" \
+  --wait \
+  --api-port 127.0.0.1:random \
+  --kubeconfig-update-default=false \
+  --kubeconfig-switch-context=false
 
 # With update-default off, k3d wrote no kubeconfig anywhere; write its
 # store copy to the task file so kubectl has a config to read.
 k3d kubeconfig get "$cluster" >"$KUBECONFIG"
 
-# k3d --wait covers node container readiness, not a serving apiserver; slow
-# runners hit EOF on the first request. kubectl wait polls until nodes are
-# Ready, which implies the apiserver answers.
-kubectl wait --for=condition=ready node --all --timeout=180s >/dev/null
+server=$(kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}')
+case "$server" in
+  https://127.0.0.1:[0-9]*) ;;
+  *)
+    echo "kubeconfig server is ${server}; expected https://127.0.0.1:<port>" >&2
+    exit 1
+    ;;
+esac
 
-# k3d writes the server as 0.0.0.0, which is not a usable TLS identity or dial
-# address everywhere a grant travels; loopback is the same listener.
-k3d kubeconfig get "$cluster" | sed 's|https://0.0.0.0:|https://127.0.0.1:|' >"$scratch/cert-kubeconfig"
+# kubectl's discovery client retries an EOF about five times, ten seconds
+# apart, then exits. `kubectl wait --timeout` does not start until that
+# discovery succeeds, which is why the previous 180s wait died in ~50s.
+# Each probe is a new client, so the budget here is actually 180s. The
+# sleep is the gap between probes, not a stand-in for readiness.
+wait_for_apiserver() {
+  local deadline=$((SECONDS + 180))
+  local errfile=$scratch/readyz.err
+  local next_note=0
+  local detail
+  : >"$errfile"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if kubectl get --raw=/readyz --request-timeout=5s >"$scratch/readyz.out" 2>"$errfile"; then
+      echo "apiserver /readyz ok"
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$next_note" ]; then
+      detail=$(tr '\n' ' ' <"$errfile" || true)
+      echo "waiting for apiserver /readyz: ${detail}" >&2
+      next_note=$((SECONDS + 10))
+    fi
+    sleep 2
+  done
+  echo "kubernetes apiserver did not report ready within 180s" >&2
+  cat "$errfile" >&2 || true
+  return 1
+}
+wait_for_apiserver
+
+kubectl wait --for=condition=Ready nodes --all --timeout=180s
+
+# The legs dial the API by the kubeconfig address. They do not resolve
+# cluster DNS, so CoreDNS is not a gate.
 
 # Bearer-leg source: token-only copy of the same kubeconfig.
 cp "$scratch/cert-kubeconfig" "$scratch/token-kubeconfig"
