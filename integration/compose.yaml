@@ -198,15 +198,22 @@ services:
         set -euo pipefail
         apt-get update -qq && apt-get install -qq -y openssh-client
         if [ -n "${HOST_UID:-}" ] && [ "$HOST_UID" != 0 ]; then
+          gid="${HOST_GID:-$HOST_UID}"
           mkdir -p /out
-          chown "$HOST_UID:${HOST_GID:-$HOST_UID}" /out
-          # ssh ignores a private key it does not own. /certs is read-only,
-          # so the decoy is copied to a file this uid owns.
+          chown "$HOST_UID:$gid" /out
+          # ssh ignores a private key it does not own, and it refuses a uid
+          # with no passwd entry. /certs is read-only, so the decoy is copied.
+          if ! getent group "$gid" >/dev/null; then
+            echo "arkham:x:$gid:" >> /etc/group
+          fi
+          if ! getent passwd "$HOST_UID" >/dev/null; then
+            echo "arkham:x:$HOST_UID:$gid:arkham:/tmp:/bin/bash" >> /etc/passwd
+          fi
           cp /certs/ssh/decoy /tmp/decoy
-          chown "$HOST_UID:${HOST_GID:-$HOST_UID}" /tmp/decoy
+          chown "$HOST_UID:$gid" /tmp/decoy
           chmod 600 /tmp/decoy
           export HOME=/tmp SSH_IDENTITY=/tmp/decoy
-          exec setpriv --reuid="$HOST_UID" --regid="${HOST_GID:-$HOST_UID}" --clear-groups bun /srv/run.ts
+          exec setpriv --reuid="$HOST_UID" --regid="$gid" --clear-groups bun /srv/run.ts
         fi
         exec bun /srv/run.ts
     environment:

@@ -29,6 +29,10 @@ fi
 # a service's cgroup path — `ARKHAM_BACKEND=ebpf mise run demo:bwrap` runs
 # the same scenarios over eBPF instead.
 backends=${ARKHAM_TEST_BACKENDS:-"tproxy tun"}
+# Compose interpolates these on every `up` and `down`. Export them for the
+# whole loop so a command that does not prefix them does not warn.
+export HOST_UID="$(id -u)"
+export HOST_GID="$(id -g)"
 
 # The debug binary comes from the `build:debug` dependency; compose mounts
 # it from here (the image is runtime-only, no build stage).
@@ -46,7 +50,7 @@ for backend in $backends; do
   # The bind-mounted file survives `down`. A leftover from the previous
   # backend, or from an earlier run, must not satisfy this round.
   rm -f integration/out/covered.json
-  ARKHAM_BACKEND="$backend" HOST_UID="$(id -u)" HOST_GID="$(id -g)" $compose up -d --build
+  ARKHAM_BACKEND="$backend" $compose up -d --build
 
   state=running
   for _ in $(seq 1 120); do
