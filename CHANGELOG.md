@@ -1,8 +1,18 @@
+## [0.3.16] - 2026-10-13
+
+### 🐛 Bug Fixes
+
+- *(test)* Wait longer for the k3d apiserver and clear capture leftovers (#48)
 ## [0.3.15] - 2026-10-13
 
 ### 🐛 Bug Fixes
 
 - Record per-vendor signing decisions for exchange and cloud keys (#46)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.15 [ci skip]
+- Release
 ## [0.3.14] - 2026-10-12
 
 ### 🐛 Bug Fixes

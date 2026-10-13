@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-compose"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "arkham-config",
  "arkham-fnox",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-config"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "base62",
  "clap",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -400,14 +400,14 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf-programs"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "aya-ebpf",
 ]
 
 [[package]]
 name = "arkham-fnox"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "arkham-config",
  "fnox-core",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-pki"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "pretty_assertions",
  "rama",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-plugin"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "arkham-config",
  "pretty_assertions",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-proxy"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tproxy"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tun"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -9349,9 +9349,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -11416,18 +11416,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86502bf56ac7c77571a32e2647bb2a15894565e981fb2a48d7bde2d91c965a9d"
+checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5457206954b06561e2608c7e19cf58b1926586d999c246eebe4502f7e2039d1a"
+checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
 dependencies = [
  "proc-macro2",
  "quote",
