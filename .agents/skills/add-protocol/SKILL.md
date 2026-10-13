@@ -28,7 +28,7 @@ test -d "crates/arkham-proxy/src/transports/$PROTO" \
   && rg -n "mod $PROTO;" crates/arkham-proxy/src/transports/mod.rs \
   && rg -n "fn serve" "crates/arkham-proxy/src/transports/$PROTO/mod.rs" \
   && rg -n -i "Expect::${PROTO}" crates/arkham-proxy/src/identity.rs \
-  && rg -n "${PROTO}:" crates/arkham-proxy/src/lib.rs
+  && rg -n "${PROTO}: Arc<" crates/arkham-proxy/src/lib.rs
 ```
 
 ## 2. Config, validation, and the demo rule
