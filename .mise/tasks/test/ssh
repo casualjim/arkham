@@ -43,7 +43,10 @@ for backend in $backends; do
   # A leftover stack holds an old CA while the rerun rotates the volume, and
   # the first handshake fails on the mismatch; every round starts clean.
   $compose down --remove-orphans -v --timeout 3
-  ARKHAM_BACKEND="$backend" $compose up -d --build
+  # The bind-mounted file survives `down`. A leftover from the previous
+  # backend, or from an earlier run, must not satisfy this round.
+  rm -f integration/out/covered.json
+  ARKHAM_BACKEND="$backend" HOST_UID="$(id -u)" HOST_GID="$(id -g)" $compose up -d --build
 
   state=running
   for _ in $(seq 1 120); do

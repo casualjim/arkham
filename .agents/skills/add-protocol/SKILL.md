@@ -12,7 +12,7 @@ Worked example: Redis RESP, merged in PR #44 as squash `11ce4a877f7ce9ac010bf259
 
 Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy`. Capture backends hand the stream to `serve_transparent_stream` and do not reimplement either.
 
-Each step ends with a command. Run it from the repo root. A non-zero exit means the step is not done. The Redis names below are the example; substitute the protocol you are adding.
+Each step ends with a command. Run it from the repo root. A non-zero exit means the step is not done. `PROTO` is the transport directory name. The blocks set `PROTO=redis` because Redis is the worked example; point it at the protocol you are adding before you run them.
 
 ## 1. Transport module
 
@@ -23,41 +23,56 @@ The vertical parses the protocol and finds the credential bytes the swap reframe
 Register the strategy on `ProxyState` (`crates/arkham-proxy/src/lib.rs`, field `redis`, constructed in `ProxyState::new`). Route it from `Expect` in `crates/arkham-proxy/src/identity.rs`: `expect` calls `Grant::redis`, and `Expect::serve` is the only `match` on the picked protocol (`Expect::Redis` → `state.redis.serve`).
 
 ```bash
-test -d crates/arkham-proxy/src/transports/redis \
-  && rg -n "mod redis" crates/arkham-proxy/src/transports/mod.rs \
-  && rg -n "fn serve" crates/arkham-proxy/src/transports/redis/mod.rs \
-  && rg -n "AUTH|HELLO" crates/arkham-proxy/src/transports/redis/machine.rs \
-  && rg -n "Expect::Redis" crates/arkham-proxy/src/identity.rs \
-  && rg -n "redis: Arc<RedisTransport>" crates/arkham-proxy/src/lib.rs
+export PROTO=redis
+test -d "crates/arkham-proxy/src/transports/$PROTO" \
+  && rg -n "mod $PROTO;" crates/arkham-proxy/src/transports/mod.rs \
+  && rg -n "fn serve" "crates/arkham-proxy/src/transports/$PROTO/mod.rs" \
+  && rg -n -i "Expect::${PROTO}" crates/arkham-proxy/src/identity.rs \
+  && rg -n "${PROTO}:" crates/arkham-proxy/src/lib.rs
 ```
 
 ## 2. Config, validation, and the demo rule
 
-`Scheme` in `crates/arkham-config/src/grants/mod.rs` is the list of protocols. Redis added `Redis` and `Rediss`, and the same names in `Scheme::as_str` and `Scheme::ALL` (`arkham schemes` prints `ALL`). `RuleCfg::value_scheme` in `crates/arkham-config/src/config.rs` recognizes `redis://` and `rediss://`. `GrantCollector::connection_string` dispatches `Scheme::Redis | Scheme::Rediss` to `grants/redis.rs` (`redis::grant`). A connection-string rule has no `allow` entries (`Error::ConnectionStringAllow`); the fake string's port is the match. `Grant::redis` takes `host: Option<&str>` because transparent capture knows the port before it knows a name.
+`Scheme` in `crates/arkham-config/src/grants/mod.rs` is the list of protocols. Redis added `Redis` and `Rediss`. `Scheme::as_str` is an exhaustive match, and `Scheme::all` is `strum::EnumIter` (`arkham schemes` prints that iterator). A variant missing from either fails the build. `RuleCfg::value_scheme` in `crates/arkham-config/src/config.rs` recognizes `redis://` and `rediss://`. `GrantCollector::connection_string` dispatches `Scheme::Redis | Scheme::Rediss` to `grants/redis.rs` (`redis::grant`). A connection-string rule has no `allow` entries (`Error::ConnectionStringAllow`); the fake string's port is the match. `Grant::redis` takes `host: Option<&str>` because transparent capture knows the port before it knows a name.
 
 `IfMissing` defaults to `Error` (`#[default]` on `IfMissing::Error` in `config.rs`). A rule whose secret does not resolve fails startup.
 
 Document the fields in `docs/user/reference/configuration.md` (the Redis rules section: scheme, port, `sslrootcert`, `sslcert`/`sslkey`, `guest_tls_mode`). Put a fake URL in `integration/arkham.toml`. Redis uses `[rules.redis_plain]` (`REDIS_URL`, `redis://…@redis:6379/0`) and `[rules.redis_tls]` (`REDIS_TLS_URL`, `rediss://…@redis:6380/0`).
 
 ```bash
-rg -n "Redis,|Rediss," crates/arkham-config/src/grants/mod.rs \
-  && rg -n 'redis://|rediss://' crates/arkham-config/src/config.rs \
-  && rg -n "fn redis\(" crates/arkham-config/src/grants/mod.rs \
-  && rg -n "Scheme::Redis \| Scheme::Rediss" crates/arkham-config/src/grants/mod.rs \
-  && rg -n "redis_plain|redis_tls" integration/arkham.toml \
-  && rg -n "### Redis rules" docs/user/reference/configuration.md \
+export PROTO=redis
+variant="$(printf '%s' "$PROTO" | python3 -c 'import sys; p=sys.stdin.read().strip(); print(p[:1].upper()+p[1:])')"
+rg -n "EnumIter" crates/arkham-config/src/grants/mod.rs \
+  && rg -n "${variant}," crates/arkham-config/src/grants/mod.rs \
+  && rg -n "Self::${variant} => \"${PROTO}\"" crates/arkham-config/src/grants/mod.rs \
+  && rg -n "${PROTO}://" crates/arkham-config/src/config.rs \
+  && rg -n "fn ${PROTO}\\(" crates/arkham-config/src/grants/mod.rs \
+  && rg -n "Scheme::${variant}" crates/arkham-config/src/grants/mod.rs \
+  && rg -n "### ${variant} rules" docs/user/reference/configuration.md \
   && python3 - <<'PY'
-import pathlib, sys
+import os, pathlib, re, sys
+proto = os.environ["PROTO"]
 text = pathlib.Path("integration/arkham.toml").read_text()
-blocks = text.split("\n[")
+scheme = re.compile(re.escape(proto) + r"s?://")
 bad = []
-for block in blocks:
-    if block.startswith("rules.redis_plain]") or block.startswith("rules.redis_tls]"):
-        if "\nallow" in "\n" + block.split("\n[", 1)[0]:
-            bad.append(block.split("]", 1)[0])
+saw = False
+for block in text.split("\n["):
+    if not scheme.search(block):
+        continue
+    # allow-list rules name the scheme inside `allow`. A connection-string
+    # rule puts it in `value` and has no allow entries.
+    if not re.search(r'^value\s*=', block, re.M):
+        continue
+    saw = True
+    if re.search(r'^allow\s*=', block, re.M):
+        bad.append(block.split("]", 1)[0])
+if not saw:
+    print(f"no connection-string rule contains {proto}://")
+    sys.exit(1)
 if bad:
     print("connection-string rules must not set allow:", bad)
     sys.exit(1)
+print(f"{proto} connection-string rules set no allow")
 PY
 ```
 
@@ -67,19 +82,27 @@ A connection-string protocol does not get a `[providers.*]` host list. The strin
 
 Add a registry provider only when the protocol is an HTTP API with allow-list hosts. That edit is `rules/registry.toml` plus `docs/user/how-to/extend-the-registry.md`. Wire-protocol work does not need it.
 
+`[providers.redis-cloud]` is the one exception already in the tree: the Redis Cloud HTTPS API, and only when `PROTO=redis`. Any other `[providers.<protocol>]` or `[providers.<protocol>-*]` name is a wire-host provider this step rejects.
+
 ```bash
-rg -n '^\[providers\.redis' rules/registry.toml \
-  && python3 - <<'PY'
-import pathlib, sys
-names = [
-    line.split("]", 1)[0].removeprefix("[providers.")
-    for line in pathlib.Path("rules/registry.toml").read_text().splitlines()
-    if line.startswith("[providers.redis")
-]
-if names != ["redis-cloud"]:
-    print("RESP must not grow a wire-host provider; found", names)
+export PROTO=redis
+python3 - <<'PY'
+import os, pathlib, sys
+proto = os.environ["PROTO"]
+# redis-cloud is the HTTPS REST API, not RESP. No other protocol has that exception.
+allowed = {"redis": ["redis-cloud"]}
+names = []
+for line in pathlib.Path("rules/registry.toml").read_text().splitlines():
+    if not line.startswith("[providers."):
+        continue
+    name = line.split("]", 1)[0].removeprefix("[providers.")
+    if name == proto or name.startswith(proto + "-"):
+        names.append(name)
+extra = [name for name in names if name not in allowed.get(proto, [])]
+if extra:
+    print(f"{proto} added a wire-host provider:", extra)
     sys.exit(1)
-print("registry redis providers:", ", ".join(names), "(HTTPS API only)")
+print(f"{proto} wire-host providers:", ", ".join(names) or "(none)")
 PY
 ```
 
@@ -89,29 +112,26 @@ Capture is all outbound TCP. nft (`crates/arkham-tproxy/src/nft.rs`), tun (`crat
 
 The only port special case is UDP/443 (QUIC), which these backends do not terminate: nft drops `udp dport 443`, tun returns on `dst.port() == 443`, and `crates/arkham-ebpf/src/udp.rs` relays UDP with no substitution. Redis 6379 and 6380 needed no capture change.
 
-eBPF cannot pin a compose service cgroup. `ARKHAM_BACKEND=ebpf mise run demo:bwrap` runs the same client script. Scenarios whose env is unset are skipped (bwrap sets no `REDIS_URL`).
+eBPF cannot pin a compose service cgroup. `ARKHAM_BACKEND=ebpf mise run demo:bwrap` covers https and tcp with curl and a raw TCP client (`integration/bwrap/run.sh`). It does not run `integration/client/run.ts`. That script skips a scenario whose env var is unset.
 
 ```bash
+export PROTO=redis
 rg -n "udp dport 443" crates/arkham-tproxy/src/nft.rs \
   && rg -n 'dst\.port\(\) == 443' crates/arkham-tun/src/tun.rs \
   && rg -n "no substitution" crates/arkham-ebpf/src/udp.rs \
   && python3 - <<'PY'
-import pathlib, sys
+import os, pathlib, sys
+proto = os.environ["PROTO"].lower()
 roots = ["crates/arkham-tproxy", "crates/arkham-tun", "crates/arkham-ebpf", "crates/arkham-ebpf-programs"]
-needles = ("6379", "6380")
 hits = []
 for root in roots:
-    for path in pathlib.Path(root).rglob("*"):
-        if path.suffix not in {".rs"}:
-            continue
-        text = path.read_text(errors="replace")
-        for needle in needles:
-            if needle in text:
-                hits.append(f"{path}: {needle}")
+    for path in pathlib.Path(root).rglob("*.rs"):
+        if proto in path.read_text(errors="replace").lower():
+            hits.append(str(path))
 if hits:
-    print("capture special-cases a protocol port:\n" + "\n".join(hits))
+    print("capture names the protocol:\n" + "\n".join(hits))
     sys.exit(1)
-print("capture backends do not special-case Redis ports")
+print("capture backends do not name the protocol")
 PY
 ```
 
@@ -135,28 +155,39 @@ Redis demo URLs (fake and real passwords are the same length):
 
 `sslrootcert` stays on the real `rediss://` string so arkham trusts the demo CA. It is parsed off and not sent to Redis.
 
+`RULE_ENVS` is the rule `env` names. `REAL_ENVS` is what `gen-secrets.sh` requires. Redis uses `REDIS_URL REDIS_TLS_URL` and `ARKHAM_REDIS_REAL ARKHAM_REDIS_TLS_REAL`. A real value's scheme is `PROTO://` or `PROTOs://` (`rediss://` for `PROTO=redis`).
+
 ```bash
-rg -n "ARKHAM_REDIS_REAL|ARKHAM_REDIS_TLS_REAL" integration/gen-secrets.sh integration/.env.example integration/compose.yaml \
-  && rg -n '\[secrets\.REDIS_URL\]|\[secrets\.REDIS_TLS_URL\]' integration/gen-secrets.sh \
-  && rg -n "gen-secrets.sh" integration/compose.yaml \
+export PROTO=redis
+export RULE_ENVS="REDIS_URL REDIS_TLS_URL"
+export REAL_ENVS="ARKHAM_REDIS_REAL ARKHAM_REDIS_TLS_REAL"
+rg -n "gen-secrets.sh" integration/compose.yaml \
   && python3 - <<'PY'
-import pathlib, sys
+import os, pathlib, sys
+proto = os.environ["PROTO"]
+rules = os.environ["RULE_ENVS"].split()
+reals = os.environ["REAL_ENVS"].split()
 script = pathlib.Path("integration/gen-secrets.sh").read_text()
-example = pathlib.Path("integration/.env.example").read_text()
+example = pathlib.Path("integration/.env.example").read_text().splitlines()
 compose = pathlib.Path("integration/compose.yaml").read_text()
-required = ["ARKHAM_REDIS_REAL", "ARKHAM_REDIS_TLS_REAL", "[secrets.REDIS_URL]", "[secrets.REDIS_TLS_URL]"]
-missing = [item for item in required if item not in script]
-if missing:
-    print("gen-secrets.sh missing", missing)
-    sys.exit(1)
-for key in ("ARKHAM_REDIS_REAL", "ARKHAM_REDIS_TLS_REAL"):
-    if f"{key}=" not in example:
-        print(key, "missing from .env.example")
-        sys.exit(1)
+missing = []
+for key in rules:
+    if f"[secrets.{key}]" not in script:
+        missing.append(f"[secrets.{key}]")
+for key in reals:
+    if key not in script:
+        missing.append(key)
+    line = next((item for item in example if item.startswith(key + "=")), "")
+    if not line:
+        missing.append(f"{key} in .env.example")
+    elif f"{proto}://" not in line and f"{proto}s://" not in line:
+        missing.append(f"{key} scheme is not {proto}://")
     if "${" + key + ":?" not in compose:
-        print(key, "is not required by compose")
-        sys.exit(1)
-print("redis secrets are required at render time")
+        missing.append(f"{key} required by compose")
+if missing:
+    print("secrets wiring missing:", missing)
+    sys.exit(1)
+print("rule secrets are required at render time")
 PY
 ```
 
@@ -172,9 +203,9 @@ Transparent capture has a destination address and a port, not a URL host. Some c
 Follow `RedisTransport::serve`. `PostgresTransport::serve` still passes the raw host into `guest_tls_opening`; a client that omits SNI needs the Redis fallback.
 
 ```bash
-rg -n "scope\.downstream\.host" crates/arkham-proxy/src/transports/redis/mod.rs \
-  && rg -n "guest TLS with no name to mint for" crates/arkham-proxy/src/connection.rs \
-  && rg -n "fn redis_tls_without_sni_mints_for_the_grant_host" crates/arkham-proxy/src/e2e.rs
+export PROTO=redis
+rg -n "scope\.downstream\.host" "crates/arkham-proxy/src/transports/$PROTO" \
+  && rg -n "${PROTO}_tls_without_sni" crates/arkham-proxy/src/e2e.rs
 ```
 
 ## 7. Upstream client certificates
@@ -190,11 +221,9 @@ Guest mTLS is separate: `[rules.<label>.tls."<env>"].guest_tls_mode` (`tls` or `
 `integration/gen-certs.sh` mints the Redis leaf with `DNS:redis` and the demo IP so the upstream handshake can verify the name.
 
 ```bash
-rg -n "sslcert|client_cert" crates/arkham-config/src/grants/redis.rs \
-  && rg -n "with_client_auth_cert|with_no_client_auth" crates/arkham-proxy/src/transports/redis/mod.rs \
-  && rg -n "tls-auth-clients no" integration/compose.yaml \
-  && rg -n "DNS:redis" integration/gen-certs.sh \
-  && rg -n "sslcert|guest_tls_mode" docs/user/reference/configuration.md
+export PROTO=redis
+rg -n "client_cert|sslcert" "crates/arkham-config/src/grants/${PROTO}.rs" \
+  && rg -n "with_client_auth_cert|with_no_client_auth" "crates/arkham-proxy/src/transports/$PROTO"
 ```
 
 ## 8. Tests
@@ -219,11 +248,10 @@ if (REDIS_URL) {
 `retry`'s first argument is the scheme that scenario covers (`"redis"`, `"rediss"`). `redisScenarios` picks it from `kind`. A scenario that covers no scheme passes `""` and is not recorded.
 
 ```bash
-rg -n "fn auth_password_reframes_to_any_length|fn upstream_redacts_real_password" crates/arkham-proxy/src/transports/redis/machine.rs \
-  && rg -n "fn redis_auth_swaps_over_cleartext|fn redis_tls_without_sni_mints_for_the_grant_host" crates/arkham-proxy/src/e2e.rs \
-  && rg -n "image: redis:7-alpine" integration/compose.yaml \
-  && rg -n 'RedisClient' integration/client/run.ts \
-  && rg -n 'redis plaintext requirepass auth swaps password|redis tls requirepass auth over arkham MITM' integration/client/run.ts integration/README.md
+export PROTO=redis
+rg -n "$PROTO" "crates/arkham-proxy/src/transports/$PROTO" crates/arkham-proxy/src/e2e.rs \
+  && rg -n "\"${PROTO}\"" integration/client/run.ts \
+  && rg -n -i "image: ${PROTO}:" integration/compose.yaml
 ```
 
 ## 9. CI and the README
@@ -235,33 +263,52 @@ rg -n "fn auth_password_reframes_to_any_length|fn upstream_redacts_real_password
 Add a row to the protocol table in `README.md`. Redis is the RESP row. `integration/README.md` lists scenarios 9 and 10, the official image, Bun's client, `tls-auth-clients no`, and the bwrap skip.
 
 ```bash
+export PROTO=redis
 rg -n "ubuntu-24.04-arm" .github/workflows/ci.yml \
   && rg -n "Dump integration compose logs|arkham-integration-compose.log" .github/workflows/ci.yml .mise/tasks/test/ssh \
-  && rg -n "^\| Redis \|" README.md \
-  && rg -n "redis:7-alpine|tls-auth-clients no" integration/README.md
+  && rg -n -i "^\\| ${PROTO} \\|" README.md \
+  && rg -n -i "$PROTO" integration/README.md
 ```
 
 ## 10. Pull request
 
 `Closes #N` when the PR fully finishes issue N. `Refs #N` when N is an umbrella or epic. A title that starts with `Tracking:` is one of those: PR #44's body is `Refs #23` because #23 is `Tracking: Redis RESP credential rewriting`. The squash commit message does not carry that line; read the PR body.
 
+The command needs `gh` signed in (`gh auth status`). If it is not, open the PR on the forge and look for the same line in the body.
+
 ```bash
-gh issue view 23 --json title --jq .title \
-  && gh pr view 44 --json body --jq .body | rg "Refs #23"
+export ISSUE=23 PR=44
+gh auth status \
+  && python3 - <<'PY'
+import json, os, subprocess, sys
+issue = os.environ["ISSUE"]
+pr = os.environ["PR"]
+title = json.loads(subprocess.check_output(["gh", "issue", "view", issue, "--json", "title"], text=True))["title"]
+body = json.loads(subprocess.check_output(["gh", "pr", "view", pr, "--json", "body"], text=True))["body"]
+tracking = title.startswith("Tracking:")
+needle = f"Refs #{issue}" if tracking else f"Closes #{issue}"
+if needle not in body:
+    print(f"PR body must contain {needle!r} (issue title: {title})")
+    sys.exit(1)
+print(needle, "present")
+PY
 ```
 
-For the issue this PR finishes, replace `23` and `44`. Require `Closes #N` when the issue title does not start with `Tracking:`. Require `Refs #N` when it does.
+Set `ISSUE` and `PR` to the issue this change finishes and the pull request that carries it. The command requires `Closes #N` when the issue title does not start with `Tracking:`, and `Refs #N` when it does.
 
 ## 11. Scheme coverage
 
-A passing `retry(scheme, label, fn)` records `scheme`. When the client finishes, it writes the set to `/out/covered.json`. `integration/compose.yaml` bind-mounts `integration/out` on `/out`.
+A passing `retry(scheme, label, fn)` records `scheme`. When `ARKHAM_COVERED` is set, the client writes that set to the path. Compose sets it to `/out/covered.json` and bind-mounts `integration/out` on `/out`. Unset, the write is skipped, so a run of the script without that mount still finishes. Compose also passes `HOST_UID` and drops to that user after `apt-get`, so the file is not owned by root.
 
-`.mise/tasks/test/ssh` runs that client for `tproxy` and `tun`. After a client exits 0 it runs `integration/docker/arkham schemes` and fails, naming each scheme that is missing from `covered.json`. `arkham schemes` prints `Scheme::ALL`. CI runs this on both `rust` matrix legs (`mise build` → `test` → `test:ssh`). Do not add a parser or a second manifest.
+`.mise/tasks/test/ssh` deletes `integration/out/covered.json` before each backend (`tproxy`, then `tun`). A leftover from the previous backend cannot satisfy the next one. After a client exits 0 it runs `integration/docker/arkham schemes` and fails, naming each scheme missing from the file. `arkham schemes` prints `Scheme::all()`, which is every `EnumIter` variant. CI runs this on both `rust` matrix legs (`mise build` → `test` → `test:ssh`). Do not add a parser or a second list.
 
-A new variant goes in `Scheme::as_str` and `Scheme::ALL`, and in a `retry("<scheme>", ...)` call that passes against the official server image. Until that scenario passes, `test:ssh` fails.
+A new variant needs an `as_str` arm (the match is exhaustive) and a passing `retry` whose scheme is that name, against the official server image. `EnumIter` puts the variant in `arkham schemes` on its own. Until the scenario passes, `test:ssh` fails.
 
 ```bash
-rg -n "covered.json" integration/client/run.ts integration/compose.yaml .mise/tasks/test/ssh \
-  && rg -n "struct SchemesArgs" src/commands.rs \
-  && rg -n "const ALL" crates/arkham-config/src/grants/mod.rs
+export PROTO=redis
+rg -n "ARKHAM_COVERED" integration/client/run.ts integration/compose.yaml \
+  && rg -n "rm -f integration/out/covered.json" .mise/tasks/test/ssh \
+  && rg -n "EnumIter" crates/arkham-config/src/grants/mod.rs \
+  && rg -n "fn all" crates/arkham-config/src/grants/mod.rs \
+  && rg -n "\"${PROTO}\"" integration/client/run.ts
 ```

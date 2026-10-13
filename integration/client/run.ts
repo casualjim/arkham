@@ -295,11 +295,12 @@ await retry("http", "oauth2 token endpoint mints and the minted decoy substitute
 // writable known_hosts of its own, so the first connection records arkham's
 // host key — ssh's mechanism is the allowlist, arkham adds no pins.
 const SSH_DST = process.env.SSH_DST ?? "";
+const SSH_IDENTITY = process.env.SSH_IDENTITY ?? "/certs/ssh/decoy";
 const SSH_KNOWN_HOSTS = "/tmp/known_hosts";
 const sshCommand = [
   "ssh",
   "-i",
-  "/certs/ssh/decoy",
+  SSH_IDENTITY,
   "-o",
   "IdentitiesOnly=yes",
   "-o",
@@ -494,6 +495,9 @@ if (REDIS_TLS_URL) {
   stage("redis tls scenarios skipped: no REDIS_TLS_URL");
 }
 
-await writeFile("/out/covered.json", `${JSON.stringify([...covered].sort())}\n`);
+const coveredPath = process.env.ARKHAM_COVERED ?? "";
+if (coveredPath) {
+  await writeFile(coveredPath, `${JSON.stringify([...covered].sort())}\n`);
+}
 console.log("all scenarios passed");
 process.exit(0);

@@ -42,7 +42,7 @@ Print the deterministic decoy for an env var name. `--pattern` overrides the reg
 
 ## `arkham schemes`
 
-Print each URL scheme the proxy serves, one per line. The list is `Scheme::ALL`.
+Print each URL scheme the proxy serves, one per line. The list is every `Scheme` variant.
 
 ## `arkham ca`
 

@@ -158,7 +158,7 @@ impl CliCommand for SchemesArgs {
   ///
   /// This command does not fail.
   fn run(self, _cli: &Cli, _arkham_version: &str) -> impl Future<Output = Result<(), Self::Error>> + Send {
-    for scheme in Scheme::ALL {
+    for scheme in Scheme::all() {
       println!("{}", scheme.as_str());
     }
     std::future::ready(Ok(()))

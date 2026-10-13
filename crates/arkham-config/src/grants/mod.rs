@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use secrecy::{ExposeSecret as _, SecretString};
+use strum::EnumIter;
 use url::{Host, Url};
 
 use crate::config::{AppConfig, RuleCfg, fake_for};
@@ -74,7 +75,7 @@ impl FromStr for HostPat {
 }
 
 /// Grant scheme: the URL scheme names the protocol. No inference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub enum Scheme {
   /// Plain HTTP.
   Http,
@@ -109,15 +110,9 @@ impl Scheme {
   }
 
   /// Every scheme the proxy serves, in enum order.
-  pub const ALL: [Self; 7] = [
-    Self::Http,
-    Self::Https,
-    Self::Tcp,
-    Self::Postgres,
-    Self::Redis,
-    Self::Rediss,
-    Self::Ssh,
-  ];
+  pub fn all() -> impl Iterator<Item = Self> {
+    <Self as strum::IntoEnumIterator>::iter()
+  }
 }
 
 /// One real secret and the decoy that stands in for it. Shared by every
@@ -794,12 +789,6 @@ mod tests {
   fn redis_grant(fake: &str, real: &str) -> Grant {
     let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
     resolved.grants.into_iter().next().unwrap()
-  }
-
-  #[test]
-  fn scheme_all_names() {
-    let names: Vec<_> = Scheme::ALL.iter().copied().map(Scheme::as_str).collect();
-    assert_eq!(names, ["http", "https", "tcp", "postgres", "redis", "rediss", "ssh"]);
   }
 
   #[test]

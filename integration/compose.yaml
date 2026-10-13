@@ -189,13 +189,30 @@ services:
     working_dir: /srv
     # openssh-client first: scenario 8 is a plain `ssh` binary holding only
     # the decoy identity, connecting through the transparent capture.
+    # apt needs root. When the host passes HOST_UID, bun then drops to that
+    # user so the bind-mounted coverage file is not owned by root.
     command:
-      [
-        "bash",
-        "-c",
-        "apt-get update -qq && apt-get install -qq -y openssh-client && exec bun /srv/run.ts",
-      ]
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        apt-get update -qq && apt-get install -qq -y openssh-client
+        if [ -n "${HOST_UID:-}" ] && [ "$HOST_UID" != 0 ]; then
+          mkdir -p /out
+          chown "$HOST_UID:${HOST_GID:-$HOST_UID}" /out
+          # ssh ignores a private key it does not own. /certs is read-only,
+          # so the decoy is copied to a file this uid owns.
+          cp /certs/ssh/decoy /tmp/decoy
+          chown "$HOST_UID:${HOST_GID:-$HOST_UID}" /tmp/decoy
+          chmod 600 /tmp/decoy
+          export HOME=/tmp SSH_IDENTITY=/tmp/decoy
+          exec setpriv --reuid="$HOST_UID" --regid="${HOST_GID:-$HOST_UID}" --clear-groups bun /srv/run.ts
+        fi
+        exec bun /srv/run.ts
     environment:
+      ARKHAM_COVERED: /out/covered.json
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
       ARKHAM_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `arkham fake GH_TOKEN`, not a credential
       DATABASE_URL: postgres://arkham:arkham_fake_password_01@db:5432/demo?sslmode=require # nosemgrep: deterministic demo decoy, not a credential
       OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `arkham fake OIDC_CLIENT_SECRET`, not a credential
