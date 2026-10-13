@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::Deserialize;
+use serde::de::Deserializer;
 use url::{Host, Url};
 
 use crate::config::{RuleCfg, validate_pattern};
@@ -68,6 +69,50 @@ impl OAuthFlow {
   }
 }
 
+/// Where one credential value travels on a request.
+///
+/// Exactly one of `header`, `query`, or `json` is set. `claim` is set only
+/// with `header`, when that header carries a token and the value is a claim
+/// inside it rather than the raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePlace {
+  /// Header name.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub header: Option<String>,
+  /// Query-parameter name.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub query: Option<String>,
+  /// JSON field name.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub json: Option<String>,
+  /// Claim name when `header` carries a token instead of the raw value.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub claim: Option<String>,
+}
+
+/// A signing secret: an algorithm input that never itself travels on the wire.
+///
+/// `scheme` is one name (`hmac-sha256`) or several when the vendor accepts
+/// more than one (`["es256", "ed25519"]`). Exactly one of `header`, `query`,
+/// or `json` names where the signature, not the secret, is placed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signing {
+  /// Signing scheme names.
+  #[serde(deserialize_with = "one_or_many")]
+  pub scheme: Vec<String>,
+  /// Header that carries the signature.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub header: Option<String>,
+  /// Query parameter that carries the signature.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub query: Option<String>,
+  /// JSON field that carries the signature.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub json: Option<String>,
+}
+
 /// What the registry knows about one environment name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KnownHosts {
@@ -77,6 +122,10 @@ pub struct KnownHosts {
   pub pattern: Option<String>,
   /// `OAuth2` token-issuer flow, if any entry declares one.
   pub oauth2: Option<OAuthFlow>,
+  /// Signing-secret declaration, when this name is an algorithm input.
+  pub signing: Option<Signing>,
+  /// Where this name's value is sent, when it travels on the wire.
+  pub send: Vec<WirePlace>,
 }
 
 /// Known hosts and decoy shapes: bundled table plus `rules.d` overrides.
@@ -134,6 +183,13 @@ struct ProviderEntry {
   /// `OAuth2` flow this provider's token issuer runs, if any.
   #[serde(default)]
   oauth2: Option<OAuthFlow>,
+  /// Where the claimed values travel. One placement, or a list when the
+  /// entry covers more than one header, query parameter, or JSON field.
+  #[serde(default, deserialize_with = "one_or_many")]
+  send: Vec<WirePlace>,
+  /// Set when every claimed name is a signing secret.
+  #[serde(default)]
+  signing: Option<Signing>,
 }
 
 /// One exact environment-name entry.
@@ -152,6 +208,12 @@ struct NameEntry {
   /// `OAuth2` flow this name's token issuer runs, if any.
   #[serde(default)]
   oauth2: Option<OAuthFlow>,
+  /// Where this name's value travels.
+  #[serde(default, deserialize_with = "one_or_many")]
+  send: Vec<WirePlace>,
+  /// Set when this name is a signing secret.
+  #[serde(default)]
+  signing: Option<Signing>,
 }
 
 impl Registry {
@@ -240,12 +302,16 @@ impl Registry {
     if let Some(flow) = &entry.oauth2 {
       validate_flow(flow, &source.display().to_string(), provider)?;
     }
+    validate_signing(entry.signing.as_ref(), source, "provider", provider)?;
+    validate_send(&entry.send, source, "provider", provider)?;
     for env in &entry.env {
       let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
       if entry.replace {
         slot.hosts.clear();
         slot.pattern = None;
         slot.oauth2 = None;
+        slot.signing = None;
+        slot.send.clear();
       }
       for host in &entry.hosts {
         if !slot.hosts.contains(host) {
@@ -258,6 +324,13 @@ impl Registry {
       if entry.oauth2.is_some() {
         slot.oauth2.clone_from(&entry.oauth2);
       }
+      if entry.signing.is_some() {
+        slot.signing.clone_from(&entry.signing);
+      }
+      if !entry.send.is_empty() {
+        slot.send.clone_from(&entry.send);
+      }
+      validate_loaded_credential(slot, source, env)?;
     }
     if entry.replace {
       self.contains.retain(|rule| rule.provider != provider);
@@ -292,11 +365,15 @@ impl Registry {
     if let Some(flow) = &entry.oauth2 {
       validate_flow(flow, &source.display().to_string(), env)?;
     }
+    validate_signing(entry.signing.as_ref(), source, "name", env)?;
+    validate_send(&entry.send, source, "name", env)?;
     let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
     if entry.replace {
       slot.hosts.clear();
       slot.pattern = None;
       slot.oauth2 = None;
+      slot.signing = None;
+      slot.send.clear();
     }
     for host in &entry.hosts {
       if !slot.hosts.contains(host) {
@@ -309,6 +386,13 @@ impl Registry {
     if entry.oauth2.is_some() {
       slot.oauth2.clone_from(&entry.oauth2);
     }
+    if entry.signing.is_some() {
+      slot.signing.clone_from(&entry.signing);
+    }
+    if !entry.send.is_empty() {
+      slot.send.clone_from(&entry.send);
+    }
+    validate_loaded_credential(slot, source, env)?;
     Ok(())
   }
 
@@ -497,6 +581,156 @@ fn validate_hosts(hosts: &[String], source: &Path, kind: &str, name: &str) -> Re
       let what = format!("{kind} `{name}`");
       tracing::warn!(file = %source.display(), entry = %host, what, "grant matches any host; secret is exfil-risky");
     }
+  }
+  Ok(())
+}
+
+/// Accept one placement table or a list of them.
+fn one_or_many<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+  D: Deserializer<'de>,
+  T: Deserialize<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(untagged)]
+  enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+  }
+  Ok(match OneOrMany::<T>::deserialize(deserializer)? {
+    OneOrMany::One(item) => vec![item],
+    OneOrMany::Many(items) => items,
+  })
+}
+
+/// File and entry named by a placement error.
+#[derive(Clone, Copy)]
+struct PlaceCtx<'a> {
+  source: &'a Path,
+  kind: &'a str,
+  name: &'a str,
+  what: &'a str,
+}
+
+/// A placement names exactly one of header, query, or json, and each named
+/// field is non-empty. `claim` is only meaningful beside a header.
+fn validate_place(
+  header: Option<&str>,
+  query: Option<&str>,
+  json: Option<&str>,
+  claim: Option<&str>,
+  ctx: PlaceCtx<'_>,
+) -> Result<(), Error> {
+  let mut named = 0_u8;
+  for (field, value) in [("header", header), ("query", query), ("json", json)] {
+    if let Some(value) = value {
+      if value.is_empty() {
+        return Err(Error::BadCredentialPlace {
+          file: ctx.source.to_path_buf(),
+          kind: ctx.kind.to_string(),
+          name: ctx.name.to_string(),
+          detail: format!("`{field}` must not be empty"),
+        });
+      }
+      named = named.saturating_add(1);
+    }
+  }
+  if named != 1 {
+    return Err(Error::BadCredentialPlace {
+      file: ctx.source.to_path_buf(),
+      kind: ctx.kind.to_string(),
+      name: ctx.name.to_string(),
+      detail: format!("`{}` must name exactly one of `header`, `query`, or `json`", ctx.what),
+    });
+  }
+  if let Some(claim) = claim {
+    if claim.is_empty() {
+      return Err(Error::BadCredentialPlace {
+        file: ctx.source.to_path_buf(),
+        kind: ctx.kind.to_string(),
+        name: ctx.name.to_string(),
+        detail: "`claim` must not be empty".to_string(),
+      });
+    }
+    if header.is_none() {
+      return Err(Error::BadCredentialPlace {
+        file: ctx.source.to_path_buf(),
+        kind: ctx.kind.to_string(),
+        name: ctx.name.to_string(),
+        detail: "`claim` is only valid with `header`".to_string(),
+      });
+    }
+  }
+  Ok(())
+}
+
+/// Validate a signing block's scheme list and signature placement.
+fn validate_signing(signing: Option<&Signing>, source: &Path, kind: &str, name: &str) -> Result<(), Error> {
+  let Some(signing) = signing else {
+    return Ok(());
+  };
+  if signing.scheme.is_empty() || signing.scheme.iter().any(String::is_empty) {
+    return Err(Error::BadCredentialPlace {
+      file: source.to_path_buf(),
+      kind: kind.to_string(),
+      name: name.to_string(),
+      detail: "signing `scheme` must not be empty".to_string(),
+    });
+  }
+  validate_place(
+    signing.header.as_deref(),
+    signing.query.as_deref(),
+    signing.json.as_deref(),
+    None,
+    PlaceCtx {
+      source,
+      kind,
+      name,
+      what: "signing",
+    },
+  )
+}
+
+/// Validate every `send` placement on one entry.
+fn validate_send(send: &[WirePlace], source: &Path, kind: &str, name: &str) -> Result<(), Error> {
+  for place in send {
+    validate_place(
+      place.header.as_deref(),
+      place.query.as_deref(),
+      place.json.as_deref(),
+      place.claim.as_deref(),
+      PlaceCtx {
+        source,
+        kind,
+        name,
+        what: "send",
+      },
+    )?;
+  }
+  Ok(())
+}
+
+/// A signing secret grants nothing and is not itself a sent value. A sent
+/// value grants at least one host. Checked on the merged entry so a later
+/// layer cannot put hosts back onto a signing secret.
+fn validate_loaded_credential(known: &KnownHosts, source: &Path, name: &str) -> Result<(), Error> {
+  if known.signing.is_some() && !known.hosts.is_empty() {
+    return Err(Error::SigningHasHosts {
+      file: source.to_path_buf(),
+      name: name.to_string(),
+    });
+  }
+  if known.signing.is_some() && !known.send.is_empty() {
+    return Err(Error::SigningDeclaresSend {
+      file: source.to_path_buf(),
+      name: name.to_string(),
+    });
+  }
+  if !known.send.is_empty() && known.hosts.is_empty() {
+    return Err(Error::SendWithoutHosts {
+      file: source.to_path_buf(),
+      name: name.to_string(),
+    });
   }
   Ok(())
 }
@@ -1020,412 +1254,6 @@ hosts = ["https://api.example/path"]
     assert!(err.to_string().contains("duplicate `token_fields` entry"), "{err:?}");
   }
 
-  const SIGNING_SECRETS: &[&str] = &[
-    "AWS_SECRET_ACCESS_KEY",
-    "EXOSCALE_SECRET_KEY",
-    "EXOSCALE_SECRET",
-    "POLYMARKET_SECRET",
-    "POLYMARKET_SECRET_KEY",
-    "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
-    "ALICLOUD_ACCESS_KEY_SECRET",
-    "ALICLOUD_SECRET_KEY",
-    "OVH_APPLICATION_SECRET",
-    "OVH_APP_SECRET",
-    "BINANCE_API_SECRET",
-    "BINANCE_PRIVATE_KEY",
-    "BINANCE_SECRET",
-    "BINANCE_SECRET_KEY",
-    "BINANCECOINM_API_SECRET",
-    "BINANCECOINM_PRIVATE_KEY",
-    "BINANCECOINM_SECRET",
-    "BINANCECOINM_SECRET_KEY",
-    "BINANCEUS_API_SECRET",
-    "BINANCEUS_PRIVATE_KEY",
-    "BINANCEUS_SECRET",
-    "BINANCEUS_SECRET_KEY",
-    "BINANCEUSDM_API_SECRET",
-    "BINANCEUSDM_PRIVATE_KEY",
-    "BINANCEUSDM_SECRET",
-    "BINANCEUSDM_SECRET_KEY",
-    "OKX_API_SECRET",
-    "OKX_PRIVATE_KEY",
-    "OKX_SECRET",
-    "OKX_SECRET_KEY",
-    "OKXUS_API_SECRET",
-    "OKXUS_PRIVATE_KEY",
-    "OKXUS_SECRET",
-    "OKXUS_SECRET_KEY",
-    "MYOKX_API_SECRET",
-    "MYOKX_PRIVATE_KEY",
-    "MYOKX_SECRET",
-    "MYOKX_SECRET_KEY",
-    "BYBIT_API_SECRET",
-    "BYBIT_PRIVATE_KEY",
-    "BYBIT_SECRET",
-    "BYBIT_SECRET_KEY",
-    "BYBITEU_API_SECRET",
-    "BYBITEU_PRIVATE_KEY",
-    "BYBITEU_SECRET",
-    "BYBITEU_SECRET_KEY",
-    "KUCOIN_API_SECRET",
-    "KUCOIN_PRIVATE_KEY",
-    "KUCOIN_SECRET",
-    "KUCOIN_SECRET_KEY",
-    "KUCOINFUTURES_API_SECRET",
-    "KUCOINFUTURES_PRIVATE_KEY",
-    "KUCOINFUTURES_SECRET",
-    "KUCOINFUTURES_SECRET_KEY",
-    "KRAKEN_API_SECRET",
-    "KRAKEN_PRIVATE_KEY",
-    "KRAKEN_SECRET",
-    "KRAKEN_SECRET_KEY",
-    "COINBASE_API_SECRET",
-    "COINBASE_PRIVATE_KEY",
-    "COINBASE_SECRET",
-    "COINBASE_SECRET_KEY",
-    "COINBASEEXCHANGE_API_SECRET",
-    "COINBASEEXCHANGE_PRIVATE_KEY",
-    "COINBASEEXCHANGE_SECRET",
-    "COINBASEEXCHANGE_SECRET_KEY",
-    "COINBASE_EXCHANGE_API_SECRET",
-    "COINBASEINTERNATIONAL_API_SECRET",
-    "COINBASEINTERNATIONAL_PRIVATE_KEY",
-    "COINBASEINTERNATIONAL_SECRET",
-    "COINBASEINTERNATIONAL_SECRET_KEY",
-    "BITFINEX_API_SECRET",
-    "BITFINEX_PRIVATE_KEY",
-    "BITFINEX_SECRET",
-    "BITFINEX_SECRET_KEY",
-    "BITSTAMP_API_SECRET",
-    "BITSTAMP_PRIVATE_KEY",
-    "BITSTAMP_SECRET",
-    "BITSTAMP_SECRET_KEY",
-    "GEMINI_API_SECRET",
-    "GEMINI_PRIVATE_KEY",
-    "GEMINI_SECRET",
-    "GEMINI_SECRET_KEY",
-    "GATE_API_SECRET",
-    "GATE_PRIVATE_KEY",
-    "GATE_SECRET",
-    "GATE_SECRET_KEY",
-    "GATEEU_API_SECRET",
-    "GATEEU_PRIVATE_KEY",
-    "GATEEU_SECRET",
-    "GATEEU_SECRET_KEY",
-    "MEXC_API_SECRET",
-    "MEXC_PRIVATE_KEY",
-    "MEXC_SECRET",
-    "MEXC_SECRET_KEY",
-    "BITGET_API_SECRET",
-    "BITGET_PRIVATE_KEY",
-    "BITGET_SECRET",
-    "BITGET_SECRET_KEY",
-    "HTX_API_SECRET",
-    "HTX_PRIVATE_KEY",
-    "HTX_SECRET",
-    "HTX_SECRET_KEY",
-    "UPBIT_API_SECRET",
-    "UPBIT_PRIVATE_KEY",
-    "UPBIT_SECRET",
-    "UPBIT_SECRET_KEY",
-    "BITHUMB_API_SECRET",
-    "BITHUMB_PRIVATE_KEY",
-    "BITHUMB_SECRET",
-    "BITHUMB_SECRET_KEY",
-    "DERIBIT_API_SECRET",
-    "DERIBIT_PRIVATE_KEY",
-    "DERIBIT_SECRET",
-    "DERIBIT_SECRET_KEY",
-    "BITMEX_API_SECRET",
-    "BITMEX_PRIVATE_KEY",
-    "BITMEX_SECRET",
-    "BITMEX_SECRET_KEY",
-    "CRYPTOCOM_API_SECRET",
-    "CRYPTOCOM_PRIVATE_KEY",
-    "CRYPTOCOM_SECRET",
-    "CRYPTOCOM_SECRET_KEY",
-  ];
-
-  const SIGNING_VENDOR_KEYS: &[(&[&str], &str)] = &[
-    (
-      &["ALIBABA_CLOUD_ACCESS_KEY_ID", "ALICLOUD_ACCESS_KEY_ID", "ALICLOUD_ACCESS_KEY"],
-      "ecs.cn-shanghai.aliyuncs.com",
-    ),
-    (&["ALIBABA_CLOUD_SECURITY_TOKEN", "ALICLOUD_SECURITY_TOKEN"], "sts.aliyuncs.com"),
-    (&["OVH_APPLICATION_KEY", "OVH_APP_KEY", "OVH_CONSUMER_KEY"], "eu.api.ovh.com"),
-    (&["GEMINI_API_KEY", "GOOGLE_API_KEY"], "api.gemini.com"),
-    (
-      &[
-        "BITFINEX_API_KEY",
-        "BITFINEX_API_TOKEN",
-        "BITFINEX_APIKEY",
-        "BITFINEX_TOKEN",
-        "BITFINEX_ACCESS_TOKEN",
-        "BITFINEX_AUTH_TOKEN",
-        "BITFINEX_KEY",
-      ],
-      "api.bitfinex.com",
-    ),
-    (
-      &[
-        "KRAKEN_API_KEY",
-        "KRAKEN_API_TOKEN",
-        "KRAKEN_APIKEY",
-        "KRAKEN_TOKEN",
-        "KRAKEN_ACCESS_TOKEN",
-        "KRAKEN_AUTH_TOKEN",
-        "KRAKEN_KEY",
-      ],
-      "api.kraken.com",
-    ),
-    (
-      &[
-        "KUCOIN_API_KEY",
-        "KUCOIN_API_TOKEN",
-        "KUCOIN_APIKEY",
-        "KUCOIN_TOKEN",
-        "KUCOIN_ACCESS_TOKEN",
-        "KUCOIN_AUTH_TOKEN",
-        "KUCOIN_KEY",
-        "KUCOIN_PASSPHRASE",
-        "KUCOIN_API_PASSPHRASE",
-      ],
-      "api.kucoin.com",
-    ),
-    (
-      &[
-        "BINANCE_ACCESS_KEY",
-        "BINANCE_APIKEY",
-        "BINANCE_API_KEY",
-        "BINANCE_API_TOKEN",
-        "BINANCE_KEY",
-      ],
-      "api.binance.com",
-    ),
-    (
-      &[
-        "BINANCECOINM_ACCESS_KEY",
-        "BINANCECOINM_APIKEY",
-        "BINANCECOINM_API_KEY",
-        "BINANCECOINM_API_TOKEN",
-        "BINANCECOINM_KEY",
-      ],
-      "dapi.binance.com",
-    ),
-    (
-      &[
-        "BINANCEUS_ACCESS_KEY",
-        "BINANCEUS_APIKEY",
-        "BINANCEUS_API_KEY",
-        "BINANCEUS_API_TOKEN",
-        "BINANCEUS_KEY",
-      ],
-      "api.binance.us",
-    ),
-    (
-      &[
-        "BINANCEUSDM_ACCESS_KEY",
-        "BINANCEUSDM_APIKEY",
-        "BINANCEUSDM_API_KEY",
-        "BINANCEUSDM_API_TOKEN",
-        "BINANCEUSDM_KEY",
-      ],
-      "fapi.binance.com",
-    ),
-    (
-      &[
-        "BITGET_ACCESS_KEY",
-        "BITGET_APIKEY",
-        "BITGET_API_KEY",
-        "BITGET_API_TOKEN",
-        "BITGET_KEY",
-        "BITGET_PASSPHRASE",
-        "BITGET_API_PASSPHRASE",
-      ],
-      "api.bitget.com",
-    ),
-    (
-      &[
-        "BITHUMB_ACCESS_KEY",
-        "BITHUMB_APIKEY",
-        "BITHUMB_API_KEY",
-        "BITHUMB_API_TOKEN",
-        "BITHUMB_KEY",
-      ],
-      "api.bithumb.com",
-    ),
-    (
-      &[
-        "BITMEX_ACCESS_KEY",
-        "BITMEX_APIKEY",
-        "BITMEX_API_KEY",
-        "BITMEX_API_TOKEN",
-        "BITMEX_KEY",
-      ],
-      "www.bitmex.com",
-    ),
-    (
-      &[
-        "BITSTAMP_ACCESS_KEY",
-        "BITSTAMP_APIKEY",
-        "BITSTAMP_API_KEY",
-        "BITSTAMP_API_TOKEN",
-        "BITSTAMP_KEY",
-      ],
-      "www.bitstamp.net",
-    ),
-    (
-      &["BYBIT_ACCESS_KEY", "BYBIT_APIKEY", "BYBIT_API_KEY", "BYBIT_API_TOKEN", "BYBIT_KEY"],
-      "api.bybit.com",
-    ),
-    (
-      &[
-        "BYBITEU_ACCESS_KEY",
-        "BYBITEU_APIKEY",
-        "BYBITEU_API_KEY",
-        "BYBITEU_API_TOKEN",
-        "BYBITEU_KEY",
-      ],
-      "api.bybit.eu",
-    ),
-    (
-      &[
-        "COINBASE_ACCESS_KEY",
-        "COINBASE_APIKEY",
-        "COINBASE_API_KEY",
-        "COINBASE_API_TOKEN",
-        "COINBASE_KEY",
-      ],
-      "api.coinbase.com",
-    ),
-    (
-      &[
-        "COINBASEEXCHANGE_ACCESS_KEY",
-        "COINBASEEXCHANGE_APIKEY",
-        "COINBASEEXCHANGE_API_KEY",
-        "COINBASEEXCHANGE_API_TOKEN",
-        "COINBASEEXCHANGE_KEY",
-        "COINBASE_EXCHANGE_API_KEY",
-        "COINBASEEXCHANGE_PASSPHRASE",
-        "COINBASE_EXCHANGE_PASSPHRASE",
-      ],
-      "api.exchange.coinbase.com",
-    ),
-    (
-      &[
-        "COINBASEINTERNATIONAL_ACCESS_KEY",
-        "COINBASEINTERNATIONAL_APIKEY",
-        "COINBASEINTERNATIONAL_API_KEY",
-        "COINBASEINTERNATIONAL_API_TOKEN",
-        "COINBASEINTERNATIONAL_KEY",
-        "COINBASEINTERNATIONAL_PASSPHRASE",
-      ],
-      "api.international.coinbase.com",
-    ),
-    (
-      &[
-        "CRYPTOCOM_ACCESS_KEY",
-        "CRYPTOCOM_APIKEY",
-        "CRYPTOCOM_API_KEY",
-        "CRYPTOCOM_API_TOKEN",
-        "CRYPTOCOM_KEY",
-      ],
-      "api.crypto.com",
-    ),
-    (
-      &[
-        "DERIBIT_ACCESS_KEY",
-        "DERIBIT_APIKEY",
-        "DERIBIT_API_KEY",
-        "DERIBIT_API_TOKEN",
-        "DERIBIT_KEY",
-      ],
-      "www.deribit.com",
-    ),
-    (
-      &["GATE_ACCESS_KEY", "GATE_APIKEY", "GATE_API_KEY", "GATE_API_TOKEN", "GATE_KEY"],
-      "api.gateio.ws",
-    ),
-    (
-      &[
-        "GATEEU_ACCESS_KEY",
-        "GATEEU_APIKEY",
-        "GATEEU_API_KEY",
-        "GATEEU_API_TOKEN",
-        "GATEEU_KEY",
-      ],
-      "api.gateeu.com",
-    ),
-    (
-      &["HTX_ACCESS_KEY", "HTX_APIKEY", "HTX_API_KEY", "HTX_API_TOKEN", "HTX_KEY"],
-      "api.huobi.pro",
-    ),
-    (
-      &[
-        "KUCOINFUTURES_ACCESS_KEY",
-        "KUCOINFUTURES_APIKEY",
-        "KUCOINFUTURES_API_KEY",
-        "KUCOINFUTURES_API_TOKEN",
-        "KUCOINFUTURES_KEY",
-        "KUCOINFUTURES_PASSPHRASE",
-        "KUCOINFUTURES_API_PASSPHRASE",
-      ],
-      "api-futures.kucoin.com",
-    ),
-    (
-      &["MEXC_ACCESS_KEY", "MEXC_APIKEY", "MEXC_API_KEY", "MEXC_API_TOKEN", "MEXC_KEY"],
-      "api.mexc.com",
-    ),
-    (
-      &[
-        "MYOKX_ACCESS_KEY",
-        "MYOKX_APIKEY",
-        "MYOKX_API_KEY",
-        "MYOKX_API_TOKEN",
-        "MYOKX_KEY",
-        "MYOKX_PASSPHRASE",
-        "MYOKX_API_PASSPHRASE",
-      ],
-      "eea.okx.com",
-    ),
-    (
-      &[
-        "OKX_ACCESS_KEY",
-        "OKX_APIKEY",
-        "OKX_API_KEY",
-        "OKX_API_TOKEN",
-        "OKX_KEY",
-        "OKX_PASSPHRASE",
-        "OKX_API_PASSPHRASE",
-      ],
-      "www.okx.com",
-    ),
-    (
-      &[
-        "OKXUS_ACCESS_KEY",
-        "OKXUS_APIKEY",
-        "OKXUS_API_KEY",
-        "OKXUS_API_TOKEN",
-        "OKXUS_KEY",
-        "OKXUS_PASSPHRASE",
-        "OKXUS_API_PASSPHRASE",
-      ],
-      "us.okx.com",
-    ),
-    (
-      &["UPBIT_ACCESS_KEY", "UPBIT_APIKEY", "UPBIT_API_KEY", "UPBIT_API_TOKEN", "UPBIT_KEY"],
-      "api.upbit.com",
-    ),
-  ];
-
-  fn host_grants(known: &KnownHosts, host: &str) -> bool {
-    known.hosts.iter().any(|entry| {
-      entry
-        .parse::<EndpointScope>()
-        .is_ok_and(|scope| uri_match(std::slice::from_ref(&scope), Scheme::Https, host, 443))
-    })
-  }
-
   /// A concrete hostname the entry must grant: the exact host, or one
   /// subdomain when the entry is a wildcard.
   fn concrete_host(pat: &HostPat) -> String {
@@ -1440,50 +1268,180 @@ hosts = ["https://api.example/path"]
   }
 
   #[test]
-  fn signing_only_secrets_have_no_hosts() {
+  fn declared_signing_secrets_grant_nothing_and_keep_a_decoy() {
     let registry = Registry::load(None).unwrap();
-    // Every signing secret from #14 and #19. The value is an HMAC or JWT
-    // signing input and never reaches the wire, so the entry is a decoy
-    // shape with no hosts and therefore no grant.
-    for env in SIGNING_SECRETS {
-      let known = registry
-        .lookup(env)
-        .unwrap_or_else(|| panic!("{env} missing from the bundled registry"));
-      assert!(
-        known.hosts.is_empty(),
-        "{env} is a signing-only secret but has hosts: {:?}",
-        known.hosts
-      );
-      assert_eq!(
-        registry.template(env, None).as_ref(),
-        DEFAULT_PATTERN,
-        "{env} must keep the default decoy shape and no explicit pattern"
-      );
+    let mut saw = false;
+    for (env, known) in &registry.names {
+      let Some(signing) = &known.signing else {
+        continue;
+      };
+      saw = true;
+      assert!(!signing.scheme.is_empty(), "{env} signing scheme is empty");
+      assert_eq!(known.hosts, [] as [String; 0], "{env} signing secret has hosts");
+      assert_eq!(known.send, [] as [WirePlace; 0], "{env} signing secret also declares send");
+      let shape = registry.template(env, None);
+      let expected = known.pattern.as_deref().unwrap_or(DEFAULT_PATTERN);
+      assert_eq!(shape.as_ref(), expected, "{env} decoy shape");
     }
+    assert!(saw, "bundled registry declares no signing secrets");
   }
 
   #[test]
-  fn signing_vendor_keys_parse_and_match_their_hosts() {
+  fn declared_send_placements_match_their_hosts() {
     let registry = Registry::load(None).unwrap();
-    for (envs, host) in SIGNING_VENDOR_KEYS {
-      for env in *envs {
-        let known = registry
-          .lookup(env)
-          .unwrap_or_else(|| panic!("{env} missing from the bundled registry"));
-        assert!(known.pattern.is_some(), "{env} has no decoy shape");
-        assert!(!known.hosts.is_empty(), "{env} has no hosts");
-        for entry in &known.hosts {
-          let scope = entry
-            .parse::<EndpointScope>()
-            .unwrap_or_else(|err| panic!("{env} host {entry} does not parse: {err}"));
-          let concrete = concrete_host(&scope.host);
-          assert!(
-            uri_match(std::slice::from_ref(&scope), scope.scheme, &concrete, scope.port),
-            "{env} host {entry} does not match {concrete}"
-          );
-        }
-        assert!(host_grants(known, host), "{env} hosts {:?} do not grant {host}", known.hosts);
+    let mut saw = false;
+    for (env, known) in &registry.names {
+      if known.send.is_empty() {
+        continue;
+      }
+      saw = true;
+      assert!(known.signing.is_none(), "{env} declares both send and signing");
+      assert!(!known.hosts.is_empty(), "{env} declares send but grants no host");
+      for entry in &known.hosts {
+        let scope = entry
+          .parse::<EndpointScope>()
+          .unwrap_or_else(|err| panic!("{env} host {entry} does not parse: {err}"));
+        let concrete = concrete_host(&scope.host);
+        assert!(
+          uri_match(std::slice::from_ref(&scope), scope.scheme, &concrete, scope.port),
+          "{env} host {entry} does not match {concrete}"
+        );
       }
     }
+    assert!(saw, "bundled registry declares no send placements");
+  }
+
+  #[test]
+  fn signing_secret_with_hosts_is_rejected() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+[providers.bad]
+env = ["BAD_SECRET"]
+hosts = ["https://api.example.com"]
+signing = { scheme = "hmac-sha256", header = "X-SIGN" }
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("signing secret declares hosts"), "{err:?}");
+  }
+
+  #[test]
+  fn send_without_hosts_is_rejected() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+[providers.bad]
+env = ["BAD_KEY"]
+send = { header = "X-API-KEY" }
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("grants no host"), "{err:?}");
+  }
+
+  #[test]
+  fn signing_over_an_earlier_host_grant_is_rejected() {
+    let global = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    write_rules(
+      global.path(),
+      "10-hosts.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_KEY"]
+hosts = ["https://api.example.com"]
+"#,
+    );
+    write_rules(
+      project.path(),
+      "10-signing.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_KEY"]
+signing = { scheme = "hmac-sha256", header = "X-SIGN" }
+"#,
+    );
+    let err = Registry::load_union(Some(global.path()), Some(project.path())).unwrap_err();
+    assert!(err.to_string().contains("signing secret declares hosts"), "{err:?}");
+  }
+
+  #[test]
+  fn replace_clears_hosts_when_a_name_becomes_a_signing_secret() {
+    let global = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    write_rules(
+      global.path(),
+      "10-hosts.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_SECRET"]
+hosts = ["https://api.example.com"]
+"#,
+    );
+    write_rules(
+      project.path(),
+      "10-signing.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_SECRET"]
+replace = true
+signing = { scheme = "hmac-sha256", query = "signature" }
+"#,
+    );
+    let registry = Registry::load_union(Some(global.path()), Some(project.path())).unwrap();
+    let known = registry.lookup("VENUE_SECRET").expect("VENUE_SECRET");
+    assert_eq!(known.hosts, [] as [String; 0]);
+    let signing = known.signing.as_ref().expect("signing");
+    assert_eq!(signing.scheme, ["hmac-sha256"]);
+    assert_eq!(signing.query.as_deref(), Some("signature"));
+  }
+
+  #[test]
+  fn send_accepts_one_placement_or_a_list() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-send.toml",
+      r#"
+[providers.one]
+env = ["ONE_KEY"]
+hosts = ["https://api.example.com"]
+send = { header = "X-API-KEY", claim = "sub" }
+
+[providers.many]
+env = ["MANY_KEY"]
+hosts = ["https://*.example.com"]
+send = [{ header = "ACCESS-KEY" }, { header = "ACCESS-PASSPHRASE" }]
+"#,
+    );
+    let registry = Registry::load(Some(dir.path())).unwrap();
+    let one = registry.lookup("ONE_KEY").expect("ONE_KEY");
+    assert_eq!(one.send.len(), 1);
+    assert_eq!(one.send[0].header.as_deref(), Some("X-API-KEY"));
+    assert_eq!(one.send[0].claim.as_deref(), Some("sub"));
+    let many = registry.lookup("MANY_KEY").expect("MANY_KEY");
+    assert_eq!(many.send.len(), 2);
+  }
+
+  #[test]
+  fn wire_placement_must_name_one_field() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+[providers.bad]
+env = ["BAD_KEY"]
+hosts = ["https://api.example.com"]
+send = { claim = "sub" }
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("exactly one of `header`, `query`, or `json`"), "{err:?}");
   }
 }

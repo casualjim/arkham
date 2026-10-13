@@ -295,6 +295,42 @@ pub enum Error {
     /// Provider name.
     provider: String,
   },
+  /// A `send` placement or a signing signature placement is not one field.
+  #[error("{}: {kind} `{name}`: {detail}", file.display())]
+  BadCredentialPlace {
+    /// File carrying the bad placement.
+    file: PathBuf,
+    /// Entry kind (`provider` or `name`).
+    kind: String,
+    /// Entry name.
+    name: String,
+    /// What is wrong with the placement.
+    detail: String,
+  },
+  /// A signing secret still grants hosts after the layers merge.
+  #[error("{}: `{name}`: signing secret declares hosts", file.display())]
+  SigningHasHosts {
+    /// File that produced the merged entry.
+    file: PathBuf,
+    /// Env name.
+    name: String,
+  },
+  /// A signing secret also declares a wire placement for its own value.
+  #[error("{}: `{name}`: signing secret also declares `send`", file.display())]
+  SigningDeclaresSend {
+    /// File that produced the merged entry.
+    file: PathBuf,
+    /// Env name.
+    name: String,
+  },
+  /// `send` names a wire placement for a name that grants no host.
+  #[error("{}: `{name}`: `send` declares a wire placement but the entry grants no host", file.display())]
+  SendWithoutHosts {
+    /// File that produced the merged entry.
+    file: PathBuf,
+    /// Env name.
+    name: String,
+  },
   /// An `oauth2` URL does not parse.
   #[error("{origin}: `{name}`: {source}")]
   BadOAuthUrl {

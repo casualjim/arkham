@@ -120,6 +120,7 @@ pattern = "sk-{base62:32}"
 env = ["ALIBABA_CLOUD_ACCESS_KEY_ID", "ALICLOUD_ACCESS_KEY_ID", "ALICLOUD_ACCESS_KEY"]
 hosts = ["https://*.aliyuncs.com"]
 pattern = "{base62:32}"
+send = { header = "Authorization" }
 # source: https://www.alibabacloud.com/help/en/sdk/product-overview/v3-request-structure-and-signature
 # note: the AccessKey id is the `Credential` value in `Authorization: ACS3-HMAC-SHA256 Credential=...,SignedHeaders=...,Signature=...`.
 # note: official SDKs read `ALIBABA_CLOUD_ACCESS_KEY_ID`; the Terraform alicloud provider reads `ALICLOUD_ACCESS_KEY`. The signature docs state no key format, so the shape is generic.
@@ -129,11 +130,13 @@ pattern = "{base62:32}"
 env = ["ALIBABA_CLOUD_SECURITY_TOKEN", "ALICLOUD_SECURITY_TOKEN"]
 hosts = ["https://*.aliyuncs.com"]
 pattern = "{base62:32}"
+send = { header = "x-acs-security-token" }
 # source: https://www.alibabacloud.com/help/en/sdk/product-overview/v3-request-structure-and-signature
 # note: temporary credentials send the STS token in the `x-acs-security-token` header. It is an ordinary header credential, so it substitutes. The temporary AccessKey secret that accompanies it does not — see providers.alibaba-cloud-secret.
 
 [providers.alibaba-cloud-secret]
 env = ["ALIBABA_CLOUD_ACCESS_KEY_SECRET", "ALICLOUD_ACCESS_KEY_SECRET", "ALICLOUD_SECRET_KEY"]
+signing = { scheme = ["hmac-sha256", "hmac-sha1"], header = "Authorization" }
 # ACS3-HMAC-SHA256 (older signature versions use HMAC-SHA1) takes the AccessKey secret as the HMAC key.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -256,6 +259,7 @@ pattern = "{base62:32}"
 env = ["AWS_ACCESS_KEY_ID"]
 hosts = ["https://*.amazonaws.com"]
 pattern = "AKIA{base62:16}"
+send = { header = "Authorization" }
 # source: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
 # source: https://docs.aws.amazon.com/general/latest/gr/rande.html
 # note: the `AKIA` prefix comes from the docs' `AKIAIOSFODNN7EXAMPLE`; real key ids are uppercase, which `{base62:N}` approximates.
@@ -263,6 +267,7 @@ pattern = "AKIA{base62:16}"
 
 [providers.aws-secret]
 env = ["AWS_SECRET_ACCESS_KEY"]
+signing = { scheme = "aws4-hmac-sha256", header = "Authorization" }
 # signing half: a SigV4 HMAC input that never reaches the wire,
 # so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/14
 
@@ -744,6 +749,7 @@ pattern = "{hex:32}"
 env = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
 hosts = ["https://generativelanguage.googleapis.com", "https://api.gemini.com", "https://exchange.gemini.com"]
 pattern = "{base62:32}"
+send = [{ header = "X-GEMINI-APIKEY" }, { header = "x-goog-api-key" }, { query = "key" }]
 # source: https://ai.google.dev/gemini-api/docs/api-key
 # source: https://developer.gemini.com/authentication/api-key
 # note: on api.gemini.com the key is the `X-GEMINI-APIKEY` header. The exchange also accepts an OAuth `Authorization: Bearer` token; that bearer substitutes when it is the value held for these names.
@@ -1413,6 +1419,7 @@ pattern = "{base62:32}"
 env = ["OVH_APPLICATION_KEY", "OVH_APP_KEY", "OVH_CONSUMER_KEY"]
 hosts = ["https://eu.api.ovh.com", "https://ca.api.ovh.com", "https://api.us.ovhcloud.com"]
 pattern = "{base62:32}"
+send = [{ header = "X-Ovh-Application" }, { header = "X-Ovh-Consumer" }]
 # source: https://docs.ovhcloud.com/en/guides/manage-and-operate/api/first-steps.md
 # source: https://github.com/ovh/python-ovh/blob/master/ovh/client.py
 # note: the application key is the `X-Ovh-Application` header and the consumer key is the `X-Ovh-Consumer` header. Both are header credentials and substitute.
@@ -1420,6 +1427,7 @@ pattern = "{base62:32}"
 
 [providers.ovh-secret]
 env = ["OVH_APPLICATION_SECRET", "OVH_APP_SECRET"]
+signing = { scheme = "sha1", header = "X-Ovh-Signature" }
 # `X-Ovh-Signature` is `$1$` + SHA1(application secret + "+" + consumer key + "+" + method + "+" + url + "+" + body + "+" + timestamp).
 # The application secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -2631,6 +2639,7 @@ pattern = "{base62:32}"
 env = ["BITFINEX_API_KEY", "BITFINEX_API_TOKEN", "BITFINEX_APIKEY", "BITFINEX_TOKEN", "BITFINEX_ACCESS_TOKEN", "BITFINEX_AUTH_TOKEN", "BITFINEX_KEY"]
 hosts = ["https://api.bitfinex.com", "https://api-pub.bitfinex.com"]
 pattern = "{base62:32}"
+send = { header = "bfx-apikey" }
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/bitfinex/bitfinex.go
 # source: https://docs.bitfinex.com/docs/rest-auth
 # note: the key is the `bfx-apikey` header (v2; v1 used `X-BFX-APIKEY`). `bfx-signature` is hex HMAC-SHA384 of the secret over `/api/` + path + nonce + body and is not the secret — see providers.bitfinex-secret.
@@ -4051,6 +4060,7 @@ pattern = "{base62:32}"
 env = ["KRAKEN_API_KEY", "KRAKEN_API_TOKEN", "KRAKEN_APIKEY", "KRAKEN_TOKEN", "KRAKEN_ACCESS_TOKEN", "KRAKEN_AUTH_TOKEN", "KRAKEN_KEY"]
 hosts = ["https://api.kraken.com"]
 pattern = "{base62:32}"
+send = { header = "API-Key" }
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/kraken/kraken.go
 # source: https://docs.kraken.com/exchange/guides/rest/authentication
 # note: the key is the `API-Key` header. `API-Sign` is Base64 HMAC-SHA512 of the secret over the path plus SHA256(nonce + POST data) and is not the secret — see providers.kraken-secret.
@@ -4059,6 +4069,7 @@ pattern = "{base62:32}"
 env = ["KUCOIN_API_KEY", "KUCOIN_API_TOKEN", "KUCOIN_APIKEY", "KUCOIN_TOKEN", "KUCOIN_ACCESS_TOKEN", "KUCOIN_AUTH_TOKEN", "KUCOIN_KEY", "KUCOIN_PASSPHRASE", "KUCOIN_API_PASSPHRASE"]
 hosts = ["https://api.kucoin.com", "https://api-broker.kucoin.com", "https://api-futures.kucoin.com", "https://kucoin.com"]
 pattern = "{base62:32}"
+send = [{ header = "KC-API-KEY" }, { header = "KC-API-PASSPHRASE" }]
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/kucoin/kucoin.go
 # source: https://www.kucoin.com/docs-new/authentication
 # note: the key is the `KC-API-KEY` header. Key version 1 sends the passphrase in `KC-API-PASSPHRASE` as plaintext, so that name stays in scope. Version 2 sends Base64 HMAC-SHA256(secret, passphrase) instead, and a raw swap of the passphrase misses it.
@@ -4362,6 +4373,7 @@ pattern = "{base62:32}"
 env = ["MONGODB_API_KEY", "MONGODB_API_TOKEN", "MONGODB_APIKEY", "MONGODB_TOKEN", "MONGODB_ACCESS_TOKEN", "MONGODB_AUTH_TOKEN", "MONGODB_KEY"]
 hosts = ["https://howtorotate.com"]
 pattern = "{base62:32}"
+send = { header = "Authorization" }
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/mongodb/mongodb.go
 # note: trufflehog lists a placeholder host; MONGODB_SECRET and MONGODB_SECRET_KEY removed (unclear what MongoDB product they refer to, and Atlas API keys are sent in headers)
 
@@ -6316,12 +6328,14 @@ pattern = "{base62:32}"
 env = ["EXOSCALE_API_KEY", "EXOSCALE_API_TOKEN", "EXOSCALE_APIKEY", "EXOSCALE_TOKEN", "EXOSCALE_ACCESS_TOKEN", "EXOSCALE_AUTH_TOKEN", "EXOSCALE_KEY"]
 hosts = ["https://*.exoscale.com"]
 pattern = "{base62:32}"
+send = { header = "Authorization" }
 # source: betterleaks v1.6.1 rule `exoscale-api-key` — its validate expression calls api-ch-gva-2.exoscale.com
 # note: the validation host is zone-specific (`api-ch-gva-2`), so the host pattern covers every zone; the rule states no key prefix.
 # note: EXOSCALE_API_KEY and variants appear in headers and substitute; EXOSCALE_SECRET_KEY and EXOSCALE_SECRET are HMAC signing inputs — see providers.exoscale-secret.
 
 [providers.exoscale-secret]
 env = ["EXOSCALE_SECRET_KEY", "EXOSCALE_SECRET"]
+signing = { scheme = "exo2-hmac-sha256", header = "Authorization" }
 # signing half: an HMAC input that never reaches the wire,
 # so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
@@ -6368,11 +6382,13 @@ pattern = "{base62:32}"
 env = ["POLYMARKET_API_KEY", "POLYMARKET_API_TOKEN", "POLYMARKET_APIKEY", "POLYMARKET_TOKEN", "POLYMARKET_ACCESS_TOKEN", "POLYMARKET_AUTH_TOKEN", "POLYMARKET_KEY"]
 hosts = ["https://clob.polymarket.com"]
 pattern = "{base62:32}"
+send = { header = "POLY_API_KEY" }
 # source: betterleaks v1.6.1 rule `polymarket-api-key` — its validate expression calls clob.polymarket.com
 # note: POLYMARKET_API_KEY and variants appear in headers and substitute; POLYMARKET_SECRET and POLYMARKET_SECRET_KEY are HMAC signing inputs — see providers.polymarket-secret.
 
 [providers.polymarket-secret]
 env = ["POLYMARKET_SECRET", "POLYMARKET_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "POLY_SIGNATURE" }
 # signing half: an HMAC input that never reaches the wire,
 # so no hosts — decoy shape only, no rule. https://github.com/casualjim/arkham/issues/19
 
@@ -6445,6 +6461,7 @@ pattern = "{base62:32}"
 env = ["BINANCE_ACCESS_KEY", "BINANCE_APIKEY", "BINANCE_API_KEY", "BINANCE_API_TOKEN", "BINANCE_KEY"]
 hosts = ["https://api.binance.com", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com"]
 pattern = "{base62:32}"
+send = { header = "X-MBX-APIKEY" }
 # source: ccxt 4.5.78 — exchanges/binance.ts `urls.api`
 # note: the key is the `X-MBX-APIKEY` header. `signature` is hex HMAC-SHA256 of the secret over the query string and is not the secret — see providers.binance-secret.
 # source: https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md
@@ -6453,6 +6470,7 @@ pattern = "{base62:32}"
 env = ["BINANCECOINM_ACCESS_KEY", "BINANCECOINM_APIKEY", "BINANCECOINM_API_KEY", "BINANCECOINM_API_TOKEN", "BINANCECOINM_KEY"]
 hosts = ["https://api.binance.com", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com"]
 pattern = "{base62:32}"
+send = { header = "X-MBX-APIKEY" }
 # source: ccxt 4.5.78 — exchanges/binancecoinm.ts `urls.api`
 # note: the key is the `X-MBX-APIKEY` header, same scheme as spot. `signature` is hex HMAC-SHA256 of the secret over the query string and is not the secret — see providers.binancecoinm-secret.
 # source: https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md
@@ -6461,6 +6479,7 @@ pattern = "{base62:32}"
 env = ["BINANCEUS_ACCESS_KEY", "BINANCEUS_APIKEY", "BINANCEUS_API_KEY", "BINANCEUS_API_TOKEN", "BINANCEUS_KEY"]
 hosts = ["https://api.binance.com", "https://api.binance.us", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com", "https://www.binance.us"]
 pattern = "{base62:32}"
+send = { header = "X-MBX-APIKEY" }
 # source: ccxt 4.5.78 — exchanges/binanceus.ts `urls.api`
 # note: the key is the `X-MBX-APIKEY` header. `signature` is hex HMAC-SHA256 of the secret over the query string and is not the secret — see providers.binanceus-secret.
 # source: https://docs.binance.us/
@@ -6469,6 +6488,7 @@ pattern = "{base62:32}"
 env = ["BINANCEUSDM_ACCESS_KEY", "BINANCEUSDM_APIKEY", "BINANCEUSDM_API_KEY", "BINANCEUSDM_API_TOKEN", "BINANCEUSDM_KEY"]
 hosts = ["https://api.binance.com", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com"]
 pattern = "{base62:32}"
+send = { header = "X-MBX-APIKEY" }
 # source: ccxt 4.5.78 — exchanges/binanceusdm.ts `urls.api`
 # note: the key is the `X-MBX-APIKEY` header, same scheme as spot. `signature` is hex HMAC-SHA256 of the secret over the query string and is not the secret — see providers.binanceusdm-secret.
 # source: https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md
@@ -6507,6 +6527,7 @@ pattern = "{base62:32}"
 env = ["BITGET_ACCESS_KEY", "BITGET_APIKEY", "BITGET_API_KEY", "BITGET_API_TOKEN", "BITGET_KEY", "BITGET_PASSPHRASE", "BITGET_API_PASSPHRASE"]
 hosts = ["https://api.bitget.com"]
 pattern = "{base62:32}"
+send = [{ header = "ACCESS-KEY" }, { header = "ACCESS-PASSPHRASE" }]
 # source: ccxt 4.5.78 — exchanges/bitget.ts `urls.api`
 # note: the key is the `ACCESS-KEY` header and the passphrase is the `ACCESS-PASSPHRASE` header. `ACCESS-SIGN` is Base64 HMAC-SHA256 of the secret over timestamp + method + path + query + body and is not the secret — see providers.bitget-secret.
 # source: https://www.bitget.com/api-doc/common/signature
@@ -6515,6 +6536,7 @@ pattern = "{base62:32}"
 env = ["BITHUMB_ACCESS_KEY", "BITHUMB_APIKEY", "BITHUMB_API_KEY", "BITHUMB_API_TOKEN", "BITHUMB_KEY"]
 hosts = ["https://api.bithumb.com"]
 pattern = "{base62:32}"
+send = { header = "Authorization", claim = "access_key" }
 # source: ccxt 4.5.78 — exchanges/bithumb.ts `urls.api`
 # note: the key is the `access_key` claim of an HS256 JWT sent as `Authorization: Bearer`. The claim is base64url-encoded inside the token, so a raw value swap does not see the key. The secret that signs the JWT never reaches the wire — see providers.bithumb-secret.
 # source: https://apidocs.bithumb.com/docs/%EC%9D%B8%EC%A6%9D-%ED%86%A0%ED%81%B0-%EC%83%9D%EC%84%B1%ED%95%98%EA%B8%B0
@@ -6523,6 +6545,7 @@ pattern = "{base62:32}"
 env = ["BITMEX_ACCESS_KEY", "BITMEX_APIKEY", "BITMEX_API_KEY", "BITMEX_API_TOKEN", "BITMEX_KEY"]
 hosts = ["https://www.bitmex.com"]
 pattern = "{base62:32}"
+send = { header = "api-key" }
 # source: ccxt 4.5.78 — exchanges/bitmex.ts `urls.api`
 # note: the key is the `api-key` header. `api-signature` is hex HMAC-SHA256 of the secret over verb + path + expires + body and is not the secret — see providers.bitmex-secret.
 # source: https://docs.bitmex.com/api-explorer/bitmex-api
@@ -6549,6 +6572,7 @@ pattern = "{base62:32}"
 env = ["BITSTAMP_ACCESS_KEY", "BITSTAMP_APIKEY", "BITSTAMP_API_KEY", "BITSTAMP_API_TOKEN", "BITSTAMP_KEY"]
 hosts = ["https://www.bitstamp.net"]
 pattern = "{base62:32}"
+send = { header = "X-Auth" }
 # source: ccxt 4.5.78 — exchanges/bitstamp.ts `urls.api`
 # note: the key is the `X-Auth` header (`BITSTAMP <key>`). `X-Auth-Signature` is hex HMAC-SHA256 of the secret over the v2 string-to-sign and is not the secret — see providers.bitstamp-secret.
 # source: https://www.bitstamp.net/api/
@@ -6617,6 +6641,7 @@ pattern = "{base62:32}"
 env = ["BYBIT_ACCESS_KEY", "BYBIT_APIKEY", "BYBIT_API_KEY", "BYBIT_API_TOKEN", "BYBIT_KEY"]
 hosts = ["https://api.bybit.com"]
 pattern = "{base62:32}"
+send = { header = "X-BAPI-API-KEY" }
 # source: ccxt 4.5.78 — exchanges/bybit.ts `urls.api`
 # note: the key is the `X-BAPI-API-KEY` header. `X-BAPI-SIGN` is hex HMAC-SHA256 of the secret over timestamp + key + recv window + payload and is not the secret — see providers.bybit-secret.
 # source: https://bybit-exchange.github.io/docs/v5/guide
@@ -6625,6 +6650,7 @@ pattern = "{base62:32}"
 env = ["BYBITEU_ACCESS_KEY", "BYBITEU_APIKEY", "BYBITEU_API_KEY", "BYBITEU_API_TOKEN", "BYBITEU_KEY"]
 hosts = ["https://api.bybit.eu"]
 pattern = "{base62:32}"
+send = { header = "X-BAPI-API-KEY" }
 # source: ccxt 4.5.78 — exchanges/bybiteu.ts `urls.api`
 # note: the key is the `X-BAPI-API-KEY` header, same scheme as Bybit. `X-BAPI-SIGN` is hex HMAC-SHA256 of the secret and is not the secret — see providers.bybiteu-secret.
 # source: https://bybit-exchange.github.io/docs/v5/guide
@@ -6645,6 +6671,7 @@ pattern = "{base62:32}"
 env = ["COINBASE_ACCESS_KEY", "COINBASE_APIKEY", "COINBASE_API_KEY", "COINBASE_API_TOKEN", "COINBASE_KEY"]
 hosts = ["https://api.coinbase.com"]
 pattern = "{base62:32}"
+send = { header = "Authorization", claim = "sub" }
 # source: ccxt 4.5.78 — exchanges/coinbase.ts `urls.api`
 # note: Advanced Trade sends a JWT as `Authorization: Bearer`. The key name is the `sub` and `kid` claims, base64url-encoded inside the token, so a raw value swap does not see it. The EC or Ed25519 private key signs the JWT and never reaches the wire — see providers.coinbase-secret.
 # source: https://docs.cdp.coinbase.com/get-started/authentication/jwt-authentication
@@ -6653,6 +6680,7 @@ pattern = "{base62:32}"
 env = ["COINBASEEXCHANGE_ACCESS_KEY", "COINBASEEXCHANGE_APIKEY", "COINBASEEXCHANGE_API_KEY", "COINBASEEXCHANGE_API_TOKEN", "COINBASEEXCHANGE_KEY", "COINBASE_EXCHANGE_API_KEY", "COINBASEEXCHANGE_PASSPHRASE", "COINBASE_EXCHANGE_PASSPHRASE"]
 hosts = ["https://api.exchange.coinbase.com"]
 pattern = "{base62:32}"
+send = [{ header = "CB-ACCESS-KEY" }, { header = "CB-ACCESS-PASSPHRASE" }]
 # source: ccxt 4.5.78 — exchanges/coinbaseexchange.ts `urls.api`
 # note: the key is the `CB-ACCESS-KEY` header and the passphrase is the `CB-ACCESS-PASSPHRASE` header. `CB-ACCESS-SIGN` is Base64 HMAC-SHA256 of the base64-decoded secret over timestamp + method + path + body and is not the secret — see providers.coinbaseexchange-secret.
 # source: https://docs.cdp.coinbase.com/exchange/rest-api/authentication
@@ -6661,6 +6689,7 @@ pattern = "{base62:32}"
 env = ["COINBASEINTERNATIONAL_ACCESS_KEY", "COINBASEINTERNATIONAL_APIKEY", "COINBASEINTERNATIONAL_API_KEY", "COINBASEINTERNATIONAL_API_TOKEN", "COINBASEINTERNATIONAL_KEY", "COINBASEINTERNATIONAL_PASSPHRASE"]
 hosts = ["https://api.international.coinbase.com"]
 pattern = "{base62:32}"
+send = [{ header = "CB-ACCESS-KEY" }, { header = "CB-ACCESS-PASSPHRASE" }]
 # source: ccxt 4.5.78 — exchanges/coinbaseinternational.ts `urls.api`
 # note: the key is the `CB-ACCESS-KEY` header and the passphrase is the `CB-ACCESS-PASSPHRASE` header, the same HMAC scheme as Coinbase Exchange. `CB-ACCESS-SIGN` is not the secret — see providers.coinbaseinternational-secret.
 # source: https://docs.cdp.coinbase.com/exchange/rest-api/authentication
@@ -6705,6 +6734,7 @@ pattern = "{base62:32}"
 env = ["CRYPTOCOM_ACCESS_KEY", "CRYPTOCOM_APIKEY", "CRYPTOCOM_API_KEY", "CRYPTOCOM_API_TOKEN", "CRYPTOCOM_KEY"]
 hosts = ["https://api.crypto.com", "https://deriv-api.crypto.com"]
 pattern = "{base62:32}"
+send = { json = "api_key" }
 # source: ccxt 4.5.78 — exchanges/cryptocom.ts `urls.api`
 # note: the key is the JSON field `api_key` on private methods. `sig` is hex HMAC-SHA256 of the secret over method + id + api_key + parameter string + nonce and is not the secret — see providers.cryptocom-secret.
 # source: https://exchange-developer.crypto.com/exchange/v1/docs/api/rest-common-api-reference
@@ -6731,6 +6761,7 @@ pattern = "{base62:32}"
 env = ["DERIBIT_ACCESS_KEY", "DERIBIT_APIKEY", "DERIBIT_API_KEY", "DERIBIT_API_TOKEN", "DERIBIT_KEY"]
 hosts = ["https://www.deribit.com"]
 pattern = "{base62:32}"
+send = { header = "Authorization" }
 # source: ccxt 4.5.78 — exchanges/deribit.ts `urls.api`
 # note: the client id is the `id` field of `Authorization: deri-hmac-sha256 id=...,ts=...,sig=...,nonce=...`. `public/auth` also returns an `access_token` sent as `Authorization: Bearer`, and that bearer stays in scope under these token names. The client secret is the HMAC key — see providers.deribit-secret.
 # source: https://docs.deribit.com/articles/authentication
@@ -6775,6 +6806,7 @@ pattern = "{base62:32}"
 env = ["GATE_ACCESS_KEY", "GATE_APIKEY", "GATE_API_KEY", "GATE_API_TOKEN", "GATE_KEY"]
 hosts = ["https://api.gateio.ws"]
 pattern = "{base62:32}"
+send = { header = "KEY" }
 # source: ccxt 4.5.78 — exchanges/gate.ts `urls.api`
 # note: the key is the `KEY` header. `SIGN` is hex HMAC-SHA512 of the secret over method, path, query, the SHA512 of the body, and the timestamp, and is not the secret — see providers.gate-secret.
 # source: https://www.gate.com/en-us/docs/developers/apiv4/
@@ -6783,6 +6815,7 @@ pattern = "{base62:32}"
 env = ["GATEEU_ACCESS_KEY", "GATEEU_APIKEY", "GATEEU_API_KEY", "GATEEU_API_TOKEN", "GATEEU_KEY"]
 hosts = ["https://api.gateeu.com", "https://api.gateio.ws"]
 pattern = "{base62:32}"
+send = { header = "KEY" }
 # source: ccxt 4.5.78 — exchanges/gateeu.ts `urls.api`
 # note: the key is the `KEY` header, same scheme as Gate.io. `SIGN` is hex HMAC-SHA512 of the secret and is not the secret — see providers.gateeu-secret.
 # source: https://www.gate.com/en-us/docs/developers/apiv4/
@@ -6821,6 +6854,7 @@ pattern = "{base62:32}"
 env = ["HTX_ACCESS_KEY", "HTX_APIKEY", "HTX_API_KEY", "HTX_API_TOKEN", "HTX_KEY"]
 hosts = ["https://api.huobi.pro"]
 pattern = "{base62:32}"
+send = { query = "AccessKeyId" }
 # source: ccxt 4.5.78 — exchanges/htx.ts `urls.api`
 # note: the key is the `AccessKeyId` query parameter. `Signature` is Base64 HMAC-SHA256 of the secret over method + host + path + sorted query and is not the secret — see providers.htx-secret.
 # source: https://huobiapi.github.io/docs/spot/v1/en/#signing-api-requests
@@ -6853,6 +6887,7 @@ pattern = "{base62:32}"
 env = ["KUCOINFUTURES_ACCESS_KEY", "KUCOINFUTURES_APIKEY", "KUCOINFUTURES_API_KEY", "KUCOINFUTURES_API_TOKEN", "KUCOINFUTURES_KEY", "KUCOINFUTURES_PASSPHRASE", "KUCOINFUTURES_API_PASSPHRASE"]
 hosts = ["https://api-broker.kucoin.com", "https://api-futures.kucoin.com", "https://api.kucoin.com", "https://kucoin.com"]
 pattern = "{base62:32}"
+send = [{ header = "KC-API-KEY" }, { header = "KC-API-PASSPHRASE" }]
 # source: ccxt 4.5.78 — exchanges/kucoinfutures.ts `urls.api`
 # source: https://www.kucoin.com/docs-new/authentication
 # note: the key is the `KC-API-KEY` header, same scheme as spot. Key version 1 sends the passphrase in `KC-API-PASSPHRASE` as plaintext, so that name stays in scope. `KC-API-SIGN` is Base64 HMAC-SHA256 of the secret — see providers.kucoinfutures-secret.
@@ -6885,6 +6920,7 @@ pattern = "{base62:32}"
 env = ["MEXC_ACCESS_KEY", "MEXC_APIKEY", "MEXC_API_KEY", "MEXC_API_TOKEN", "MEXC_KEY"]
 hosts = ["https://api.mexc.com", "https://www.mexc.com"]
 pattern = "{base62:32}"
+send = { header = "X-MEXC-APIKEY" }
 # source: ccxt 4.5.78 — exchanges/mexc.ts `urls.api`
 # note: the key is the `X-MEXC-APIKEY` header. `signature` is hex HMAC-SHA256 of the secret over the query string plus body and is not the secret — see providers.mexc-secret.
 # source: https://www.mexc.com/api-docs/spot-v3/introduction
@@ -6905,6 +6941,7 @@ pattern = "{base62:32}"
 env = ["MYOKX_ACCESS_KEY", "MYOKX_APIKEY", "MYOKX_API_KEY", "MYOKX_API_TOKEN", "MYOKX_KEY", "MYOKX_PASSPHRASE", "MYOKX_API_PASSPHRASE"]
 hosts = ["https://eea.okx.com"]
 pattern = "{base62:32}"
+send = [{ header = "OK-ACCESS-KEY" }, { header = "OK-ACCESS-PASSPHRASE" }]
 # source: ccxt 4.5.78 — exchanges/myokx.ts `urls.api`
 # note: the key is the `OK-ACCESS-KEY` header and the passphrase is the `OK-ACCESS-PASSPHRASE` header, same scheme as OKX. `OK-ACCESS-SIGN` is Base64 HMAC-SHA256 of the secret and is not the secret — see providers.myokx-secret.
 # source: https://www.okx.com/docs-v5/en/
@@ -6925,6 +6962,7 @@ pattern = "{base62:32}"
 env = ["OKX_ACCESS_KEY", "OKX_APIKEY", "OKX_API_KEY", "OKX_API_TOKEN", "OKX_KEY", "OKX_PASSPHRASE", "OKX_API_PASSPHRASE"]
 hosts = ["https://www.okx.com"]
 pattern = "{base62:32}"
+send = [{ header = "OK-ACCESS-KEY" }, { header = "OK-ACCESS-PASSPHRASE" }]
 # source: ccxt 4.5.78 — exchanges/okx.ts `urls.api`
 # note: the key is the `OK-ACCESS-KEY` header and the passphrase is the `OK-ACCESS-PASSPHRASE` header. `OK-ACCESS-SIGN` is Base64 HMAC-SHA256 of the secret over timestamp + method + path + body and is not the secret — see providers.okx-secret.
 # source: https://www.okx.com/docs-v5/en/
@@ -6933,6 +6971,7 @@ pattern = "{base62:32}"
 env = ["OKXUS_ACCESS_KEY", "OKXUS_APIKEY", "OKXUS_API_KEY", "OKXUS_API_TOKEN", "OKXUS_KEY", "OKXUS_PASSPHRASE", "OKXUS_API_PASSPHRASE"]
 hosts = ["https://us.okx.com"]
 pattern = "{base62:32}"
+send = [{ header = "OK-ACCESS-KEY" }, { header = "OK-ACCESS-PASSPHRASE" }]
 # source: ccxt 4.5.78 — exchanges/okxus.ts `urls.api`
 # note: the key is the `OK-ACCESS-KEY` header and the passphrase is the `OK-ACCESS-PASSPHRASE` header, same scheme as OKX. `OK-ACCESS-SIGN` is Base64 HMAC-SHA256 of the secret and is not the secret — see providers.okxus-secret.
 # source: https://www.okx.com/docs-v5/en/
@@ -6995,6 +7034,7 @@ pattern = "{base62:32}"
 env = ["UPBIT_ACCESS_KEY", "UPBIT_APIKEY", "UPBIT_API_KEY", "UPBIT_API_TOKEN", "UPBIT_KEY"]
 hosts = ["https://api.upbit.com"]
 pattern = "{base62:32}"
+send = { header = "Authorization", claim = "access_key" }
 # source: ccxt 4.5.78 — exchanges/upbit.ts `urls.api`
 # note: the key is the `access_key` claim of a JWT (HS512 recommended) sent as `Authorization: Bearer`. The claim is base64url-encoded inside the token, so a raw value swap does not see the key. The secret that signs the JWT never reaches the wire — see providers.upbit-secret.
 # source: https://global-docs.upbit.com/reference/auth
@@ -7073,24 +7113,28 @@ env = ["BIGONE_API_SECRET", "BIGONE_PRIVATE_KEY", "BIGONE_SECRET", "BIGONE_SECRE
 
 [providers.binance-secret]
 env = ["BINANCE_API_SECRET", "BINANCE_PRIVATE_KEY", "BINANCE_SECRET", "BINANCE_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", query = "signature" }
 # HMAC-SHA256 over the query string (Binance `signature`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.binancecoinm-secret]
 env = ["BINANCECOINM_API_SECRET", "BINANCECOINM_PRIVATE_KEY", "BINANCECOINM_SECRET", "BINANCECOINM_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", query = "signature" }
 # HMAC-SHA256 over the query string (Binance COIN-M `signature`), same scheme as spot.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.binanceus-secret]
 env = ["BINANCEUS_API_SECRET", "BINANCEUS_PRIVATE_KEY", "BINANCEUS_SECRET", "BINANCEUS_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", query = "signature" }
 # HMAC-SHA256 over the query string (Binance.US `signature`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.binanceusdm-secret]
 env = ["BINANCEUSDM_API_SECRET", "BINANCEUSDM_PRIVATE_KEY", "BINANCEUSDM_SECRET", "BINANCEUSDM_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", query = "signature" }
 # HMAC-SHA256 over the query string (Binance USD-M `signature`), same scheme as spot.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7117,6 +7161,7 @@ env = ["BITBNS_API_SECRET", "BITBNS_PRIVATE_KEY", "BITBNS_SECRET", "BITBNS_SECRE
 
 [providers.bitfinex-secret]
 env = ["BITFINEX_API_SECRET", "BITFINEX_PRIVATE_KEY", "BITFINEX_SECRET", "BITFINEX_SECRET_KEY"]
+signing = { scheme = "hmac-sha384", header = "bfx-signature" }
 # HMAC-SHA384 over `/api/` + path + nonce + body (`bfx-signature`; v1 signed the base64 payload as `X-BFX-SIGNATURE`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7128,18 +7173,21 @@ env = ["BITFLYER_API_SECRET", "BITFLYER_PRIVATE_KEY", "BITFLYER_SECRET", "BITFLY
 
 [providers.bitget-secret]
 env = ["BITGET_API_SECRET", "BITGET_PRIVATE_KEY", "BITGET_SECRET", "BITGET_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "ACCESS-SIGN" }
 # HMAC-SHA256, Base64-encoded, over timestamp + method + path + query + body (`ACCESS-SIGN`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.bithumb-secret]
 env = ["BITHUMB_API_SECRET", "BITHUMB_PRIVATE_KEY", "BITHUMB_SECRET", "BITHUMB_SECRET_KEY"]
+signing = { scheme = "hs256", header = "Authorization" }
 # HS256 (HMAC-SHA256) JWT signing key. The JWT is `Authorization: Bearer`; the secret never reaches the wire.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.bitmex-secret]
 env = ["BITMEX_API_SECRET", "BITMEX_PRIVATE_KEY", "BITMEX_SECRET", "BITMEX_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "api-signature" }
 # HMAC-SHA256 over verb + path + expires + body (`api-signature`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7161,6 +7209,7 @@ env = ["BITSO_API_SECRET", "BITSO_PRIVATE_KEY", "BITSO_SECRET", "BITSO_SECRET_KE
 
 [providers.bitstamp-secret]
 env = ["BITSTAMP_API_SECRET", "BITSTAMP_PRIVATE_KEY", "BITSTAMP_SECRET", "BITSTAMP_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "X-Auth-Signature" }
 # HMAC-SHA256 over the v2 string-to-sign (`X-Auth-Signature`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7217,12 +7266,14 @@ env = ["BULLISH_API_SECRET", "BULLISH_PRIVATE_KEY", "BULLISH_SECRET", "BULLISH_S
 
 [providers.bybit-secret]
 env = ["BYBIT_API_SECRET", "BYBIT_PRIVATE_KEY", "BYBIT_SECRET", "BYBIT_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "X-BAPI-SIGN" }
 # HMAC-SHA256 over timestamp + api key + recv window + payload (`X-BAPI-SIGN`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.bybiteu-secret]
 env = ["BYBITEU_API_SECRET", "BYBITEU_PRIVATE_KEY", "BYBITEU_SECRET", "BYBITEU_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "X-BAPI-SIGN" }
 # HMAC-SHA256 over timestamp + api key + recv window + payload (`X-BAPI-SIGN`), same scheme as Bybit.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7239,18 +7290,21 @@ env = ["CEX_API_SECRET", "CEX_PRIVATE_KEY", "CEX_SECRET", "CEX_SECRET_KEY"]
 
 [providers.coinbase-secret]
 env = ["COINBASE_API_SECRET", "COINBASE_PRIVATE_KEY", "COINBASE_SECRET", "COINBASE_SECRET_KEY"]
+signing = { scheme = ["es256", "ed25519"], header = "Authorization" }
 # Advanced Trade signs an ES256 or Ed25519 JWT with this private key. Issue #19 names `CB-ACCESS-SIGN`; that HMAC-SHA256 header is the Exchange scheme (providers.coinbaseexchange-secret), not the JWT Advanced Trade sends today.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.coinbaseexchange-secret]
 env = ["COINBASEEXCHANGE_API_SECRET", "COINBASEEXCHANGE_PRIVATE_KEY", "COINBASEEXCHANGE_SECRET", "COINBASEEXCHANGE_SECRET_KEY", "COINBASE_EXCHANGE_API_SECRET"]
+signing = { scheme = "hmac-sha256", header = "CB-ACCESS-SIGN" }
 # HMAC-SHA256 of the base64-decoded secret over timestamp + method + path + body (`CB-ACCESS-SIGN`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.coinbaseinternational-secret]
 env = ["COINBASEINTERNATIONAL_API_SECRET", "COINBASEINTERNATIONAL_PRIVATE_KEY", "COINBASEINTERNATIONAL_SECRET", "COINBASEINTERNATIONAL_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "CB-ACCESS-SIGN" }
 # HMAC-SHA256 over timestamp + method + path + body (`CB-ACCESS-SIGN`), same scheme as Coinbase Exchange.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7287,6 +7341,7 @@ env = ["COINSPOT_API_SECRET", "COINSPOT_PRIVATE_KEY", "COINSPOT_SECRET", "COINSP
 
 [providers.cryptocom-secret]
 env = ["CRYPTOCOM_API_SECRET", "CRYPTOCOM_PRIVATE_KEY", "CRYPTOCOM_SECRET", "CRYPTOCOM_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", json = "sig" }
 # HMAC-SHA256 over method + id + api_key + parameter string + nonce (JSON field `sig`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7308,6 +7363,7 @@ env = ["DELTA_API_SECRET", "DELTA_PRIVATE_KEY", "DELTA_SECRET", "DELTA_SECRET_KE
 
 [providers.deribit-secret]
 env = ["DERIBIT_API_SECRET", "DERIBIT_PRIVATE_KEY", "DERIBIT_SECRET", "DERIBIT_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "Authorization" }
 # HMAC-SHA256 over timestamp + nonce + method + URI + body (`deri-hmac-sha256` `sig`, and `grant_type=client_signature`). `grant_type=client_credentials` does POST `client_secret`; that path is the same value as this HMAC key, so it stays shape-only. The bearer `access_token` from `public/auth` is the in-scope credential.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7344,18 +7400,21 @@ env = ["FOXBIT_API_SECRET", "FOXBIT_PRIVATE_KEY", "FOXBIT_SECRET", "FOXBIT_SECRE
 
 [providers.gate-secret]
 env = ["GATE_API_SECRET", "GATE_PRIVATE_KEY", "GATE_SECRET", "GATE_SECRET_KEY"]
+signing = { scheme = "hmac-sha512", header = "SIGN" }
 # HMAC-SHA512 over method, URL, query, hex SHA512 of the body, and timestamp (`SIGN`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.gateeu-secret]
 env = ["GATEEU_API_SECRET", "GATEEU_PRIVATE_KEY", "GATEEU_SECRET", "GATEEU_SECRET_KEY"]
+signing = { scheme = "hmac-sha512", header = "SIGN" }
 # HMAC-SHA512 over method, URL, query, hex SHA512 of the body, and timestamp (`SIGN`), same scheme as Gate.io.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.gemini-secret]
 env = ["GEMINI_API_SECRET", "GEMINI_PRIVATE_KEY", "GEMINI_SECRET", "GEMINI_SECRET_KEY"]
+signing = { scheme = "hmac-sha384", header = "X-GEMINI-SIGNATURE" }
 # HMAC-SHA384 over the base64 payload (`X-GEMINI-SIGNATURE`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7387,6 +7446,7 @@ env = ["HOLLAEX_API_SECRET", "HOLLAEX_PRIVATE_KEY", "HOLLAEX_SECRET", "HOLLAEX_S
 
 [providers.htx-secret]
 env = ["HTX_API_SECRET", "HTX_PRIVATE_KEY", "HTX_SECRET", "HTX_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", query = "Signature" }
 # HMAC-SHA256, Base64-encoded, over method + host + path + sorted query (`Signature`, signature version 2).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7408,6 +7468,7 @@ env = ["INDODAX_API_SECRET", "INDODAX_PRIVATE_KEY", "INDODAX_SECRET", "INDODAX_S
 
 [providers.kraken-secret]
 env = ["KRAKEN_API_SECRET", "KRAKEN_PRIVATE_KEY", "KRAKEN_SECRET", "KRAKEN_SECRET_KEY"]
+signing = { scheme = "hmac-sha512", header = "API-Sign" }
 # HMAC-SHA512 of (URI path + SHA256(nonce + POST data)) with the base64-decoded secret (`API-Sign`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7419,12 +7480,14 @@ env = ["KRAKENFUTURES_API_SECRET", "KRAKENFUTURES_PRIVATE_KEY", "KRAKENFUTURES_S
 
 [providers.kucoin-secret]
 env = ["KUCOIN_API_SECRET", "KUCOIN_PRIVATE_KEY", "KUCOIN_SECRET", "KUCOIN_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "KC-API-SIGN" }
 # HMAC-SHA256, Base64-encoded, over timestamp + method + endpoint + body (`KC-API-SIGN`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.kucoinfutures-secret]
 env = ["KUCOINFUTURES_API_SECRET", "KUCOINFUTURES_PRIVATE_KEY", "KUCOINFUTURES_SECRET", "KUCOINFUTURES_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "KC-API-SIGN" }
 # HMAC-SHA256, Base64-encoded, over timestamp + method + endpoint + body (`KC-API-SIGN`), same scheme as KuCoin spot.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7456,6 +7519,7 @@ env = ["MERCADO_API_SECRET", "MERCADO_PRIVATE_KEY", "MERCADO_SECRET", "MERCADO_S
 
 [providers.mexc-secret]
 env = ["MEXC_API_SECRET", "MEXC_PRIVATE_KEY", "MEXC_SECRET", "MEXC_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", query = "signature" }
 # HMAC-SHA256 over the query string concatenated with the body (`signature`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7472,6 +7536,7 @@ env = ["MUDREX_API_SECRET", "MUDREX_PRIVATE_KEY", "MUDREX_SECRET", "MUDREX_SECRE
 
 [providers.myokx-secret]
 env = ["MYOKX_API_SECRET", "MYOKX_PRIVATE_KEY", "MYOKX_SECRET", "MYOKX_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "OK-ACCESS-SIGN" }
 # HMAC-SHA256, Base64-encoded, over timestamp + method + path + body (`OK-ACCESS-SIGN`), same scheme as OKX.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7488,12 +7553,14 @@ env = ["NDAX_API_SECRET", "NDAX_PRIVATE_KEY", "NDAX_SECRET", "NDAX_SECRET_KEY"]
 
 [providers.okx-secret]
 env = ["OKX_API_SECRET", "OKX_PRIVATE_KEY", "OKX_SECRET", "OKX_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "OK-ACCESS-SIGN" }
 # HMAC-SHA256, Base64-encoded, over timestamp + method + path + body (`OK-ACCESS-SIGN`).
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
 
 [providers.okxus-secret]
 env = ["OKXUS_API_SECRET", "OKXUS_PRIVATE_KEY", "OKXUS_SECRET", "OKXUS_SECRET_KEY"]
+signing = { scheme = "hmac-sha256", header = "OK-ACCESS-SIGN" }
 # HMAC-SHA256, Base64-encoded, over timestamp + method + path + body (`OK-ACCESS-SIGN`), same scheme as OKX.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15
@@ -7550,6 +7617,7 @@ env = ["TOOBIT_API_SECRET", "TOOBIT_PRIVATE_KEY", "TOOBIT_SECRET", "TOOBIT_SECRE
 
 [providers.upbit-secret]
 env = ["UPBIT_API_SECRET", "UPBIT_PRIVATE_KEY", "UPBIT_SECRET", "UPBIT_SECRET_KEY"]
+signing = { scheme = "hs512", header = "Authorization" }
 # HS512 (HMAC-SHA512) JWT signing key. The JWT is `Authorization: Bearer`; the secret never reaches the wire.
 # The secret is an algorithm input and never reaches the wire, so no hosts — decoy shape only, no rule.
 # https://github.com/casualjim/arkham/issues/14 https://github.com/casualjim/arkham/issues/15

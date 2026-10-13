@@ -30,6 +30,10 @@ pattern = "acme_{hex:32}"
 | `pattern` | Decoy shape for these names. |
 | `contains` | Substrings matched against lowercased env names to select a decoy shape only, never hosts. |
 | `replace` | `true` discards what earlier layers declared for these names, then applies this entry's fields. |
+| `send` | Where the value travels (header, query parameter, or JSON field). Requires `hosts`. |
+| `signing` | Marks the names as signing secrets. Grants no hosts. |
+
+`send` and `signing` are optional. A key that is sent records `send`; a signing secret records `signing` and omits `hosts`. The [registry reference](../reference/registry.md) has the field shape. Adding a vendor that fits those fields is a registry edit only.
 
 A rule referencing the name now inherits the hosts and the shape:
 
