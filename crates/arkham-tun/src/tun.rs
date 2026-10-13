@@ -336,7 +336,9 @@ mod tests {
       .unwrap();
     assert_eq!(&reply[..n], b"REPLY-456");
     stub_task.await.unwrap();
+    // Join so the route guard runs before the test returns.
     loop_task.abort();
+    let _ = loop_task.await;
   }
 
   #[tokio::test]
@@ -497,5 +499,6 @@ mod tests {
     assert_eq!(body, expect.as_bytes());
     stub_task.await.unwrap();
     loop_task.abort();
+    let _ = loop_task.await;
   }
 }
