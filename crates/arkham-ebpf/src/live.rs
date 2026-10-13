@@ -116,11 +116,11 @@ impl Drop for TestCgroup {
     // cannot be removed, so move them to the parent first. Programs must
     // already be detached: `stop_capture` joins the capture task before
     // this drop runs.
-    if let Some(parent) = self.0.parent() {
-      if let Ok(procs) = std::fs::read_to_string(self.0.join("cgroup.procs")) {
-        for pid in procs.split_whitespace() {
-          let _ = std::fs::write(parent.join("cgroup.procs"), pid);
-        }
+    if let Some(parent) = self.0.parent()
+      && let Ok(procs) = std::fs::read_to_string(self.0.join("cgroup.procs"))
+    {
+      for pid in procs.split_whitespace() {
+        let _ = std::fs::write(parent.join("cgroup.procs"), pid);
       }
     }
     let _ = std::fs::remove_dir(&self.0);
