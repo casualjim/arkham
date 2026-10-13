@@ -19,8 +19,6 @@
 //! call whose argument the label names.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
 
 /// One `retry()` label and the env vars that must be set for that path to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,206 +36,296 @@ struct CoverageInputs<'a> {
   compose: &'a str,
 }
 
-/// Gaps that should fail the build. Empty means every supported and configured
-/// protocol has a live compose scenario.
-fn coverage_gaps(inputs: &CoverageInputs<'_>) -> Vec<String> {
-  let mut gaps = Vec::new();
-  let variants = match scheme_variants(inputs.scheme_src) {
-    Ok(variants) => variants,
-    Err(err) => return vec![format!("reading Scheme: {err}")],
-  };
-  let env = match client_env_keys(inputs.compose) {
-    Ok(env) => env,
-    Err(err) => return vec![format!("reading compose client environment: {err}")],
-  };
-  let found = match scan_labels(inputs.run_ts) {
-    Ok(found) => found,
-    Err(err) => return vec![format!("reading integration/client/run.ts: {err}")],
-  };
-  let live: Vec<String> = found
-    .into_iter()
-    .filter(|label| label.gates.iter().all(|gate| env.contains(gate)))
-    .map(|label| label.text)
-    .collect();
-
-  let mut protocols = BTreeSet::new();
-  for variant in &variants {
-    let scheme = variant.to_ascii_lowercase();
-    let Some(protocol) = protocol_id(&scheme, inputs.transport_dirs) else {
-      gaps.push(format!(
-        "Scheme::{variant} ({scheme}) has no transport directory under crates/arkham-proxy/src/transports"
-      ));
-      continue;
+impl CoverageInputs<'_> {
+  /// Gaps that should fail the build. Empty means every supported and configured
+  /// protocol has a live compose scenario.
+  fn gaps(&self) -> Vec<String> {
+    let mut gaps = Vec::new();
+    let variants = match self.scheme_src.scheme_variants() {
+      Ok(variants) => variants,
+      Err(err) => return vec![format!("reading Scheme: {err}")],
     };
-    protocols.insert(protocol.to_string());
-    if !scheme_covered(&scheme, protocol, &live) {
-      gaps.push(format!(
-        "Scheme::{variant} ({scheme}) has no live e2e scenario. A retry() label in integration/client/run.ts must contain `{scheme}` as a token, on a path whose if (ENV) guards are set in the compose client environment. `{protocol}` over TLS is covered by a label that contains `{protocol}` and `tls`. Live labels:\n{}",
-        live.join("\n")
-      ));
+    let env = match self.compose.client_env_keys() {
+      Ok(env) => env,
+      Err(err) => return vec![format!("reading compose client environment: {err}")],
+    };
+    let found = match Parser::new(self.run_ts).found_labels() {
+      Ok(found) => found,
+      Err(err) => return vec![format!("reading integration/client/run.ts: {err}")],
+    };
+    let live: Vec<String> = found
+      .into_iter()
+      .filter(|label| label.gates.iter().all(|gate| env.contains(gate)))
+      .map(|label| label.text)
+      .collect();
+
+    let mut protocols = BTreeSet::new();
+    for variant in &variants {
+      let scheme = variant.to_ascii_lowercase();
+      let Some(protocol) = self.transport_dirs.protocol_id(&scheme) else {
+        gaps.push(format!(
+          "Scheme::{variant} ({scheme}) has no transport directory under crates/arkham-proxy/src/transports"
+        ));
+        continue;
+      };
+      protocols.insert(protocol.to_string());
+      if !live.covers(&scheme, protocol) {
+        gaps.push(format!(
+          "Scheme::{variant} ({scheme}) has no live e2e scenario. A retry() label in integration/client/run.ts must contain `{scheme}` as a token, on a path whose if (ENV) guards are set in the compose client environment. `{protocol}` over TLS is covered by a label that contains `{protocol}` and `tls`. Live labels:\n{}",
+          live.join("\n")
+        ));
+      }
     }
-  }
-  for dir in inputs.transport_dirs {
-    if !protocols.contains(dir) {
-      gaps.push(format!(
-        "transport `{dir}` is supported but no Scheme variant maps to it (directory name, or a scheme prefixed by that name)"
-      ));
+    for dir in self.transport_dirs {
+      if !protocols.contains(dir) {
+        gaps.push(format!(
+          "transport `{dir}` is supported but no Scheme variant maps to it (directory name, or a scheme prefixed by that name)"
+        ));
+      }
     }
-  }
-  for scheme in configured_schemes(inputs.arkham_toml) {
-    if !variants.iter().any(|variant| variant.eq_ignore_ascii_case(&scheme)) {
-      gaps.push(format!(
-        "configured scheme `{scheme}` in integration/arkham.toml is not a Scheme variant"
-      ));
+    for scheme in self.arkham_toml.configured_schemes() {
+      if !variants.iter().any(|variant| variant.eq_ignore_ascii_case(&scheme)) {
+        gaps.push(format!(
+          "configured scheme `{scheme}` in integration/arkham.toml is not a Scheme variant"
+        ));
+      }
     }
+    gaps
   }
-  gaps
 }
 
-/// `https` is its own token, so it does not satisfy `http`. `rediss` has no
-/// token in the Redis labels; a `redis` + `tls` label is that scheme's scenario.
-fn scheme_covered(scheme: &str, protocol: &str, live: &[String]) -> bool {
-  if live.iter().any(|label| contains_token(label, scheme)) {
-    return true;
-  }
-  scheme != protocol
-    && live
-      .iter()
-      .any(|label| contains_token(label, protocol) && contains_token(label, "tls"))
+/// Methods on the strings this gate parses: scheme source, compose, config, and labels.
+trait CoverageText {
+  /// `https` is its own token, so it does not satisfy `http`.
+  fn contains_token(&self, needle: &str) -> bool;
+  fn is_word(&self) -> bool;
+  fn is_js_keyword(&self) -> bool;
+  fn mentions_any(&self, tokens: &BTreeSet<String>) -> bool;
+  fn scheme_variants(&self) -> Result<Vec<String>, String>;
+  fn variant_name(&self) -> Option<String>;
+  fn configured_schemes(&self) -> BTreeSet<String>;
+  fn url_scheme(&self) -> Option<String>;
+  fn client_env_keys(&self) -> Result<BTreeSet<String>, String>;
 }
 
-fn protocol_id<'a>(scheme: &str, dirs: &'a [String]) -> Option<&'a str> {
-  if let Some(exact) = dirs.iter().find(|dir| dir.as_str() == scheme) {
-    return Some(exact.as_str());
+impl CoverageText for str {
+  fn contains_token(&self, needle: &str) -> bool {
+    if needle.is_empty() {
+      return false;
+    }
+    let hay = self.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    hay.match_indices(&needle).any(|(at, _)| {
+      let before = hay.get(..at).and_then(|prefix| prefix.chars().next_back());
+      let after = hay.get(at + needle.len()..).and_then(|suffix| suffix.chars().next());
+      before.is_none_or(|ch| !ch.is_ascii_alphanumeric()) && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
   }
-  dirs
-    .iter()
-    .filter(|dir| !dir.is_empty() && scheme.starts_with(dir.as_str()))
-    .max_by_key(|dir| dir.len())
-    .map(String::as_str)
-}
 
-fn contains_token(hay: &str, needle: &str) -> bool {
-  if needle.is_empty() {
-    return false;
+  fn is_word(&self) -> bool {
+    !self.is_empty() && self.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
   }
-  let hay = hay.to_ascii_lowercase();
-  let needle = needle.to_ascii_lowercase();
-  hay.match_indices(&needle).any(|(at, _)| {
-    let before = hay.get(..at).and_then(|prefix| prefix.chars().next_back());
-    let after = hay.get(at + needle.len()..).and_then(|suffix| suffix.chars().next());
-    before.is_none_or(|ch| !ch.is_ascii_alphanumeric()) && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
-  })
-}
 
-fn scheme_variants(src: &str) -> Result<Vec<String>, String> {
-  let start = src.find("pub enum Scheme").ok_or("missing `pub enum Scheme`")?;
-  let after = src.get(start..).ok_or("scheme slice")?;
-  let open = after.find('{').ok_or("scheme brace")?;
-  let mut depth = 0i32;
-  let mut end = None;
-  for (idx, ch) in after.get(open..).unwrap_or("").char_indices() {
-    match ch {
-      '{' => depth += 1,
-      '}' => {
-        depth -= 1;
-        if depth == 0 {
-          end = Some(open.saturating_add(idx));
-          break;
+  fn is_js_keyword(&self) -> bool {
+    matches!(
+      self,
+      "if"
+        | "for"
+        | "while"
+        | "switch"
+        | "catch"
+        | "function"
+        | "return"
+        | "await"
+        | "async"
+        | "const"
+        | "let"
+        | "var"
+        | "else"
+        | "new"
+        | "typeof"
+        | "instanceof"
+        | "of"
+        | "in"
+        | "from"
+        | "import"
+        | "export"
+        | "class"
+        | "try"
+        | "throw"
+        | "break"
+        | "continue"
+        | "case"
+        | "default"
+        | "do"
+        | "yield"
+        | "void"
+        | "delete"
+        | "this"
+        | "super"
+    )
+  }
+
+  fn mentions_any(&self, tokens: &BTreeSet<String>) -> bool {
+    tokens.iter().any(|token| self.contains_token(token))
+  }
+
+  fn scheme_variants(&self) -> Result<Vec<String>, String> {
+    let start = self.find("pub enum Scheme").ok_or("missing `pub enum Scheme`")?;
+    let after = self.get(start..).ok_or("scheme slice")?;
+    let open = after.find('{').ok_or("scheme brace")?;
+    let mut depth = 0i32;
+    let mut end = None;
+    for (idx, ch) in after.get(open..).unwrap_or("").char_indices() {
+      match ch {
+        '{' => depth += 1,
+        '}' => {
+          depth -= 1;
+          if depth == 0 {
+            end = Some(open.saturating_add(idx));
+            break;
+          }
         }
+        _ => {}
       }
-      _ => {}
     }
-  }
-  let end = end.ok_or("unclosed Scheme enum")?;
-  let body = after.get(open.saturating_add(1)..end).ok_or("scheme body")?;
-  let mut names = Vec::new();
-  for line in body.lines() {
-    if let Some(name) = variant_name(line) {
-      names.push(name);
-    }
-  }
-  if names.is_empty() {
-    return Err("Scheme enum has no variants".to_string());
-  }
-  Ok(names)
-}
-
-fn variant_name(line: &str) -> Option<String> {
-  let line = line.trim();
-  if line.is_empty() || line.starts_with('/') || line.starts_with('#') || line.starts_with('[') {
-    return None;
-  }
-  let name: String = line.chars().take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_').collect();
-  if name.is_empty() || !name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) {
-    return None;
-  }
-  let rest = line.get(name.len()..)?.trim_start();
-  rest.starts_with([',', '{', '(']).then_some(name)
-}
-
-fn configured_schemes(toml: &str) -> BTreeSet<String> {
-  let mut schemes = BTreeSet::new();
-  let mut rest = toml;
-  while let Some(start) = rest.find('"') {
-    let after = rest.get(start.saturating_add(1)..).unwrap_or("");
-    let Some(end) = after.find('"') else { break };
-    let quoted = after.get(..end).unwrap_or("");
-    if let Some(scheme) = url_scheme(quoted) {
-      schemes.insert(scheme);
-    }
-    rest = after.get(end.saturating_add(1)..).unwrap_or("");
-  }
-  schemes
-}
-
-fn url_scheme(quoted: &str) -> Option<String> {
-  let (scheme, tail) = quoted.split_once("://")?;
-  if scheme.is_empty()
-    || !scheme
-      .chars()
-      .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.'))
-  {
-    return None;
-  }
-  if tail.is_empty() {
-    return None;
-  }
-  Some(scheme.to_string())
-}
-
-fn client_env_keys(compose: &str) -> Result<BTreeSet<String>, String> {
-  let lines: Vec<&str> = compose.lines().collect();
-  let client = lines
-    .iter()
-    .position(|line| *line == "  client:")
-    .ok_or("compose has no `client` service")?;
-  let mut env_at = None;
-  for (offset, line) in lines.iter().enumerate().skip(client.saturating_add(1)) {
-    if line.starts_with("  ") && !line.starts_with("   ") && !line.is_empty() {
-      break;
-    }
-    if *line == "    environment:" {
-      env_at = Some(offset);
-      break;
-    }
-  }
-  let env_at = env_at.ok_or("client service has no environment")?;
-  let mut keys = BTreeSet::new();
-  for line in lines.iter().skip(env_at.saturating_add(1)) {
-    if let Some(rest) = line.strip_prefix("      ") {
-      let key = rest.split(':').next().unwrap_or("").trim();
-      if !key.is_empty() && key.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_') {
-        keys.insert(key.to_string());
+    let end = end.ok_or("unclosed Scheme enum")?;
+    let body = after.get(open.saturating_add(1)..end).ok_or("scheme body")?;
+    let mut names = Vec::new();
+    for line in body.lines() {
+      if let Some(name) = line.variant_name() {
+        names.push(name);
       }
-    } else if !(line.trim().is_empty() || line.trim_start().starts_with('#')) {
-      break;
     }
+    if names.is_empty() {
+      return Err("Scheme enum has no variants".to_string());
+    }
+    Ok(names)
   }
-  if keys.is_empty() {
-    return Err("client environment has no keys".to_string());
+
+  fn variant_name(&self) -> Option<String> {
+    let line = self.trim();
+    if line.is_empty() || line.starts_with('/') || line.starts_with('#') || line.starts_with('[') {
+      return None;
+    }
+    let name: String = line.chars().take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_').collect();
+    if name.is_empty() || !name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) {
+      return None;
+    }
+    let rest = line.get(name.len()..)?.trim_start();
+    rest.starts_with([',', '{', '(']).then_some(name)
   }
-  Ok(keys)
+
+  fn configured_schemes(&self) -> BTreeSet<String> {
+    let mut schemes = BTreeSet::new();
+    let mut rest = self;
+    while let Some(start) = rest.find('"') {
+      let after = rest.get(start.saturating_add(1)..).unwrap_or("");
+      let Some(end) = after.find('"') else { break };
+      let quoted = after.get(..end).unwrap_or("");
+      if let Some(scheme) = quoted.url_scheme() {
+        schemes.insert(scheme);
+      }
+      rest = after.get(end.saturating_add(1)..).unwrap_or("");
+    }
+    schemes
+  }
+
+  fn url_scheme(&self) -> Option<String> {
+    let (scheme, tail) = self.split_once("://")?;
+    if scheme.is_empty()
+      || !scheme
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.'))
+    {
+      return None;
+    }
+    if tail.is_empty() {
+      return None;
+    }
+    Some(scheme.to_string())
+  }
+
+  fn client_env_keys(&self) -> Result<BTreeSet<String>, String> {
+    let lines: Vec<&str> = self.lines().collect();
+    let client = lines
+      .iter()
+      .position(|line| *line == "  client:")
+      .ok_or("compose has no `client` service")?;
+    let mut env_at = None;
+    for (offset, line) in lines.iter().enumerate().skip(client.saturating_add(1)) {
+      if line.starts_with("  ") && !line.starts_with("   ") && !line.is_empty() {
+        break;
+      }
+      if *line == "    environment:" {
+        env_at = Some(offset);
+        break;
+      }
+    }
+    let env_at = env_at.ok_or("client service has no environment")?;
+    let mut keys = BTreeSet::new();
+    for line in lines.iter().skip(env_at.saturating_add(1)) {
+      if let Some(rest) = line.strip_prefix("      ") {
+        let key = rest.split(':').next().unwrap_or("").trim();
+        if !key.is_empty() && key.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_') {
+          keys.insert(key.to_string());
+        }
+      } else if !(line.trim().is_empty() || line.trim_start().starts_with('#')) {
+        break;
+      }
+    }
+    if keys.is_empty() {
+      return Err("client environment has no keys".to_string());
+    }
+    Ok(keys)
+  }
+}
+
+/// Transport directories and live scenario labels are both lists of strings.
+trait CoverageList {
+  fn protocol_id(&self, scheme: &str) -> Option<&str>;
+  /// `https` is its own token, so it does not satisfy `http`. `rediss` has no
+  /// token in the Redis labels; a `redis` + `tls` label is that scheme's scenario.
+  fn covers(&self, scheme: &str, protocol: &str) -> bool;
+}
+
+impl CoverageList for [String] {
+  fn protocol_id(&self, scheme: &str) -> Option<&str> {
+    if let Some(exact) = self.iter().find(|dir| dir.as_str() == scheme) {
+      return Some(exact.as_str());
+    }
+    self
+      .iter()
+      .filter(|dir| !dir.is_empty() && scheme.starts_with(dir.as_str()))
+      .max_by_key(|dir| dir.len())
+      .map(String::as_str)
+  }
+
+  fn covers(&self, scheme: &str, protocol: &str) -> bool {
+    if self.iter().any(|label| label.contains_token(scheme)) {
+      return true;
+    }
+    scheme != protocol
+      && self
+        .iter()
+        .any(|label| label.contains_token(protocol) && label.contains_token("tls"))
+  }
+}
+
+/// ASCII identifier characters in the client script.
+trait JsIdent {
+  fn starts_js_ident(self) -> bool;
+  fn continues_js_ident(self) -> bool;
+}
+
+impl JsIdent for char {
+  fn starts_js_ident(self) -> bool {
+    self.is_ascii_alphabetic() || self == '_' || self == '$'
+  }
+
+  fn continues_js_ident(self) -> bool {
+    self.is_ascii_alphanumeric() || self == '_' || self == '$'
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -253,72 +341,6 @@ struct Call {
   callee: String,
   gates: Vec<String>,
   arg_strings: Vec<String>,
-}
-
-fn scan_labels(src: &str) -> Result<Vec<FoundLabel>, String> {
-  let mut parser = Parser::new(src);
-  parser.parse()?;
-  Ok(expand(&parser.labels, &parser.calls))
-}
-
-fn expand(labels: &[LocalLabel], calls: &[Call]) -> Vec<FoundLabel> {
-  let mut out = Vec::new();
-  let mut seen = BTreeSet::new();
-  walk("", &[], &[], labels, calls, &mut out, &mut seen);
-  out
-}
-
-fn walk(
-  func: &str,
-  inherited: &[String],
-  from_args: &[String],
-  labels: &[LocalLabel],
-  calls: &[Call],
-  out: &mut Vec<FoundLabel>,
-  seen: &mut BTreeSet<String>,
-) {
-  let mark = format!("{func}|{}|{}", inherited.join(","), from_args.join(","));
-  if !seen.insert(mark) {
-    return;
-  }
-  let discriminators = discriminator_set(func, calls);
-  for label in labels.iter().filter(|label| label.func == func) {
-    if is_conditional(&label.text, &discriminators) && !from_args.iter().any(|arg| contains_token(&label.text, arg)) {
-      continue;
-    }
-    let mut gates = inherited.to_vec();
-    gates.extend(label.gates.iter().cloned());
-    gates.sort();
-    gates.dedup();
-    out.push(FoundLabel {
-      text: label.text.clone(),
-      gates,
-    });
-  }
-  for call in calls.iter().filter(|call| call.caller == func) {
-    let mut gates = inherited.to_vec();
-    gates.extend(call.gates.iter().cloned());
-    gates.sort();
-    gates.dedup();
-    let args: Vec<String> = call.arg_strings.iter().filter(|arg| is_word(arg)).cloned().collect();
-    walk(&call.callee, &gates, &args, labels, calls, out, seen);
-  }
-}
-
-fn discriminator_set(func: &str, calls: &[Call]) -> BTreeSet<String> {
-  calls
-    .iter()
-    .filter(|call| call.callee == func)
-    .flat_map(|call| call.arg_strings.iter().filter(|arg| is_word(arg)).cloned())
-    .collect()
-}
-
-fn is_word(text: &str) -> bool {
-  !text.is_empty() && text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn is_conditional(label: &str, discriminators: &BTreeSet<String>) -> bool {
-  discriminators.iter().any(|token| contains_token(label, token))
 }
 
 #[derive(Debug)]
@@ -421,6 +443,56 @@ impl<'a> Parser<'a> {
       labels: Vec::new(),
       calls: Vec::new(),
     }
+  }
+
+  fn found_labels(mut self) -> Result<Vec<FoundLabel>, String> {
+    self.parse()?;
+    Ok(self.expand())
+  }
+
+  fn expand(&self) -> Vec<FoundLabel> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    self.walk("", &[], &[], &mut out, &mut seen);
+    out
+  }
+
+  fn walk(&self, func: &str, inherited: &[String], from_args: &[String], out: &mut Vec<FoundLabel>, seen: &mut BTreeSet<String>) {
+    let mark = format!("{func}|{}|{}", inherited.join(","), from_args.join(","));
+    if !seen.insert(mark) {
+      return;
+    }
+    let discriminators = self.discriminators(func);
+    for label in self.labels.iter().filter(|label| label.func == func) {
+      if label.text.mentions_any(&discriminators) && !from_args.iter().any(|arg| label.text.contains_token(arg)) {
+        continue;
+      }
+      let mut gates = inherited.to_vec();
+      gates.extend(label.gates.iter().cloned());
+      gates.sort();
+      gates.dedup();
+      out.push(FoundLabel {
+        text: label.text.clone(),
+        gates,
+      });
+    }
+    for call in self.calls.iter().filter(|call| call.caller == func) {
+      let mut gates = inherited.to_vec();
+      gates.extend(call.gates.iter().cloned());
+      gates.sort();
+      gates.dedup();
+      let args: Vec<String> = call.arg_strings.iter().filter(|arg| arg.is_word()).cloned().collect();
+      self.walk(&call.callee, &gates, &args, out, seen);
+    }
+  }
+
+  fn discriminators(&self, func: &str) -> BTreeSet<String> {
+    self
+      .calls
+      .iter()
+      .filter(|call| call.callee == func)
+      .flat_map(|call| call.arg_strings.iter().filter(|arg| arg.is_word()).cloned())
+      .collect()
   }
 
   fn parse(&mut self) -> Result<(), String> {
@@ -548,7 +620,7 @@ impl<'a> Parser<'a> {
       self.begin_binding()?;
       return Ok(());
     }
-    if !is_keyword(&id) && matches!(self.peek_kind()?, Some(Peek::LParen)) {
+    if !id.is_js_keyword() && matches!(self.peek_kind()?, Some(Peek::LParen)) {
       self.pending = Some(if id == "retry" { ArgKind::Retry } else { ArgKind::Call(id.clone()) });
       self.note_env_chain(&Token::Ident(id));
       return Ok(());
@@ -838,7 +910,7 @@ impl<'a> Parser<'a> {
           Token::Eq
         }
       }
-      ch if ident_start(ch) => Token::Ident(self.read_ident()),
+      ch if ch.starts_js_ident() => Token::Ident(self.read_ident()),
       _ => {
         self.bump();
         Token::Other
@@ -922,10 +994,10 @@ impl<'a> Parser<'a> {
 
   fn read_ident(&mut self) -> String {
     let start = self.i;
-    if self.peek_char().is_some_and(ident_start) {
+    if self.peek_char().is_some_and(JsIdent::starts_js_ident) {
       self.bump();
     }
-    while self.peek_char().is_some_and(ident_continue) {
+    while self.peek_char().is_some_and(JsIdent::continues_js_ident) {
       self.bump();
     }
     self.src.get(start..self.i).unwrap_or("").to_string()
@@ -955,88 +1027,44 @@ impl<'a> Parser<'a> {
   }
 }
 
-fn ident_start(ch: char) -> bool {
-  ch.is_ascii_alphabetic() || ch == '_' || ch == '$'
-}
-
-fn ident_continue(ch: char) -> bool {
-  ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
-}
-
-fn is_keyword(id: &str) -> bool {
-  matches!(
-    id,
-    "if"
-      | "for"
-      | "while"
-      | "switch"
-      | "catch"
-      | "function"
-      | "return"
-      | "await"
-      | "async"
-      | "const"
-      | "let"
-      | "var"
-      | "else"
-      | "new"
-      | "typeof"
-      | "instanceof"
-      | "of"
-      | "in"
-      | "from"
-      | "import"
-      | "export"
-      | "class"
-      | "try"
-      | "throw"
-      | "break"
-      | "continue"
-      | "case"
-      | "default"
-      | "do"
-      | "yield"
-      | "void"
-      | "delete"
-      | "this"
-      | "super"
-  )
-}
-
-fn repo_root() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn read_repo(path: &str) -> String {
-  let full = repo_root().join(path);
-  fs::read_to_string(&full).unwrap_or_else(|err| panic!("read {}: {err}", full.display()))
-}
-
-fn transport_dirs(root: &Path) -> Vec<String> {
-  let dir = root.join("crates/arkham-proxy/src/transports");
-  let mut names = Vec::new();
-  let entries = fs::read_dir(&dir).unwrap_or_else(|err| panic!("read {}: {err}", dir.display()));
-  for entry in entries {
-    let entry = entry.unwrap_or_else(|err| panic!("transport dir entry: {err}"));
-    if !entry.path().is_dir() {
-      continue;
-    }
-    let name = entry.file_name().to_string_lossy().into_owned();
-    if name != "engine" {
-      names.push(name);
-    }
-  }
-  names.sort();
-  names
-}
-
 #[cfg(test)]
 mod tests {
+  use std::fs;
+  use std::path::{Path, PathBuf};
+
   use super::*;
 
+  fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+  }
+
+  fn read_repo(path: &str) -> String {
+    let full = repo_root().join(path);
+    fs::read_to_string(&full).unwrap_or_else(|err| panic!("read {}: {err}", full.display()))
+  }
+
+  fn transport_dirs(root: &Path) -> Vec<String> {
+    let dir = root.join("crates/arkham-proxy/src/transports");
+    let mut names = Vec::new();
+    let entries = fs::read_dir(&dir).unwrap_or_else(|err| panic!("read {}: {err}", dir.display()));
+    for entry in entries {
+      let entry = entry.unwrap_or_else(|err| panic!("transport dir entry: {err}"));
+      if !entry.path().is_dir() {
+        continue;
+      }
+      let name = entry.file_name().to_string_lossy().into_owned();
+      if name != "engine" {
+        names.push(name);
+      }
+    }
+    names.sort();
+    names
+  }
+
   fn live(src: &str, compose: &str) -> Vec<FoundLabel> {
-    let env = client_env_keys(compose).expect("client env");
-    scan_labels(src)
+    let env = compose.client_env_keys().expect("client env");
+    Parser::new(src)
+      .found_labels()
       .expect("scan")
       .into_iter()
       .filter(|label| label.gates.iter().all(|gate| env.contains(gate)))
@@ -1046,7 +1074,7 @@ mod tests {
   #[test]
   fn scheme_parser_reads_variants_and_skips_docs() {
     let src = "pub enum Scheme {\n  /// Plain HTTP.\n  Http,\n  Https,\n}\n";
-    assert_eq!(scheme_variants(src).expect("variants"), ["Http", "Https"]);
+    assert_eq!(src.scheme_variants().expect("variants"), ["Http", "Https"]);
   }
 
   #[test]
@@ -1126,13 +1154,14 @@ mod tests {
     "#;
     let compose = "services:\n  client:\n    environment:\n      REDIS_URL: a\n    volumes: []\n";
     let toml = "value = \"redis://cache/0\"\nvalue = \"mysql://db\"\n";
-    let gaps = coverage_gaps(&CoverageInputs {
+    let gaps = CoverageInputs {
       scheme_src,
       transport_dirs: &dirs,
       arkham_toml: toml,
       run_ts,
       compose,
-    });
+    }
+    .gaps();
     let text = gaps.join("\n");
     assert!(text.contains("Rediss"), "{text}");
     assert!(text.contains("mysql"), "{text}");
@@ -1143,7 +1172,7 @@ mod tests {
   fn supported_and_configured_protocols_have_live_e2e_scenarios() {
     let root = repo_root();
     let scheme_src = read_repo("crates/arkham-config/src/grants/mod.rs");
-    let variants = scheme_variants(&scheme_src).expect("Scheme variants");
+    let variants = scheme_src.scheme_variants().expect("Scheme variants");
     for required in ["Http", "Https", "Tcp", "Postgres", "Redis", "Rediss", "Ssh"] {
       assert!(
         variants.iter().any(|variant| variant == required),
@@ -1154,13 +1183,14 @@ mod tests {
     let arkham_toml = read_repo("integration/arkham.toml");
     let run_ts = read_repo("integration/client/run.ts");
     let compose = read_repo("integration/compose.yaml");
-    let gaps = coverage_gaps(&CoverageInputs {
+    let gaps = CoverageInputs {
       scheme_src: &scheme_src,
       transport_dirs: &dirs,
       arkham_toml: &arkham_toml,
       run_ts: &run_ts,
       compose: &compose,
-    });
+    }
+    .gaps();
     assert!(gaps.is_empty(), "protocol e2e coverage gaps:\n{}", gaps.join("\n"));
   }
 }
