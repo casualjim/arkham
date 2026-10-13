@@ -112,7 +112,17 @@ impl TestCgroup {
 
 impl Drop for TestCgroup {
   fn drop(&mut self) {
-    // Best-effort: a leftover empty cgroup is untidy but harmless.
+    // The live test admits itself here. A cgroup that still has members
+    // cannot be removed, so move them to the parent first. Programs must
+    // already be detached: `stop_capture` joins the capture task before
+    // this drop runs.
+    if let Some(parent) = self.0.parent() {
+      if let Ok(procs) = std::fs::read_to_string(self.0.join("cgroup.procs")) {
+        for pid in procs.split_whitespace() {
+          let _ = std::fs::write(parent.join("cgroup.procs"), pid);
+        }
+      }
+    }
     let _ = std::fs::remove_dir(&self.0);
   }
 }
@@ -180,6 +190,17 @@ async fn start_capture(
   }
   cgroup.admit(std::process::id());
   capture
+}
+
+/// Abort the capture task and wait until it has dropped.
+///
+/// Dropping the `JoinHandle` does not unload the programs. They stay
+/// attached to the test cgroup until the task itself is dropped, and the
+/// cgroup directory cannot be removed while they are. Joining after abort
+/// runs that drop before [`TestCgroup`] is dropped.
+async fn stop_capture(capture: JoinHandle<Result<(), Error>>) {
+  capture.abort();
+  let _ = capture.await;
 }
 
 /// The TCP point of the backend: a captured connection is MITM'd, with
@@ -316,7 +337,7 @@ async fn ebpf_live_tcp_mitm_substitutes() {
   // The response came back redacted: the guest never sees the real value.
   assert_eq!(body, expect.as_bytes());
   stub_task.await.unwrap();
-  capture.abort();
+  stop_capture(capture).await;
 }
 
 /// Connected UDP is relayed both ways, and the reply the client observes must
@@ -373,7 +394,7 @@ async fn ebpf_live_udp_relay_roundtrip() {
     .expect("relay reply within 5s; a timeout here usually means recvmsg4 did not restore the source")
     .unwrap();
   assert_eq!(&reply[..n], b"echo:probe");
-  capture.abort();
+  stop_capture(capture).await;
 }
 
 /// A captured connection with no matching grant is spliced byte-for-byte.
@@ -437,7 +458,7 @@ async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
     .unwrap();
   assert_eq!(echoed, SENTINEL, "splice must be byte-identical");
   stub_task.await.unwrap();
-  capture.abort();
+  stop_capture(capture).await;
 }
 
 /// Unconnected `sendto` UDP — the shape every DNS resolver uses — is never
@@ -493,7 +514,7 @@ async fn ebpf_live_unconnected_udp_passes_through() {
     "reply must come from the stub itself: a relayed datagram would arrive from arkham's listener"
   );
   stub_task.await.unwrap();
-  capture.abort();
+  stop_capture(capture).await;
 }
 
 /// A connection from a network namespace nested under the attached cgroup is
@@ -646,7 +667,7 @@ async fn ebpf_live_nested_netns_connect_is_not_captured() {
     "the nested connection must reach the stub directly, not through arkham"
   );
   netns_task.await.unwrap();
-  capture.abort();
+  stop_capture(capture).await;
 }
 
 /// A destination inside a configured bypass CIDR is never rewritten: the
@@ -743,7 +764,7 @@ async fn ebpf_live_bypass_cidr_is_not_captured() {
   );
   // Best-effort: the next run removes a stale address up front anyway.
   let _ = run_ip(&["addr", "del", BYPASSED_CIDR, "dev", "lo"]);
-  capture.abort();
+  stop_capture(capture).await;
 }
 
 /// A connect at this netns's own non-loopback address reaches its listener
@@ -832,7 +853,7 @@ async fn ebpf_live_local_address_reaches_listener_directly() {
     recorder_task.await.unwrap(),
     "the recorder must see no connection: the dial reached its listener directly, never through arkham"
   );
-  capture.abort();
+  stop_capture(capture).await;
 }
 
 /// A CIDR written to the bypass file mid-capture takes effect without a
@@ -927,5 +948,5 @@ async fn ebpf_live_bypass_file_update_applies_without_restart() {
     assert!(Instant::now() < deadline, "bypass file update did not apply within 30s");
     tokio::time::sleep(Duration::from_secs(1)).await;
   }
-  capture.abort();
+  stop_capture(capture).await;
 }

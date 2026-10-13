@@ -12,11 +12,63 @@ cluster="arkham-k3s-test"
 scratch=$proj_dir/target/k3s-e2e
 arkham=$proj_dir/target/debug/arkham
 serve_pid=""
+# One budget for /readyz, node Ready, and coredns Ready. Cluster create
+# (image pull included) is outside it. Override when a runner is slower.
+ready_timeout=${ARKHAM_K3S_READY_TIMEOUT:-600}
+case "$ready_timeout" in
+  ''|*[!0-9]*)
+    echo "ARKHAM_K3S_READY_TIMEOUT must be a positive number of seconds, got '${ready_timeout}'" >&2
+    exit 1
+    ;;
+esac
+if [ "$((10#$ready_timeout))" -lt 1 ]; then
+  echo "ARKHAM_K3S_READY_TIMEOUT must be a positive number of seconds, got '${ready_timeout}'" >&2
+  exit 1
+fi
 
-# The published API's EOF only shows up in the serverlb and server logs.
-# Print them before the trap deletes the cluster.
+run_privileged() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return
+  fi
+  if sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+    return
+  fi
+  return 127
+}
+
+bpftool_bin() {
+  if command -v bpftool >/dev/null 2>&1; then
+    command -v bpftool
+    return 0
+  fi
+  local candidate match
+  candidate="/usr/lib/linux-tools/$(uname -r)/bpftool"
+  if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  match=$(compgen -G '/usr/lib/linux-tools/*/bpftool' || true)
+  if [ -n "$match" ]; then
+    printf '%s\n' "${match%%$'\n'*}"
+    return 0
+  fi
+  return 1
+}
+
+log_elapsed() {
+  local stage=$1
+  local since_ready=$((SECONDS - ready_started))
+  local since_create=$((SECONDS - create_started))
+  echo "${stage}: readiness ${since_ready}s / ${ready_timeout}s, ${since_create}s since cluster create started"
+}
+
+# The published API's EOF is in the serverlb log. nft, routes, and cgroup
+# programs are the host state the capture suites can leave behind. Print
+# both before the trap deletes the cluster.
 dump_k3s_diagnostics() {
-  local name
+  local name bin
   {
     echo "=== kubeconfig server ==="
     kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}' 2>/dev/null || true
@@ -26,9 +78,23 @@ dump_k3s_diagnostics() {
     echo "=== docker ps (k3d-${cluster}) ==="
     docker ps -a --filter "name=k3d-${cluster}" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
     for name in "k3d-${cluster}-server-0" "k3d-${cluster}-serverlb"; do
-      echo "=== docker logs ${name} (tail 200) ==="
-      docker logs --tail 200 "$name" 2>&1 || true
+      echo "=== docker logs ${name} (tail 800) ==="
+      docker logs --tail 800 "$name" 2>&1 || true
     done
+    echo "=== nft list ruleset ==="
+    run_privileged nft list ruleset 2>&1 || echo "nft list ruleset failed"
+    echo "=== ip rule ==="
+    ip rule show 2>&1 || true
+    echo "=== ip route ==="
+    ip route show 2>&1 || true
+    echo "=== ip route show table 100 ==="
+    ip route show table 100 2>&1 || true
+    echo "=== bpftool cgroup tree ==="
+    if bin=$(bpftool_bin); then
+      run_privileged "$bin" cgroup tree 2>&1 || echo "bpftool cgroup tree failed"
+    else
+      echo "bpftool is not installed; cgroup program attachments were not listed"
+    fi
   } >&2
 }
 
@@ -43,6 +109,64 @@ cleanup() {
   k3d cluster delete "$cluster" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+# Capture suites scope themselves to TEST-NET-2 and a private cgroup, and
+# drop that state when the test task is joined. A killed run can still
+# leave it. Remove the known leftovers so this cluster is not started
+# behind a stale tproxy rule or capture route, and say so when that happens.
+sweep_host_capture() {
+  local found=0 nft_out line pref cg flushed=0
+  if nft_out=$(run_privileged nft list tables 2>/dev/null); then
+    if printf '%s\n' "$nft_out" | grep -q 'arkham_tproxy'; then
+      echo "host capture residue: nft table inet arkham_tproxy" >&2
+      run_privileged nft delete table inet arkham_tproxy >&2 || echo "could not delete nft table inet arkham_tproxy" >&2
+      found=$((found + 1))
+    fi
+  else
+    echo "host capture state: nft tables not listed (no root, or nft is missing)" >&2
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      *"fwmark 0x88"*|*"lookup 100"|*"lookup 100 "*)
+        echo "host capture residue: ip rule: ${line}" >&2
+        pref=${line%%:*}
+        run_privileged ip rule del pref "$pref" >&2 || echo "could not delete ip rule pref ${pref}" >&2
+        found=$((found + 1))
+        case "$line" in
+          *"lookup 100"|*"lookup 100 "*)
+            if [ "$flushed" -eq 0 ]; then
+              run_privileged ip route flush table 100 >&2 || true
+              flushed=1
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  done <<<"$(ip rule show 2>/dev/null || true)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      198.51.100.*)
+        echo "host capture residue: route: ${line}" >&2
+        pref=${line%% *}
+        run_privileged ip route del "$pref" >&2 || echo "could not delete route ${pref}" >&2
+        found=$((found + 1))
+        ;;
+    esac
+  done <<<"$(ip route show 2>/dev/null || true)"
+  while IFS= read -r cg; do
+    [ -n "$cg" ] || continue
+    echo "host capture residue: cgroup ${cg}" >&2
+    run_privileged rmdir "$cg" >&2 || echo "could not remove cgroup ${cg}" >&2
+    found=$((found + 1))
+  done < <(compgen -G '/sys/fs/cgroup/arkham-test-*' || true)
+  if [ "$found" -eq 0 ]; then
+    echo "host capture state: clean (no arkham_tproxy table, fwmark 0x88 or table-100 rule, 198.51.100 route, or arkham-test cgroup)"
+  else
+    echo "host capture state: interference, removed ${found} arkham leftover(s) before cluster create"
+  fi
+}
 
 rm -rf "$scratch"
 mkdir -p "$scratch" "$scratch/config/arkham"
@@ -60,18 +184,21 @@ printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/arkham/config.toml
 # The kubeconfig flags keep k3d from touching ~/.kube/config even if the
 # KUBECONFIG export above were lost.
 k3d cluster delete "$cluster" >/dev/null 2>&1 || true
+sweep_host_capture
 # Publish the API on loopback. k3d's default kubeconfig server is 0.0.0.0,
 # a listen address: CI dialed https://0.0.0.0:<port> and the serverlb closed
 # every connection with EOF. `random` is k3d's free-port allocation, and the
 # same address is what it writes into the kubeconfig and the serving cert.
 # --wait returns once the server node has logged readiness and the serverlb
 # container is running. nginx can still accept the host port and EOF until
-# its apiserver upstream is up, so the poll below is the host-side gate.
+# its apiserver upstream is up; the poll below is that host-side wait.
+create_started=$SECONDS
 k3d cluster create "$cluster" \
   --wait \
   --api-port 127.0.0.1:random \
   --kubeconfig-update-default=false \
   --kubeconfig-switch-context=false
+echo "k3d cluster create returned after $((SECONDS - create_started))s"
 
 # With update-default off, k3d wrote no kubeconfig anywhere; write its
 # store copy to the task file so kubectl has a config to read.
@@ -88,37 +215,81 @@ esac
 
 # kubectl's discovery client retries an EOF about five times, ten seconds
 # apart, then exits. `kubectl wait --timeout` does not start until that
-# discovery succeeds, which is why the previous 180s wait died in ~50s.
-# Each probe is a new client, so the budget here is actually 180s. The
-# sleep is the gap between probes, not a stand-in for readiness.
+# discovery succeeds. Each /readyz probe is a new client, so this loop is
+# what spends the budget. The sleep is the gap between probes.
 wait_for_apiserver() {
-  local deadline=$((SECONDS + 180))
   local errfile=$scratch/readyz.err
   local next_note=0
   local detail
   : >"$errfile"
   while [ "$SECONDS" -lt "$deadline" ]; do
     if kubectl get --raw=/readyz --request-timeout=5s >"$scratch/readyz.out" 2>"$errfile"; then
-      echo "apiserver /readyz ok"
+      log_elapsed "apiserver /readyz ok"
       return 0
     fi
     if [ "$SECONDS" -ge "$next_note" ]; then
       detail=$(tr '\n' ' ' <"$errfile" || true)
-      echo "waiting for apiserver /readyz: ${detail}" >&2
+      echo "waiting for apiserver /readyz ($((SECONDS - ready_started))s / ${ready_timeout}s): ${detail}" >&2
       next_note=$((SECONDS + 10))
     fi
     sleep 2
   done
-  echo "kubernetes apiserver did not report ready within 180s" >&2
+  echo "kubernetes apiserver did not report ready within ${ready_timeout}s" >&2
   cat "$errfile" >&2 || true
   return 1
 }
+
+wait_for_coredns() {
+  local errfile=$scratch/coredns.err
+  local next_note=0
+  local detail slice left
+  : >"$errfile"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    left=$((deadline - SECONDS))
+    slice=15
+    if [ "$left" -lt "$slice" ]; then
+      slice=$left
+    fi
+    if [ "$slice" -lt 1 ]; then
+      break
+    fi
+    # A missing pod makes kubectl wait exit immediately. Keep polling
+    # until the budget is gone; the deployment is created after the node.
+    if kubectl wait --for=condition=Ready pod -n kube-system -l k8s-app=kube-dns --timeout="${slice}s" >"$scratch/coredns.out" 2>"$errfile"; then
+      log_elapsed "coredns Ready"
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$next_note" ]; then
+      detail=$(tr '\n' ' ' <"$errfile" || true)
+      echo "waiting for coredns ($((SECONDS - ready_started))s / ${ready_timeout}s): ${detail}" >&2
+      next_note=$((SECONDS + 10))
+    fi
+    # Gap between probes when the pod does not exist yet. kubectl wait
+    # itself blocks while a pod is present and not Ready.
+    sleep 2
+  done
+  echo "coredns was not Ready within ${ready_timeout}s" >&2
+  cat "$errfile" >&2 || true
+  return 1
+}
+
+ready_started=$SECONDS
+deadline=$((ready_started + ready_timeout))
+echo "readiness budget ${ready_timeout}s (ARKHAM_K3S_READY_TIMEOUT) for /readyz, nodes, and coredns"
 wait_for_apiserver
 
-kubectl wait --for=condition=Ready nodes --all --timeout=180s
-
-# The legs dial the API by the kubeconfig address. They do not resolve
-# cluster DNS, so CoreDNS is not a gate.
+left=$((deadline - SECONDS))
+if [ "$left" -lt 1 ]; then
+  echo "no time left in the ${ready_timeout}s budget before nodes were Ready" >&2
+  exit 1
+fi
+echo "waiting for nodes Ready (elapsed $((SECONDS - ready_started))s, remaining ${left}s)"
+if ! kubectl wait --for=condition=Ready nodes --all --timeout="${left}s"; then
+  echo "nodes were not Ready within the ${ready_timeout}s budget (elapsed $((SECONDS - ready_started))s)" >&2
+  exit 1
+fi
+log_elapsed "nodes Ready"
+wait_for_coredns
 
 # Bearer-leg source: token-only copy of the same kubeconfig.
 cp "$scratch/cert-kubeconfig" "$scratch/token-kubeconfig"

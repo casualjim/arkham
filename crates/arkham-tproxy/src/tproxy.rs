@@ -566,7 +566,11 @@ mod tests {
     }
     assert_eq!(body, expect.as_bytes());
     stub_task.await.unwrap();
+    // Join the aborted task so the nft and route guards run before the
+    // test returns. Dropping the handle alone leaves that cleanup to
+    // runtime shutdown.
     capture.abort();
+    let _ = capture.await;
   }
 
   /// Removes the scoped dev-lo test route on drop (best-effort).
