@@ -57,6 +57,22 @@ for backend in $backends; do
     code=124
   fi
   docker logs "$client" || true
+  if [ "$code" = 0 ]; then
+    covered=integration/out/covered.json
+    if [ ! -f "$covered" ]; then
+      echo "missing $covered"
+      code=1
+    else
+      integration/docker/arkham schemes > /tmp/arkham-schemes.txt
+      while IFS= read -r scheme; do
+        [ -z "$scheme" ] && continue
+        if ! grep -Fq "\"${scheme}\"" "$covered"; then
+          echo "scheme ${scheme} has no passing e2e scenario"
+          code=1
+        fi
+      done < /tmp/arkham-schemes.txt
+    fi
+  fi
   # Capture every service, arkham especially, before teardown. The CI
   # failure step prints this file; compose down would otherwise erase it.
   if [ "$code" != 0 ]; then

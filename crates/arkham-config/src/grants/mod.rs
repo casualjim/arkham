@@ -93,6 +93,33 @@ pub enum Scheme {
   Ssh,
 }
 
+impl Scheme {
+  /// Lowercase URL scheme for this variant.
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Http => "http",
+      Self::Https => "https",
+      Self::Tcp => "tcp",
+      Self::Postgres => "postgres",
+      Self::Redis => "redis",
+      Self::Rediss => "rediss",
+      Self::Ssh => "ssh",
+    }
+  }
+
+  /// Every scheme the proxy serves, in enum order.
+  pub const ALL: [Self; 7] = [
+    Self::Http,
+    Self::Https,
+    Self::Tcp,
+    Self::Postgres,
+    Self::Redis,
+    Self::Rediss,
+    Self::Ssh,
+  ];
+}
+
 /// One real secret and the decoy that stands in for it. Shared by every
 /// grant kind, because substitution only ever needs these three.
 #[derive(Debug, Clone)]
@@ -767,6 +794,12 @@ mod tests {
   fn redis_grant(fake: &str, real: &str) -> Grant {
     let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
     resolved.grants.into_iter().next().unwrap()
+  }
+
+  #[test]
+  fn scheme_all_names() {
+    let names: Vec<_> = Scheme::ALL.iter().copied().map(Scheme::as_str).collect();
+    assert_eq!(names, ["http", "https", "tcp", "postgres", "redis", "rediss", "ssh"]);
   }
 
   #[test]

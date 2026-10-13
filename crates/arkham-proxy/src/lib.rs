@@ -39,8 +39,6 @@ mod e2e;
 mod error;
 mod identity;
 mod mint;
-#[cfg(test)]
-mod protocol_coverage;
 mod transports;
 
 mod relay;

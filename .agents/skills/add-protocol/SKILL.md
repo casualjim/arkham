@@ -33,7 +33,7 @@ test -d crates/arkham-proxy/src/transports/redis \
 
 ## 2. Config, validation, and the demo rule
 
-`Scheme` in `crates/arkham-config/src/grants/mod.rs` is the list of protocols. Redis added `Redis` and `Rediss`. `RuleCfg::value_scheme` in `crates/arkham-config/src/config.rs` recognizes `redis://` and `rediss://`. `GrantCollector::connection_string` dispatches `Scheme::Redis | Scheme::Rediss` to `grants/redis.rs` (`redis::grant`). A connection-string rule has no `allow` entries (`Error::ConnectionStringAllow`); the fake string's port is the match. `Grant::redis` takes `host: Option<&str>` because transparent capture knows the port before it knows a name.
+`Scheme` in `crates/arkham-config/src/grants/mod.rs` is the list of protocols. Redis added `Redis` and `Rediss`, and the same names in `Scheme::as_str` and `Scheme::ALL` (`arkham schemes` prints `ALL`). `RuleCfg::value_scheme` in `crates/arkham-config/src/config.rs` recognizes `redis://` and `rediss://`. `GrantCollector::connection_string` dispatches `Scheme::Redis | Scheme::Rediss` to `grants/redis.rs` (`redis::grant`). A connection-string rule has no `allow` entries (`Error::ConnectionStringAllow`); the fake string's port is the match. `Grant::redis` takes `host: Option<&str>` because transparent capture knows the port before it knows a name.
 
 `IfMissing` defaults to `Error` (`#[default]` on `IfMissing::Error` in `config.rs`). A rule whose secret does not resolve fails startup.
 
@@ -216,7 +216,7 @@ if (REDIS_URL) {
 }
 ```
 
-A shared function that serves two schemes takes a word argument the label also contains (`"plaintext"` or `"tls"`), matching `redisScenarios` in `run.ts`.
+`retry`'s first argument is the scheme that scenario covers (`"redis"`, `"rediss"`). `redisScenarios` picks it from `kind`. A scenario that covers no scheme passes `""` and is not recorded.
 
 ```bash
 rg -n "fn auth_password_reframes_to_any_length|fn upstream_redacts_real_password" crates/arkham-proxy/src/transports/redis/machine.rs \
@@ -252,28 +252,16 @@ gh issue view 23 --json title --jq .title \
 
 For the issue this PR finishes, replace `23` and `44`. Require `Closes #N` when the issue title does not start with `Tracking:`. Require `Refs #N` when it does.
 
-## 11. End-to-end coverage gate
+## 11. Scheme coverage
 
-`supported_and_configured_protocols_have_live_e2e_scenarios` in `crates/arkham-proxy/src/protocol_coverage.rs` fails the build when a protocol is supported or configured and has no live compose scenario. It is a `#[cfg(test)]` module included from `crates/arkham-proxy/src/lib.rs`. There is no hand-maintained manifest.
+A passing `retry(scheme, label, fn)` records `scheme`. When the client finishes, it writes the set to `/out/covered.json`. `integration/compose.yaml` bind-mounts `integration/out` on `/out`.
 
-Supported protocols are the `Scheme` variants in `crates/arkham-config/src/grants/mod.rs` plus directories under `crates/arkham-proxy/src/transports/` except `engine`. The directory name is the protocol id. A scheme maps to the directory of the same name, or to the longest directory name that is a prefix (`https` → `http`, `rediss` → `redis`). A variant with no directory, or a directory with no variant, is a gap.
+`.mise/tasks/test/ssh` runs that client for `tproxy` and `tun`. After a client exits 0 it runs `integration/docker/arkham schemes` and fails, naming each scheme that is missing from `covered.json`. `arkham schemes` prints `Scheme::ALL`. CI runs this on both `rust` matrix legs (`mise build` → `test` → `test:ssh`). Do not add a parser or a second manifest.
 
-Configured protocols are quoted `scheme://` URLs in `integration/arkham.toml`. An unknown scheme (`mysql://` while `Scheme` has no `Mysql`) is a gap.
-
-A live scenario is a `retry()` label in `integration/client/run.ts`:
-
-- The label contains the scheme as an alphanumeric-bounded token, so `https` does not cover `http`.
-- `rediss` has no token in the Redis labels. A label that contains both `redis` and `tls` covers it.
-- The label sits on a path the compose client runs. `const NAME = process.env.KEY` plus `if (NAME) { ... } else { ... }` counts only when `KEY` is in the `client` service `environment` of `integration/compose.yaml`. The `else` arm does not count.
-- A shared function called as `fn("tls")` and `fn("plaintext")` attributes a label to the call whose first word the label contains. A template that does not contain that word runs for every call.
-- `if (!X || Y)` is not an env gate. Use `if (NAME)`.
-
-The test also asserts the parser still sees `Http`, `Https`, `Tcp`, `Postgres`, `Redis`, `Rediss`, and `Ssh`. A new `Scheme` variant is picked up without editing the test.
-
-The test runs inside `mise run test` (`test:rust` → `cargo nextest`, workspace, `--exclude arkham-ebpf-programs`). CI runs that via `mise build` on both matrix legs. Do not run `cargo test` or a nextest filter.
+A new variant goes in `Scheme::as_str` and `Scheme::ALL`, and in a `retry("<scheme>", ...)` call that passes against the official server image. Until that scenario passes, `test:ssh` fails.
 
 ```bash
-rg -n "mod protocol_coverage" crates/arkham-proxy/src/lib.rs \
-  && rg -n "fn supported_and_configured_protocols_have_live_e2e_scenarios" crates/arkham-proxy/src/protocol_coverage.rs \
-  && mise run --force test
+rg -n "covered.json" integration/client/run.ts integration/compose.yaml .mise/tasks/test/ssh \
+  && rg -n "struct SchemesArgs" src/commands.rs \
+  && rg -n "const ALL" crates/arkham-config/src/grants/mod.rs
 ```

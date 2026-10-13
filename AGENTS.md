@@ -121,7 +121,7 @@ Owner: the face (`arkham` binary) owns file/env loading mechanics via `arkham-co
 
 Precedence: CLI > env (`ARKHAM_*`) > project (`<root>/.config/arkham.toml`) > global (`$ARKHAM_CONFIG` or `<config-dir>/arkham/config.toml`). `rules.d` layers are registry-only (bundled `rules/registry.toml`, then global `rules.d`, then project `rules.d`).
 
-Subcommands are enum variants with args that own a `run` method — never separate binaries. Current set: `serve` (default), `fake`, `ca`, `rules`, `config`, `registry` (curate), `init`, `agent`, `fwd` (stack sidecar, not a user command), `up`, `down`, `logs`. Add an entrypoint by adding a variant plus its args struct, not a new package.
+Subcommands are enum variants with args that own a `run` method — never separate binaries. Current set: `serve` (default), `fake`, `schemes`, `ca`, `rules`, `config`, `registry` (curate), `init`, `agent`, `fwd` (stack sidecar, not a user command), `up`, `down`, `logs`. Add an entrypoint by adding a variant plus its args struct, not a new package.
 
 ## Coding Standards
 
@@ -176,7 +176,7 @@ Do:
 
 When adding a capture backend: add an arm to the face dispatch plus one crate that depends on proxy/config only, reusing `serve_transparent_stream`; never copy the `with_capture` block.
 
-When adding a wire protocol: follow [`.agents/skills/add-protocol/SKILL.md`](.agents/skills/add-protocol/SKILL.md). Redis (PR #44, `11ce4a8`) is the worked example: a vertical under `crates/arkham-proxy/src/transports/`, grant types in `arkham-config`, and a compose scenario the protocol-coverage test requires.
+When adding a wire protocol: follow [`.agents/skills/add-protocol/SKILL.md`](.agents/skills/add-protocol/SKILL.md). Redis (PR #44, `11ce4a8`) is the worked example: a vertical under `crates/arkham-proxy/src/transports/`, grant types in `arkham-config`, and a compose scenario whose `retry` records the scheme.
 
 When adding a WIT world or plugin hook: extend `arkham-plugin/wit/world.wit` plus the `arkham-plugin` host, keep grant ownership in config and secret ownership in the relay, and fail guest errors closed to `Verdict::Close`.
 

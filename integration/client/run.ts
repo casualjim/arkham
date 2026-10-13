@@ -6,7 +6,7 @@
 // 90s for the whole run — the demo never sits silent.
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { RedisClient } from "bun";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
@@ -81,7 +81,9 @@ async function readAll(sock: Socket | TLSSocket): Promise<string> {
   }));
 }
 
-async function retry(what: string, fn: () => Promise<boolean>) {
+const covered = new Set<string>();
+
+async function retry(scheme: string, what: string, fn: () => Promise<boolean>) {
   const deadline = Date.now() + SCENARIO_BUDGET_MS;
   let last = "no attempt completed";
   for (let attempt = 1; attempt <= 100; attempt++) {
@@ -92,6 +94,7 @@ async function retry(what: string, fn: () => Promise<boolean>) {
     try {
       stage(`${what} attempt ${attempt}`);
       if (await fn()) {
+        if (scheme) covered.add(scheme);
         console.log(`PASS ${what}`);
         return;
       }
@@ -109,7 +112,7 @@ const ca = await readFile(`${CERT_DIR}/ca.crt`);
 
 // 1. https:// grant, HTTP over MITM TLS: server must see the real bearer;
 //    the redacted body comes back carrying the fake.
-await retry("https mitm substitutes request and redacts response", async () => {
+await retry("https", "https mitm substitutes request and redacts response", async () => {
   const tls = await tlsTo("api", 8443, ca);
   stage("http request sent");
   tls.write(`GET /echo HTTP/1.1\r\nHost: api\r\nAuthorization: Bearer ${FAKE}\r\nConnection: close\r\n\r\n`);
@@ -123,7 +126,7 @@ await retry("https mitm substitutes request and redacts response", async () => {
 
 // 2. http:// grant, cleartext HTTP through transparent capture: server must
 //    see the real bearer; the redacted body comes back carrying the fake.
-await retry("http mitm substitutes request and redacts response", async () => {
+await retry("http", "http mitm substitutes request and redacts response", async () => {
   stage("http api:8000 connecting");
   const sock = await race("http api:8000 connect", new Promise<Socket>((resolve, reject) => {
     const s = connect(8000, "api");
@@ -140,7 +143,7 @@ await retry("http mitm substitutes request and redacts response", async () => {
 });
 
 // 3. tcp:// grant, cleartext raw stream: opaque substitution both ways.
-await retry("tcp raw substitutes both directions", async () => {
+await retry("tcp", "tcp raw substitutes both directions", async () => {
   stage("tcp api:9000 connecting");
   const sock = await race("tcp api:9000 connect", new Promise<Socket>((resolve, reject) => {
     const s = connect(9000, "api");
@@ -153,15 +156,16 @@ await retry("tcp raw substitutes both directions", async () => {
 
 // 4. https:// grant, non-HTTP payload inside MITM TLS: raw machines on the
 //    terminated legs.
-await retry("tcp over tls mitm substitutes both directions", async () => {
+await retry("https", "tcp over tls mitm substitutes both directions", async () => {
   const tls = await tlsTo("api", 9443, ca);
   return (await exchange(tls, `AUTH ${FAKE}\n`)) === `OK ${FAKE}\n`;
 });
 
 // 5. No grant: arkham never terminates the TLS, the handshake passes through
 //    to the api server (its own CA-signed leaf verifies), and the fake
-//    arrives untouched, so the server rejects it.
-await retry("grantless tls splices untouched", async () => {
+//    arrives untouched, so the server rejects it. Empty scheme: this splice
+//    covers no `Scheme`.
+await retry("", "grantless tls splices untouched", async () => {
   const tls = await tlsTo("api", 9444, ca);
   return (await exchange(tls, `AUTH ${FAKE}\n`)) === `ERR ${FAKE}\n`;
 });
@@ -206,7 +210,7 @@ if (PG_URL) {
       sock.once("error", reject);
     }));
   }
-  await retry("postgres mitm swaps the password for a real server", async () => {
+  await retry("postgres", "postgres mitm swaps the password for a real server", async () => {
     const db = new URL(PG_URL);
     stage(`pg ${db.hostname}:${db.port || 5432} connecting`);
     const sock = await race("pg connect", new Promise<Socket>((resolve, reject) => {
@@ -259,7 +263,7 @@ if (PG_URL) {
 //    is minted as a decoy (never the real value), and that decoy swaps back
 //    to the real access token on the API call. Garbage tokens stay
 //    unauthorized.
-await retry("oauth2 token endpoint mints and the minted decoy substitutes", async () => {
+await retry("http", "oauth2 token endpoint mints and the minted decoy substitutes", async () => {
   const basic = Buffer.from(`demo-client:${OIDC_FAKE_SECRET}`).toString("base64");
   const tokenResp = await fetch("http://api:8000/token", {
     method: "POST",
@@ -313,7 +317,7 @@ const sshCommand = [
   "ssh-ok",
 ];
 if (SSH_DST) {
-  await retry("ssh decoy in, real key out", async () => {
+  await retry("ssh", "ssh decoy in, real key out", async () => {
     const proc = Bun.spawn(sshCommand, { stdout: "pipe", stderr: "pipe" });
     const out = await new Response(proc.stdout).text();
     const err = await new Response(proc.stderr).text();
@@ -413,6 +417,7 @@ function helloHasProto3(reply: unknown): boolean {
 // pipelined PING and SET, and a rejected password follow the same client.
 async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
   const tls = kind === "tls";
+  const scheme = tls ? "rediss" : "redis";
   const requirepass =
     kind === "plaintext" ? "redis plaintext requirepass auth swaps password" : "redis tls requirepass auth over arkham MITM";
   const hello = kind === "plaintext" ? "redis plaintext HELLO 3 AUTH via send" : "redis tls HELLO 3 AUTH via send";
@@ -420,7 +425,7 @@ async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
   const key = kind === "tls" ? "tls_test_key" : "test_key";
   const value = kind === "tls" ? "tls_test_value" : "test_value";
 
-  await retry(requirepass, async () => {
+  await retry(scheme, requirepass, async () => {
     const client = openRedis(passwordOnly(raw), tls);
     try {
       await client.connect();
@@ -432,7 +437,7 @@ async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
     }
   });
 
-  await retry(`redis ${kind} ACL username+password`, async () => {
+  await retry(scheme, `redis ${kind} ACL username+password`, async () => {
     const client = openRedis(raw, tls);
     try {
       await client.connect();
@@ -444,7 +449,7 @@ async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
     }
   });
 
-  await retry(hello, async () => {
+  await retry(scheme, hello, async () => {
     const redisUrl = new URL(raw);
     const client = openRedis(raw, tls);
     try {
@@ -458,7 +463,7 @@ async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
     }
   });
 
-  await retry(pipelined, async () => {
+  await retry(scheme, pipelined, async () => {
     const client = openRedis(raw, tls);
     try {
       await client.connect();
@@ -470,7 +475,7 @@ async function redisScenarios(kind: "plaintext" | "tls", raw: string) {
     }
   });
 
-  await retry(`redis ${kind} WRONGPASS without real secret leak`, async () => {
+  await retry(scheme, `redis ${kind} WRONGPASS without real secret leak`, async () => {
     const errMsg = await redisFailureText(raw, tls);
     stage(`redis ${kind} WRONGPASS error: ${errMsg}`);
     return errMsg.includes("WRONGPASS") && !errMsg.includes("arkham_real_redis_pass");
@@ -489,5 +494,6 @@ if (REDIS_TLS_URL) {
   stage("redis tls scenarios skipped: no REDIS_TLS_URL");
 }
 
+await writeFile("/out/covered.json", `${JSON.stringify([...covered].sort())}\n`);
 console.log("all scenarios passed");
 process.exit(0);

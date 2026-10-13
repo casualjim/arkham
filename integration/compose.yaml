@@ -205,6 +205,7 @@ services:
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
+      - ./out:/out
     network_mode: service:arkham
     depends_on:
       arkham:

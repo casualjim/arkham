@@ -15,7 +15,7 @@ use arkham_fnox::FnoxSource;
 use clap::{Parser, Subcommand};
 
 use arkham_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
-use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, ServeArgs};
+use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
 
 #[derive(Parser, Debug)]
 #[command(name = "arkham", about = "grant-scoped MITM proxy", version)]
@@ -35,6 +35,8 @@ enum Command {
   Serve(ServeArgs),
   /// Print the deterministic fake for an env var name.
   Fake(FakeArgs),
+  /// Print each supported URL scheme, one per line.
+  Schemes(SchemesArgs),
   /// Generate (or load) the CA, print its certificate PEM to stdout, and write
   /// the certificate and the key beside the CA file as `ca.crt` and `ca.key`.
   ///
@@ -120,6 +122,7 @@ async fn main() -> eyre::Result<()> {
   match command {
     Command::Serve(args) => args.run(&cli, arkham_version).await?,
     Command::Fake(args) => args.run(&cli, arkham_version).await?,
+    Command::Schemes(args) => args.run(&cli, arkham_version).await?,
     Command::Ca(args) => args.run(&cli, arkham_version).await?,
     Command::Rules(args) => args.run(&cli, arkham_version).await?,
     Command::Config(args) => args.run(&cli, arkham_version).await?,
