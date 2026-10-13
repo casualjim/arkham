@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::Deserialize;
+use serde::de::Deserializer;
 use url::{Host, Url};
 
 use crate::config::{RuleCfg, validate_pattern};
@@ -68,6 +69,50 @@ impl OAuthFlow {
   }
 }
 
+/// Where one credential value travels on a request.
+///
+/// Exactly one of `header`, `query`, or `json` is set. `claim` is set only
+/// with `header`, when that header carries a token and the value is a claim
+/// inside it rather than the raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePlace {
+  /// Header name.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub header: Option<String>,
+  /// Query-parameter name.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub query: Option<String>,
+  /// JSON field name.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub json: Option<String>,
+  /// Claim name when `header` carries a token instead of the raw value.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub claim: Option<String>,
+}
+
+/// A signing secret: an algorithm input that never itself travels on the wire.
+///
+/// `scheme` is one name (`hmac-sha256`) or several when the vendor accepts
+/// more than one (`["es256", "ed25519"]`). Exactly one of `header`, `query`,
+/// or `json` names where the signature, not the secret, is placed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signing {
+  /// Signing scheme names.
+  #[serde(deserialize_with = "one_or_many")]
+  pub scheme: Vec<String>,
+  /// Header that carries the signature.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub header: Option<String>,
+  /// Query parameter that carries the signature.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub query: Option<String>,
+  /// JSON field that carries the signature.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub json: Option<String>,
+}
+
 /// What the registry knows about one environment name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KnownHosts {
@@ -77,6 +122,10 @@ pub struct KnownHosts {
   pub pattern: Option<String>,
   /// `OAuth2` token-issuer flow, if any entry declares one.
   pub oauth2: Option<OAuthFlow>,
+  /// Signing-secret declaration, when this name is an algorithm input.
+  pub signing: Option<Signing>,
+  /// Where this name's value is sent, when it travels on the wire.
+  pub send: Vec<WirePlace>,
 }
 
 /// Known hosts and decoy shapes: bundled table plus `rules.d` overrides.
@@ -134,6 +183,13 @@ struct ProviderEntry {
   /// `OAuth2` flow this provider's token issuer runs, if any.
   #[serde(default)]
   oauth2: Option<OAuthFlow>,
+  /// Where the claimed values travel. One placement, or a list when the
+  /// entry covers more than one header, query parameter, or JSON field.
+  #[serde(default, deserialize_with = "one_or_many")]
+  send: Vec<WirePlace>,
+  /// Set when every claimed name is a signing secret.
+  #[serde(default)]
+  signing: Option<Signing>,
 }
 
 /// One exact environment-name entry.
@@ -152,6 +208,12 @@ struct NameEntry {
   /// `OAuth2` flow this name's token issuer runs, if any.
   #[serde(default)]
   oauth2: Option<OAuthFlow>,
+  /// Where this name's value travels.
+  #[serde(default, deserialize_with = "one_or_many")]
+  send: Vec<WirePlace>,
+  /// Set when this name is a signing secret.
+  #[serde(default)]
+  signing: Option<Signing>,
 }
 
 impl Registry {
@@ -240,12 +302,16 @@ impl Registry {
     if let Some(flow) = &entry.oauth2 {
       validate_flow(flow, &source.display().to_string(), provider)?;
     }
+    validate_signing(entry.signing.as_ref(), source, "provider", provider)?;
+    validate_send(&entry.send, source, "provider", provider)?;
     for env in &entry.env {
       let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
       if entry.replace {
         slot.hosts.clear();
         slot.pattern = None;
         slot.oauth2 = None;
+        slot.signing = None;
+        slot.send.clear();
       }
       for host in &entry.hosts {
         if !slot.hosts.contains(host) {
@@ -258,6 +324,13 @@ impl Registry {
       if entry.oauth2.is_some() {
         slot.oauth2.clone_from(&entry.oauth2);
       }
+      if entry.signing.is_some() {
+        slot.signing.clone_from(&entry.signing);
+      }
+      if !entry.send.is_empty() {
+        slot.send.clone_from(&entry.send);
+      }
+      validate_loaded_credential(slot, source, env)?;
     }
     if entry.replace {
       self.contains.retain(|rule| rule.provider != provider);
@@ -292,11 +365,15 @@ impl Registry {
     if let Some(flow) = &entry.oauth2 {
       validate_flow(flow, &source.display().to_string(), env)?;
     }
+    validate_signing(entry.signing.as_ref(), source, "name", env)?;
+    validate_send(&entry.send, source, "name", env)?;
     let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
     if entry.replace {
       slot.hosts.clear();
       slot.pattern = None;
       slot.oauth2 = None;
+      slot.signing = None;
+      slot.send.clear();
     }
     for host in &entry.hosts {
       if !slot.hosts.contains(host) {
@@ -309,6 +386,13 @@ impl Registry {
     if entry.oauth2.is_some() {
       slot.oauth2.clone_from(&entry.oauth2);
     }
+    if entry.signing.is_some() {
+      slot.signing.clone_from(&entry.signing);
+    }
+    if !entry.send.is_empty() {
+      slot.send.clone_from(&entry.send);
+    }
+    validate_loaded_credential(slot, source, env)?;
     Ok(())
   }
 
@@ -497,6 +581,156 @@ fn validate_hosts(hosts: &[String], source: &Path, kind: &str, name: &str) -> Re
       let what = format!("{kind} `{name}`");
       tracing::warn!(file = %source.display(), entry = %host, what, "grant matches any host; secret is exfil-risky");
     }
+  }
+  Ok(())
+}
+
+/// Accept one placement table or a list of them.
+fn one_or_many<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+  D: Deserializer<'de>,
+  T: Deserialize<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(untagged)]
+  enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+  }
+  Ok(match OneOrMany::<T>::deserialize(deserializer)? {
+    OneOrMany::One(item) => vec![item],
+    OneOrMany::Many(items) => items,
+  })
+}
+
+/// File and entry named by a placement error.
+#[derive(Clone, Copy)]
+struct PlaceCtx<'a> {
+  source: &'a Path,
+  kind: &'a str,
+  name: &'a str,
+  what: &'a str,
+}
+
+/// A placement names exactly one of header, query, or json, and each named
+/// field is non-empty. `claim` is only meaningful beside a header.
+fn validate_place(
+  header: Option<&str>,
+  query: Option<&str>,
+  json: Option<&str>,
+  claim: Option<&str>,
+  ctx: PlaceCtx<'_>,
+) -> Result<(), Error> {
+  let mut named = 0_u8;
+  for (field, value) in [("header", header), ("query", query), ("json", json)] {
+    if let Some(value) = value {
+      if value.is_empty() {
+        return Err(Error::BadCredentialPlace {
+          file: ctx.source.to_path_buf(),
+          kind: ctx.kind.to_string(),
+          name: ctx.name.to_string(),
+          detail: format!("`{field}` must not be empty"),
+        });
+      }
+      named = named.saturating_add(1);
+    }
+  }
+  if named != 1 {
+    return Err(Error::BadCredentialPlace {
+      file: ctx.source.to_path_buf(),
+      kind: ctx.kind.to_string(),
+      name: ctx.name.to_string(),
+      detail: format!("`{}` must name exactly one of `header`, `query`, or `json`", ctx.what),
+    });
+  }
+  if let Some(claim) = claim {
+    if claim.is_empty() {
+      return Err(Error::BadCredentialPlace {
+        file: ctx.source.to_path_buf(),
+        kind: ctx.kind.to_string(),
+        name: ctx.name.to_string(),
+        detail: "`claim` must not be empty".to_string(),
+      });
+    }
+    if header.is_none() {
+      return Err(Error::BadCredentialPlace {
+        file: ctx.source.to_path_buf(),
+        kind: ctx.kind.to_string(),
+        name: ctx.name.to_string(),
+        detail: "`claim` is only valid with `header`".to_string(),
+      });
+    }
+  }
+  Ok(())
+}
+
+/// Validate a signing block's scheme list and signature placement.
+fn validate_signing(signing: Option<&Signing>, source: &Path, kind: &str, name: &str) -> Result<(), Error> {
+  let Some(signing) = signing else {
+    return Ok(());
+  };
+  if signing.scheme.is_empty() || signing.scheme.iter().any(String::is_empty) {
+    return Err(Error::BadCredentialPlace {
+      file: source.to_path_buf(),
+      kind: kind.to_string(),
+      name: name.to_string(),
+      detail: "signing `scheme` must not be empty".to_string(),
+    });
+  }
+  validate_place(
+    signing.header.as_deref(),
+    signing.query.as_deref(),
+    signing.json.as_deref(),
+    None,
+    PlaceCtx {
+      source,
+      kind,
+      name,
+      what: "signing",
+    },
+  )
+}
+
+/// Validate every `send` placement on one entry.
+fn validate_send(send: &[WirePlace], source: &Path, kind: &str, name: &str) -> Result<(), Error> {
+  for place in send {
+    validate_place(
+      place.header.as_deref(),
+      place.query.as_deref(),
+      place.json.as_deref(),
+      place.claim.as_deref(),
+      PlaceCtx {
+        source,
+        kind,
+        name,
+        what: "send",
+      },
+    )?;
+  }
+  Ok(())
+}
+
+/// A signing secret grants nothing and is not itself a sent value. A sent
+/// value grants at least one host. Checked on the merged entry so a later
+/// layer cannot put hosts back onto a signing secret.
+fn validate_loaded_credential(known: &KnownHosts, source: &Path, name: &str) -> Result<(), Error> {
+  if known.signing.is_some() && !known.hosts.is_empty() {
+    return Err(Error::SigningHasHosts {
+      file: source.to_path_buf(),
+      name: name.to_string(),
+    });
+  }
+  if known.signing.is_some() && !known.send.is_empty() {
+    return Err(Error::SigningDeclaresSend {
+      file: source.to_path_buf(),
+      name: name.to_string(),
+    });
+  }
+  if !known.send.is_empty() && known.hosts.is_empty() {
+    return Err(Error::SendWithoutHosts {
+      file: source.to_path_buf(),
+      name: name.to_string(),
+    });
   }
   Ok(())
 }
@@ -1020,39 +1254,194 @@ hosts = ["https://api.example/path"]
     assert!(err.to_string().contains("duplicate `token_fields` entry"), "{err:?}");
   }
 
+  /// A concrete hostname the entry must grant: the exact host, or one
+  /// subdomain when the entry is a wildcard.
+  fn concrete_host(pat: &HostPat) -> String {
+    match pat {
+      HostPat::Exact(host) => host.clone(),
+      HostPat::Wildcard(pattern) => {
+        let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
+        format!("a.{suffix}")
+      }
+      HostPat::Any => "example.com".to_string(),
+    }
+  }
+
   #[test]
-  fn signing_only_secrets_have_no_hosts() {
+  fn declared_signing_secrets_grant_nothing_and_keep_a_decoy() {
     let registry = Registry::load(None).unwrap();
-    // Known signing-only secrets: HMAC/SigV4 inputs that never reach the wire.
-    // These must have no hosts (no rule), only decoy shape.
-    // See https://github.com/casualjim/arkham/issues/14 and #19.
-    for env in [
-      "AWS_SECRET_ACCESS_KEY",
-      "EXOSCALE_SECRET_KEY",
-      "EXOSCALE_SECRET",
-      "POLYMARKET_SECRET",
-      "POLYMARKET_SECRET_KEY",
-      // Exchange secrets (spot check a few)
-      "BINANCE_API_SECRET",
-      "BINANCE_SECRET",
-      "OKX_API_SECRET",
-      "KRAKEN_API_SECRET",
-    ] {
-      let known = registry.lookup(env);
-      match known {
-        None => {
-          // Acceptable: no registry entry at all means no rule
-        }
-        Some(entry) => {
-          assert!(
-            entry.hosts.is_empty(),
-            "{env} is a signing-only secret but has hosts: {:?}. \
-             Signing secrets never reach the wire and must not have hosts \
-             (they can have a pattern for decoy shape only).",
-            entry.hosts
-          );
-        }
+    let mut saw = false;
+    for (env, known) in &registry.names {
+      let Some(signing) = &known.signing else {
+        continue;
+      };
+      saw = true;
+      assert!(!signing.scheme.is_empty(), "{env} signing scheme is empty");
+      assert_eq!(known.hosts, [] as [String; 0], "{env} signing secret has hosts");
+      assert_eq!(known.send, [] as [WirePlace; 0], "{env} signing secret also declares send");
+      let shape = registry.template(env, None);
+      let expected = known.pattern.as_deref().unwrap_or(DEFAULT_PATTERN);
+      assert_eq!(shape.as_ref(), expected, "{env} decoy shape");
+    }
+    assert!(saw, "bundled registry declares no signing secrets");
+  }
+
+  #[test]
+  fn declared_send_placements_match_their_hosts() {
+    let registry = Registry::load(None).unwrap();
+    let mut saw = false;
+    for (env, known) in &registry.names {
+      if known.send.is_empty() {
+        continue;
+      }
+      saw = true;
+      assert!(known.signing.is_none(), "{env} declares both send and signing");
+      assert!(!known.hosts.is_empty(), "{env} declares send but grants no host");
+      for entry in &known.hosts {
+        let scope = entry
+          .parse::<EndpointScope>()
+          .unwrap_or_else(|err| panic!("{env} host {entry} does not parse: {err}"));
+        let concrete = concrete_host(&scope.host);
+        assert!(
+          uri_match(std::slice::from_ref(&scope), scope.scheme, &concrete, scope.port),
+          "{env} host {entry} does not match {concrete}"
+        );
       }
     }
+    assert!(saw, "bundled registry declares no send placements");
+  }
+
+  #[test]
+  fn signing_secret_with_hosts_is_rejected() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+[providers.bad]
+env = ["BAD_SECRET"]
+hosts = ["https://api.example.com"]
+signing = { scheme = "hmac-sha256", header = "X-SIGN" }
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("signing secret declares hosts"), "{err:?}");
+  }
+
+  #[test]
+  fn send_without_hosts_is_rejected() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+[providers.bad]
+env = ["BAD_KEY"]
+send = { header = "X-API-KEY" }
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("grants no host"), "{err:?}");
+  }
+
+  #[test]
+  fn signing_over_an_earlier_host_grant_is_rejected() {
+    let global = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    write_rules(
+      global.path(),
+      "10-hosts.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_KEY"]
+hosts = ["https://api.example.com"]
+"#,
+    );
+    write_rules(
+      project.path(),
+      "10-signing.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_KEY"]
+signing = { scheme = "hmac-sha256", header = "X-SIGN" }
+"#,
+    );
+    let err = Registry::load_union(Some(global.path()), Some(project.path())).unwrap_err();
+    assert!(err.to_string().contains("signing secret declares hosts"), "{err:?}");
+  }
+
+  #[test]
+  fn replace_clears_hosts_when_a_name_becomes_a_signing_secret() {
+    let global = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    write_rules(
+      global.path(),
+      "10-hosts.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_SECRET"]
+hosts = ["https://api.example.com"]
+"#,
+    );
+    write_rules(
+      project.path(),
+      "10-signing.toml",
+      r#"
+[providers.venue]
+env = ["VENUE_SECRET"]
+replace = true
+signing = { scheme = "hmac-sha256", query = "signature" }
+"#,
+    );
+    let registry = Registry::load_union(Some(global.path()), Some(project.path())).unwrap();
+    let known = registry.lookup("VENUE_SECRET").expect("VENUE_SECRET");
+    assert_eq!(known.hosts, [] as [String; 0]);
+    let signing = known.signing.as_ref().expect("signing");
+    assert_eq!(signing.scheme, ["hmac-sha256"]);
+    assert_eq!(signing.query.as_deref(), Some("signature"));
+  }
+
+  #[test]
+  fn send_accepts_one_placement_or_a_list() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-send.toml",
+      r#"
+[providers.one]
+env = ["ONE_KEY"]
+hosts = ["https://api.example.com"]
+send = { header = "X-API-KEY", claim = "sub" }
+
+[providers.many]
+env = ["MANY_KEY"]
+hosts = ["https://*.example.com"]
+send = [{ header = "ACCESS-KEY" }, { header = "ACCESS-PASSPHRASE" }]
+"#,
+    );
+    let registry = Registry::load(Some(dir.path())).unwrap();
+    let one = registry.lookup("ONE_KEY").expect("ONE_KEY");
+    assert_eq!(one.send.len(), 1);
+    assert_eq!(one.send[0].header.as_deref(), Some("X-API-KEY"));
+    assert_eq!(one.send[0].claim.as_deref(), Some("sub"));
+    let many = registry.lookup("MANY_KEY").expect("MANY_KEY");
+    assert_eq!(many.send.len(), 2);
+  }
+
+  #[test]
+  fn wire_placement_must_name_one_field() {
+    let dir = tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+[providers.bad]
+env = ["BAD_KEY"]
+hosts = ["https://api.example.com"]
+send = { claim = "sub" }
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("exactly one of `header`, `query`, or `json`"), "{err:?}");
   }
 }
