@@ -31,8 +31,9 @@ fi
 backends=${ARKHAM_TEST_BACKENDS:-"tproxy tun"}
 # Compose interpolates these on every `up` and `down`. Export them for the
 # whole loop so a command that does not prefix them does not warn.
-export HOST_UID="$(id -u)"
-export HOST_GID="$(id -g)"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+export HOST_UID HOST_GID
 
 # The debug binary comes from the `build:debug` dependency; compose mounts
 # it from here (the image is runtime-only, no build stage).
