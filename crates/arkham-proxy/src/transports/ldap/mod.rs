@@ -20,7 +20,7 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use arkham_config::grants::{GuestTlsMode, LdapScope, RootCert};
+use arkham_config::grants::{Grant, GuestTlsMode, LdapScope, RootCert};
 use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
@@ -256,7 +256,7 @@ impl LdapTransport {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     let swap = !pump.upgrade_upstream;
-    match read_first(&mut guest, pump).await? {
+    match read_first(&mut guest, pump.ctx.grants, pump.ctx.host, pump.ctx.port).await? {
       First::Eof | First::Close => Ok(()),
       First::Relay(prefix) => {
         let (mut downstream, mut upstream) = ldap_pair(pump.ctx, swap);
@@ -334,12 +334,13 @@ fn read_count(result: Result<usize, IoError>) -> Result<usize, IoError> {
 
 /// Read the guest one byte at a time until the first message is `StartTLS`
 /// or it is clearly something else. Stopping at that point leaves the
-/// handshake, or the rest of a bind, unread in the socket.
-async fn read_first<R>(guest: &mut R, pump: &Pump<'_>) -> Result<First, Error>
+/// handshake, or the rest of a bind, unread in the socket. A `StartTLS`
+/// control tail longer than [`machine::STARTTLS_CONTROLS_MAX`] closes.
+async fn read_first<R>(guest: &mut R, grants: &[Grant], host: &str, port: u16) -> Result<First, Error>
 where
   R: AsyncRead + Unpin,
 {
-  let mut probe = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Downstream, false);
+  let mut probe = Ldap::new(grants, host, port, Direction::Downstream, false);
   let mut got = Vec::new();
   let mut byte = [0u8; 1];
   loop {
@@ -479,4 +480,139 @@ pub(crate) fn ldap_pair(ctx: &PairCtx<'_>, swap: bool) -> (Ldap, Ldap) {
     Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap),
     Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream, false),
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use std::io::Cursor;
+
+  use arkham_config::grants::Credential;
+  use rasn::prelude::OctetString;
+  use rasn_ldap::{AuthenticationChoice, BindRequest, Control, ExtendedRequest, LdapMessage, LdapString, ProtocolOp};
+  use secrecy::SecretString;
+
+  use super::machine::STARTTLS_CONTROLS_MAX;
+  use super::*;
+
+  const FAKE_PW: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
+  const REAL_PW: &str = "arkham_real_ldap_pass_01"; // betterleaks:allow
+  const DN: &str = "cn=Directory Manager";
+  const STARTTLS_OID: &[u8] = b"1.3.6.1.4.1.1466.20037";
+
+  fn grants() -> Vec<Grant> {
+    let scope = LdapScope::from_strings(
+      &format!("ldap://{}:{FAKE_PW}@ldap:389", encode_dn(DN)),
+      &format!("ldap://{}:{REAL_PW}@ldap:389", encode_dn(DN)),
+    )
+    .unwrap();
+    vec![Grant::Ldap {
+      credential: Credential {
+        label: "ldap".into(),
+        fake: FAKE_PW.into(),
+        value: SecretString::from(REAL_PW),
+      },
+      scope: Box::new(scope),
+    }]
+  }
+
+  fn encode_dn(dn: &str) -> String {
+    dn.replace('=', "%3D").replace(' ', "%20").replace(',', "%2C")
+  }
+
+  fn bind_frame() -> Vec<u8> {
+    let message = LdapMessage::new(
+      1,
+      ProtocolOp::BindRequest(BindRequest::new(
+        3,
+        LdapString::from(DN),
+        AuthenticationChoice::Simple(OctetString::from(FAKE_PW.as_bytes())),
+      )),
+    );
+    rasn::ber::encode(&message).unwrap()
+  }
+
+  fn starttls_frame(controls: bool) -> Vec<u8> {
+    let mut message = LdapMessage::new(
+      4,
+      ProtocolOp::ExtendedReq(ExtendedRequest {
+        request_name: OctetString::from_static(STARTTLS_OID),
+        request_value: None,
+      }),
+    );
+    if controls {
+      message.controls = Some(vec![Control::new(OctetString::from_static(b"1.2.840.113556.1.4.319"), true, None)]);
+    }
+    rasn::ber::encode(&message).unwrap()
+  }
+
+  /// Keep the encoded content and announce `extra` more outer bytes.
+  fn announce_extra(frame: &[u8], extra: usize) -> Vec<u8> {
+    let lead = frame.get(1).copied().unwrap();
+    let (header, content_len) = if lead < 0x80 {
+      (2, usize::from(lead))
+    } else {
+      let octets = usize::from(lead & 0x7f);
+      let mut len = 0usize;
+      for byte in frame.get(2..2 + octets).unwrap() {
+        len = (len << 8) | usize::from(*byte);
+      }
+      (2 + octets, len)
+    };
+    let content = frame.get(header..header + content_len).unwrap();
+    let new_len = u32::try_from(content_len + extra).unwrap();
+    let mut out = Vec::with_capacity(6 + content.len());
+    out.push(0x30);
+    out.push(0x84);
+    out.extend_from_slice(&new_len.to_be_bytes());
+    out.extend_from_slice(content);
+    out
+  }
+
+  #[tokio::test]
+  async fn starttls_with_controls_keeps_the_handshake_unread() {
+    let frame = starttls_frame(true);
+    let extra = b"\x16handshake";
+    let mut bytes = frame.clone();
+    bytes.extend_from_slice(extra);
+    let mut guest = Cursor::new(bytes);
+    let First::StartTls { id, request, handshake } = read_first(&mut guest, &grants(), "ldap", 389).await.unwrap() else {
+      panic!("starttls");
+    };
+    assert_eq!(id, 4);
+    assert_eq!(request, frame);
+    assert_eq!(handshake, [] as [u8; 0]);
+    let mut rest = Vec::new();
+    guest.read_to_end(&mut rest).await.unwrap();
+    assert_eq!(rest, extra);
+  }
+
+  #[tokio::test]
+  async fn starttls_control_tail_over_the_bound_closes() {
+    let head = announce_extra(&starttls_frame(false), STARTTLS_CONTROLS_MAX + 1);
+    let unread = [0x11, 0x22, 0x33, 0x44];
+    let mut bytes = head;
+    bytes.extend_from_slice(&unread);
+    let mut guest = Cursor::new(bytes);
+    let first = read_first(&mut guest, &grants(), "ldap", 389).await.unwrap();
+    assert!(matches!(first, First::Close));
+    let mut rest = Vec::new();
+    guest.read_to_end(&mut rest).await.unwrap();
+    assert_eq!(rest, unread);
+  }
+
+  #[tokio::test]
+  async fn bind_opener_relays_from_the_prefix() {
+    let frame = bind_frame();
+    let mut guest = Cursor::new(frame.clone());
+    let First::Relay(prefix) = read_first(&mut guest, &grants(), "ldap", 389).await.unwrap() else {
+      panic!("relay");
+    };
+    assert!(prefix.len() < frame.len());
+    assert!(frame.starts_with(&prefix));
+    let mut rest = Vec::new();
+    guest.read_to_end(&mut rest).await.unwrap();
+    let mut whole = prefix;
+    whole.extend(rest);
+    assert_eq!(whole, frame);
+  }
 }

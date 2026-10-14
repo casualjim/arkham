@@ -23,6 +23,10 @@ use crate::transports::engine::{
 /// `StartTLS` extended operation OID (RFC 4511).
 const STARTTLS_OID: &[u8] = b"1.3.6.1.4.1.1466.20037";
 
+/// Controls that may follow a `StartTLS` OID. A real control set is a few
+/// small TLVs. A longer announcement is closed and not read.
+pub(crate) const STARTTLS_CONTROLS_MAX: usize = 512;
+
 /// `APPLICATION 0` constructed: `BindRequest`.
 const BIND_REQUEST_TAG: u8 = 0x60;
 
@@ -499,6 +503,9 @@ impl Ldap {
         Ok(Step::Done)
       }
       ExtParse::StartTls { id } => {
+        if peek.left > STARTTLS_CONTROLS_MAX {
+          return Err(());
+        }
         self.pass(&peek.buf, out, hits).await?;
         if peek.left == 0 {
           self.prefix = input.to_vec();
