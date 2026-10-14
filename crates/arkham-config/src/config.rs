@@ -415,6 +415,10 @@ impl RuleCfg {
       Some(Scheme::Smtps)
     } else if value.starts_with("smtp://") {
       Some(Scheme::Smtp)
+    } else if value.starts_with("ldaps://") {
+      Some(Scheme::Ldaps)
+    } else if value.starts_with("ldap://") {
+      Some(Scheme::Ldap)
     } else {
       None
     }

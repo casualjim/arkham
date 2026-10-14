@@ -154,6 +154,14 @@ pub enum Error {
     /// Parse failure.
     detail: String,
   },
+  /// An LDAP connection string does not parse.
+  #[error("rule `{label}`: {detail}")]
+  LdapScope {
+    /// Rule label.
+    label: String,
+    /// Parse failure.
+    detail: String,
+  },
   /// A connection-string rule names a scheme no vertical owns.
   #[error("rule `{label}`: scheme `{scheme:?}` owns no connection-string grant")]
   ConnectionStringScheme {
@@ -476,6 +484,18 @@ pub enum Error {
   /// An SMTP rule states its upstream trust outside the connection string.
   #[error("rule `{label}`: smtp states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
   SmtpTrust {
+    /// Rule label.
+    label: String,
+  },
+  /// An LDAP rule states its upstream identity outside the connection string.
+  #[error("rule `{label}`: ldap states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
+  LdapIdentity {
+    /// Rule label.
+    label: String,
+  },
+  /// An LDAP rule states its upstream trust outside the connection string.
+  #[error("rule `{label}`: ldap states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
+  LdapTrust {
     /// Rule label.
     label: String,
   },

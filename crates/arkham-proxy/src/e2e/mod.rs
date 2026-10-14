@@ -21,6 +21,7 @@ use crate::transports::engine::{Direction, Http, Rewritten, Wire};
 
 mod http;
 mod https;
+mod ldap;
 mod plugin;
 mod postgres;
 mod redis;

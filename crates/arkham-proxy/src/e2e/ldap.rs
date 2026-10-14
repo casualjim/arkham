@@ -1,0 +1,266 @@
+//! LDAP simple bind through the MITM: cleartext swap, `StartTLS` upgrade,
+//! and LDAPS with no SNI.
+
+use super::*;
+use arkham_config::grants::LdapScope;
+use rasn::prelude::OctetString;
+use rasn_ldap::{
+  AuthenticationChoice, BindRequest, BindResponse, ExtendedRequest, ExtendedResponse, LdapMessage, LdapString, ProtocolOp, ResultCode,
+};
+use secrecy::ExposeSecret as _;
+
+const FAKE: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
+const VALUE: &str = "arkham_real_ldap_pass_01"; // betterleaks:allow
+const DN: &str = "cn=Directory Manager";
+const STARTTLS_OID: &[u8] = b"1.3.6.1.4.1.1466.20037";
+
+fn ldap_grant(fake: &str, real: &str) -> Grant {
+  let scope = LdapScope::from_strings(fake, real).unwrap();
+  Grant::Ldap {
+    credential: Credential {
+      label: "ldap".into(),
+      fake: scope.downstream.password.expose_secret().to_string(),
+      value: scope.upstream.password.clone(),
+    },
+    scope: Box::new(scope),
+  }
+}
+
+fn user(dn: &str) -> String {
+  dn.replace('=', "%3D").replace(' ', "%20")
+}
+
+fn bind_message(id: u32, password: &str) -> LdapMessage {
+  LdapMessage::new(
+    id,
+    ProtocolOp::BindRequest(BindRequest::new(
+      3,
+      LdapString::from(DN),
+      AuthenticationChoice::Simple(OctetString::from(password.as_bytes())),
+    )),
+  )
+}
+
+fn encode(message: &LdapMessage) -> Vec<u8> {
+  rasn::ber::encode(message).unwrap()
+}
+
+async fn read_message<S: AsyncRead + Unpin>(conn: &mut S) -> LdapMessage {
+  let mut buf = Vec::new();
+  let mut tmp = [0u8; 1024];
+  loop {
+    let n = conn.read(&mut tmp).await.unwrap();
+    assert!(n > 0, "peer closed before an ldap message");
+    buf.extend_from_slice(&tmp[..n]);
+    if let Ok((message, _)) = rasn::ber::decode_with_remainder::<LdapMessage>(&buf) {
+      return message;
+    }
+  }
+}
+
+fn simple_password(message: &LdapMessage) -> &[u8] {
+  let ProtocolOp::BindRequest(request) = &message.protocol_op else {
+    panic!("expected a bind request");
+  };
+  let AuthenticationChoice::Simple(password) = &request.authentication else {
+    panic!("expected simple authentication");
+  };
+  password.as_ref()
+}
+
+async fn connect_through_proxy(proxy_addr: SocketAddr, stub_port: u16) -> TcpStream {
+  let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+  stream
+    .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let mut head = [0u8; 19];
+  stream.read_exact(&mut head).await.unwrap();
+  assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+  stream
+}
+
+#[tokio::test]
+async fn ldap_simple_bind_swaps_over_cleartext() {
+  let fx = mitm_fixture(|port| {
+    vec![ldap_grant(
+      &format!("ldap://{}:{FAKE}@localhost:{port}", user(DN)),
+      &format!("ldap://{}:{VALUE}@localhost:{port}", user(DN)),
+    )]
+  })
+  .await;
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, _) = fx.stub.accept().await.unwrap();
+    let request = read_message(&mut conn).await;
+    assert_eq!(simple_password(&request), VALUE.as_bytes());
+    let response = LdapMessage::new(
+      request.message_id,
+      ProtocolOp::BindResponse(BindResponse::new(
+        ResultCode::Success,
+        LdapString::from(""),
+        LdapString::from(""),
+        None,
+        None,
+      )),
+    );
+    conn.write_all(&encode(&response)).await.unwrap();
+  });
+  let mut stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
+  stream.write_all(&encode(&bind_message(1, FAKE))).await.unwrap();
+  let response = read_message(&mut stream).await;
+  let ProtocolOp::BindResponse(body) = response.protocol_op else {
+    panic!("bind response");
+  };
+  assert_eq!(body.result_code, ResultCode::Success);
+  drop(stream);
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  fx.proxy.abort();
+}
+
+#[tokio::test]
+async fn ldap_starttls_then_bind_swaps_the_password() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let grants = vec![ldap_grant(
+    &format!("ldap://{}:{FAKE}@localhost:{stub_port}", user(DN)),
+    &format!("ldap://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}", user(DN), bundle.display()),
+  )];
+  let state = test_state_with(grants, &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, _) = stub.accept().await.unwrap();
+    let request = read_message(&mut conn).await;
+    let ProtocolOp::ExtendedReq(extended) = &request.protocol_op else {
+      panic!("starttls request");
+    };
+    assert_eq!(extended.request_name.as_ref(), STARTTLS_OID);
+    let response = LdapMessage::new(
+      request.message_id,
+      ProtocolOp::ExtendedResp(ExtendedResponse {
+        result_code: ResultCode::Success,
+        matched_dn: LdapString::from(""),
+        diagnostic_message: LdapString::from(""),
+        referral: None,
+        response_name: Some(OctetString::from_static(STARTTLS_OID)),
+        response_value: None,
+      }),
+    );
+    conn.write_all(&encode(&response)).await.unwrap();
+    let mut tls = acceptor.accept(conn).await.unwrap();
+    let bind = read_message(&mut tls).await;
+    assert_eq!(simple_password(&bind), VALUE.as_bytes());
+    let ok = LdapMessage::new(
+      bind.message_id,
+      ProtocolOp::BindResponse(BindResponse::new(
+        ResultCode::Success,
+        LdapString::from(""),
+        LdapString::from(""),
+        None,
+        None,
+      )),
+    );
+    tls.write_all(&encode(&ok)).await.unwrap();
+  });
+  let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
+  let start = LdapMessage::new(
+    1,
+    ProtocolOp::ExtendedReq(ExtendedRequest {
+      request_name: OctetString::from_static(STARTTLS_OID),
+      request_value: None,
+    }),
+  );
+  stream.write_all(&encode(&start)).await.unwrap();
+  let started = read_message(&mut stream).await;
+  let ProtocolOp::ExtendedResp(body) = &started.protocol_op else {
+    panic!("starttls response");
+  };
+  assert_eq!(body.result_code, ResultCode::Success);
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca.cert_der().clone()).unwrap();
+  let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+  let name = ServerName::try_from("localhost".to_string()).unwrap();
+  let mut tls = TlsConnector::from(Arc::new(config)).connect(name, stream).await.unwrap();
+  tls.write_all(&encode(&bind_message(2, FAKE))).await.unwrap();
+  let response = read_message(&mut tls).await;
+  let ProtocolOp::BindResponse(body) = response.protocol_op else {
+    panic!("bind response");
+  };
+  assert_eq!(body.result_code, ResultCode::Success);
+  drop(tls);
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  proxy.abort();
+}
+
+#[tokio::test]
+async fn ldap_tls_without_sni_mints_for_the_grant_host() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let grants = vec![ldap_grant(
+    &format!("ldaps://{}:{FAKE}@localhost:{stub_port}", user(DN)),
+    &format!(
+      "ldaps://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}",
+      user(DN),
+      bundle.display()
+    ),
+  )];
+  let state = test_state_with(grants, &ca);
+  let snapshot = state.snapshot();
+  let stub_task = tokio::spawn(async move {
+    let (conn, _) = stub.accept().await.unwrap();
+    let mut tls = acceptor.accept(conn).await.unwrap();
+    let bind = read_message(&mut tls).await;
+    assert_eq!(simple_password(&bind), VALUE.as_bytes());
+    let ok = LdapMessage::new(
+      bind.message_id,
+      ProtocolOp::BindResponse(BindResponse::new(
+        ResultCode::Success,
+        LdapString::from(""),
+        LdapString::from(""),
+        None,
+        None,
+      )),
+    );
+    tls.write_all(&encode(&ok)).await.unwrap();
+  });
+  let (guest, client_end) = tokio::io::duplex(64 * 1024);
+  let serve = tokio::spawn({
+    let state = Arc::clone(&state);
+    let snapshot = Arc::clone(&snapshot);
+    async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
+  });
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca.cert_der().clone()).unwrap();
+  let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+  config.enable_sni = false;
+  let name = ServerName::try_from("localhost".to_string()).unwrap();
+  let mut tls = tokio::time::timeout(
+    Duration::from_secs(10),
+    TlsConnector::from(Arc::new(config)).connect(name, client_end),
+  )
+  .await
+  .unwrap()
+  .unwrap();
+  tls.write_all(&encode(&bind_message(1, FAKE))).await.unwrap();
+  let response = read_message(&mut tls).await;
+  let ProtocolOp::BindResponse(body) = response.protocol_op else {
+    panic!("bind response");
+  };
+  assert_eq!(body.result_code, ResultCode::Success);
+  drop(tls);
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  serve.await.unwrap().unwrap();
+}
