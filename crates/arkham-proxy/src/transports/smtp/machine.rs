@@ -1,14 +1,17 @@
 //! SMTP wire format: AUTH credential rewrite, then the shared relay.
 //!
 //! Downstream buffers one command line, capped like a Redis command.
-//! `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`
-//! reframe to the upstream spelling at any length, inline or on the
-//! continuation line after a `334`. `DATA` passes bytes until the
-//! terminating dot, holding back only the suffix that might still grow
-//! into `\r\n.\r\n`. `BDAT n` passes the next `n` octets and nothing more.
-//! Every other command is forwarded as it arrives. Upstream is the engine's
-//! [`Raw`] machine: equal-length password bytes are redacted, and a `334`
-//! challenge is not rewritten.
+//! [`smtp_proto::Request::parse`] classifies that line: the verb, the AUTH
+//! mechanism, and a `BDAT` size. `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`,
+//! and `AUTH OAUTHBEARER` reframe to the upstream spelling at any length,
+//! inline or on the continuation line after a `334`. The SASL payload itself
+//! stays local, because the parser does not swap credentials. `DATA` passes
+//! bytes until the terminating dot, holding back only the suffix that might
+//! still grow into `\r\n.\r\n`. `BDAT n` passes the next `n` octets and
+//! nothing more. Every other command is forwarded as it arrives. Upstream is
+//! the engine's [`Raw`] machine: equal-length password bytes are redacted,
+//! and a `334` challenge is not rewritten. Replies stay on [`Raw`]:
+//! smtp-proto parses them only through a receiver that buffers.
 //!
 //! `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are challenge-response mechanisms
 //! and are relayed unchanged.
@@ -18,6 +21,7 @@ use std::borrow::Cow;
 use arkham_config::grants::{Grant, Scheme};
 use base64::Engine as _;
 use secrecy::ExposeSecret as _;
+use smtp_proto::{AUTH_LOGIN, AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2, Request};
 
 use crate::transports::engine::{Direction, Hit, Location, Raw, Rewritten, Wire};
 
@@ -35,25 +39,6 @@ const DATA_END: &[u8] = b"\r\n.\r\n";
 
 /// SASL field separator used by XOAUTH2 and OAUTHBEARER (RFC 7628).
 const SASL_SEP: u8 = 0x01;
-
-/// SMTP verbs that end an AUTH continuation when the client sends one
-/// instead of a payload (the server refused, and the client moved on).
-const COMMANDS: &[&[u8]] = &[
-  b"EHLO",
-  b"HELO",
-  b"MAIL",
-  b"RCPT",
-  b"DATA",
-  b"RSET",
-  b"NOOP",
-  b"QUIT",
-  b"VRFY",
-  b"EXPN",
-  b"HELP",
-  b"STARTTLS",
-  b"AUTH",
-  b"BDAT",
-];
 
 /// One SMTP direction leg.
 pub(crate) struct Smtp {
@@ -390,7 +375,7 @@ fn rewrite_down_line(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
   if !is_line_phase(down.phase) {
     return (line.to_vec(), Vec::new());
   }
-  if down.phase != Phase::Command && is_command(body) {
+  if down.phase != Phase::Command && is_command(line) {
     down.phase = Phase::Command;
   }
   let protected = down.protected;
@@ -430,81 +415,113 @@ fn rewrite_down_line(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
 
 /// A command line, or an `AUTH` line with its mechanism and initial response.
 fn rewrite_command(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
-  let body = line_body(line);
-  let ending = line_ending(line);
-  let tokens = tokens(body);
-  let Some(verb) = tokens.first() else {
+  let Some(request) = parse_command(line) else {
     return (line.to_vec(), Vec::new());
   };
-  if verb.eq_ignore_ascii_case(b"DATA") {
-    down.tail.clear();
-    down.phase = Phase::Data { at_start: true };
-    return (line.to_vec(), Vec::new());
+  match request {
+    Request::Data => {
+      down.tail.clear();
+      down.phase = Phase::Data { at_start: true };
+      (line.to_vec(), Vec::new())
+    }
+    Request::Bdat { chunk_size, .. } => {
+      let Ok(remaining) = u64::try_from(chunk_size) else {
+        return (line.to_vec(), Vec::new());
+      };
+      down.phase = Phase::Bdat { remaining };
+      (line.to_vec(), Vec::new())
+    }
+    Request::Auth {
+      mechanism,
+      initial_response,
+    } => rewrite_auth(line, down, mechanism, &initial_response),
+    _ => (line.to_vec(), Vec::new()),
   }
-  if let Some(octets) = bdat_octets(line) {
-    down.phase = Phase::Bdat { remaining: octets };
-    return (line.to_vec(), Vec::new());
-  }
-  if !verb.eq_ignore_ascii_case(b"AUTH") {
-    return (line.to_vec(), Vec::new());
-  }
-  let Some(mech) = tokens.get(1) else {
-    return (line.to_vec(), Vec::new());
-  };
-  let initial = tokens.get(2).copied().filter(|arg| *arg != b"=");
-  if mech.eq_ignore_ascii_case(b"PLAIN") {
-    let Some(arg) = initial else {
-      down.phase = Phase::Plain;
-      return (line.to_vec(), Vec::new());
-    };
-    let protected = down.protected;
-    let Some(creds) = down.creds.as_ref() else {
-      return (line.to_vec(), Vec::new());
-    };
-    return rewrite_auth_arg(line, mech, arg, ending, creds, protected, rewrite_plain_raw);
-  }
-  if mech.eq_ignore_ascii_case(b"LOGIN") {
-    let Some(arg) = initial else {
-      down.phase = Phase::LoginUser;
-      return (line.to_vec(), Vec::new());
-    };
-    let protected = down.protected;
-    let Some(creds) = down.creds.as_ref() else {
-      return (line.to_vec(), Vec::new());
-    };
-    let (rewritten, hits) = rewrite_token_line(&join_line(arg, ending), &creds.fake_user, &creds.real_user, creds, protected);
-    down.phase = Phase::LoginPass;
-    let arg_body = line_body(&rewritten);
-    return (join_auth(mech, Some(arg_body), ending), hits);
-  }
-  if mech.eq_ignore_ascii_case(b"XOAUTH2") || mech.eq_ignore_ascii_case(b"OAUTHBEARER") {
-    let Some(arg) = initial else {
-      down.phase = Phase::Bearer;
-      return (line.to_vec(), Vec::new());
-    };
-    let protected = down.protected;
-    let Some(creds) = down.creds.as_ref() else {
-      return (line.to_vec(), Vec::new());
-    };
-    return rewrite_auth_arg(line, mech, arg, ending, creds, protected, rewrite_bearer_raw);
-  }
-  (line.to_vec(), Vec::new())
 }
 
-/// Size on `BDAT <n> [LAST]`. Missing or non-numeric sizes are `None`:
-/// the command is still forwarded, and the server rejects it with no payload.
+/// `AUTH` classified by [`smtp_proto`]. `=` is the empty initial response.
+fn rewrite_auth(line: &[u8], down: &mut Down, mechanism: u64, initial: &str) -> (Vec<u8>, Vec<Hit>) {
+  let ending = line_ending(line);
+  let initial = if initial.is_empty() || initial == "=" {
+    None
+  } else {
+    Some(initial.as_bytes())
+  };
+  match mechanism {
+    AUTH_PLAIN => {
+      let Some(arg) = initial else {
+        down.phase = Phase::Plain;
+        return (line.to_vec(), Vec::new());
+      };
+      let protected = down.protected;
+      let Some(creds) = down.creds.as_ref() else {
+        return (line.to_vec(), Vec::new());
+      };
+      rewrite_auth_arg(line, b"PLAIN", arg, ending, creds, protected, rewrite_plain_raw)
+    }
+    AUTH_LOGIN => {
+      let Some(arg) = initial else {
+        down.phase = Phase::LoginUser;
+        return (line.to_vec(), Vec::new());
+      };
+      let protected = down.protected;
+      let Some(creds) = down.creds.as_ref() else {
+        return (line.to_vec(), Vec::new());
+      };
+      let (rewritten, hits) = rewrite_token_line(&join_line(arg, ending), &creds.fake_user, &creds.real_user, creds, protected);
+      down.phase = Phase::LoginPass;
+      let arg_body = line_body(&rewritten);
+      (join_auth(b"LOGIN", Some(arg_body), ending), hits)
+    }
+    AUTH_XOAUTH2 => rewrite_bearer(line, down, b"XOAUTH2", initial, ending),
+    AUTH_OAUTHBEARER => rewrite_bearer(line, down, b"OAUTHBEARER", initial, ending),
+    _ => (line.to_vec(), Vec::new()),
+  }
+}
+
+/// XOAUTH2 and OAUTHBEARER share one payload shape.
+fn rewrite_bearer(line: &[u8], down: &mut Down, mech: &[u8], initial: Option<&[u8]>, ending: &[u8]) -> (Vec<u8>, Vec<Hit>) {
+  let Some(arg) = initial else {
+    down.phase = Phase::Bearer;
+    return (line.to_vec(), Vec::new());
+  };
+  let protected = down.protected;
+  let Some(creds) = down.creds.as_ref() else {
+    return (line.to_vec(), Vec::new());
+  };
+  rewrite_auth_arg(line, mech, arg, ending, creds, protected, rewrite_bearer_raw)
+}
+
+/// Size on `BDAT <n> [LAST]`. A line the parser rejects is `None`.
+#[cfg(test)]
 fn bdat_octets(line: &[u8]) -> Option<u64> {
-  let body = line_body(line);
-  let mut parts = body.split(|byte| *byte == b' ' || *byte == b'\t').filter(|part| !part.is_empty());
-  let verb = parts.next()?;
-  if !verb.eq_ignore_ascii_case(b"BDAT") {
+  match parse_command(line)? {
+    Request::Bdat { chunk_size, .. } => u64::try_from(chunk_size).ok(),
+    _ => None,
+  }
+}
+
+/// One SMTP command, parsed from the line already in the AUTH buffer.
+/// Anything the parser rejects is forwarded unchanged.
+fn parse_command(line: &[u8]) -> Option<Request<Cow<'_, str>>> {
+  if !line.contains(&b'\n') {
     return None;
   }
-  let size = parts.next()?;
-  if size.is_empty() || !size.iter().all(u8::is_ascii_digit) {
-    return None;
-  }
-  std::str::from_utf8(size).ok()?.parse().ok()
+  Request::parse(&mut line.iter()).ok()
+}
+
+/// `STARTTLS`, as the parser names it.
+pub(super) fn is_starttls(line: &[u8]) -> bool {
+  matches!(parse_command(line), Some(Request::StartTls))
+}
+
+/// Pre-transaction commands the cleartext opening still forwards itself.
+/// Transaction commands belong to the relay.
+pub(super) fn is_opening_command(line: &[u8]) -> bool {
+  matches!(
+    parse_command(line),
+    Some(Request::Ehlo { .. } | Request::Helo { .. } | Request::Noop { .. } | Request::Rset | Request::Auth { .. } | Request::Quit)
+  )
 }
 
 /// Replace the initial-response argument of an `AUTH` line.
@@ -705,16 +722,8 @@ fn join_line(body: &[u8], ending: &[u8]) -> Vec<u8> {
   out
 }
 
-fn tokens(body: &[u8]) -> Vec<&[u8]> {
-  body
-    .split(|byte| *byte == b' ' || *byte == b'\t')
-    .filter(|token| !token.is_empty())
-    .collect()
-}
-
-fn is_command(body: &[u8]) -> bool {
-  let verb = tokens(body).into_iter().next().unwrap_or_default();
-  COMMANDS.iter().any(|command| verb.eq_ignore_ascii_case(command))
+fn is_command(line: &[u8]) -> bool {
+  parse_command(line).is_some()
 }
 
 /// Index just past the line ending, when `buf` holds one.

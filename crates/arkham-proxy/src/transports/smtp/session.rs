@@ -21,7 +21,7 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use super::SmtpTransport;
-use super::machine::{MAX_COMMAND, Smtp};
+use super::machine::{MAX_COMMAND, Smtp, is_opening_command, is_starttls};
 use crate::Error;
 use crate::relay::{log_hits, relay_guarded};
 use crate::transports::TlsHalves;
@@ -224,7 +224,7 @@ where
       let Some(line) = guest_line(&mut self.guest).await.map_err(|source| Error::GuestRead { source })? else {
         return Ok(());
       };
-      if verb_is(&line, b"STARTTLS") {
+      if is_starttls(&line) {
         return self.starttls(&line).await;
       }
       if self.down.awaiting_auth_payload() || is_opening_command(&line) {
@@ -460,19 +460,6 @@ where
       Err(err) => return Err(err),
     }
   }
-}
-
-fn is_opening_command(line: &[u8]) -> bool {
-  const VERBS: &[&[u8]] = &[b"EHLO", b"HELO", b"NOOP", b"RSET", b"AUTH", b"QUIT"];
-  VERBS.iter().any(|verb| verb_is(line, verb))
-}
-
-fn verb_is(line: &[u8], verb: &[u8]) -> bool {
-  let body = strip_crlf(line);
-  body
-    .split(|byte| *byte == b' ' || *byte == b'\t')
-    .find(|part| !part.is_empty())
-    .is_some_and(|word| word.eq_ignore_ascii_case(verb))
 }
 
 fn is_final_line(line: &[u8]) -> bool {

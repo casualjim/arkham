@@ -133,6 +133,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 shellexpand = "3"
 smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp", "std"] }
+smtp-proto = "0.2.5"
 socket2 = "0.6"
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
