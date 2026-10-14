@@ -2747,6 +2747,104 @@ mod tests {
       fx.proxy.abort();
     }
 
+    /// Server that advertises CHUNKING and accepts `BDAT` chunks. Records
+    /// each payload so the test can see the splice instead of a deadlock.
+    async fn serve_bdat<S>(mut conn: S, seen: Arc<Mutex<Vec<Vec<u8>>>>)
+    where
+      S: AsyncRead + AsyncWrite + Unpin,
+    {
+      write_cmd(&mut conn, "220 mail.demo.test ESMTP\r\n").await;
+      loop {
+        let line = read_reply(&mut conn).await;
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+          write_cmd(&mut conn, "250-mail.demo.test\r\n250-PIPELINING\r\n250 CHUNKING\r\n").await;
+          continue;
+        }
+        if upper.starts_with("BDAT") {
+          let Some(n) = bdat_size(line.as_bytes()) else {
+            write_cmd(&mut conn, "501 5.5.4 missing chunk size\r\n").await;
+            continue;
+          };
+          let mut payload = vec![0u8; n];
+          if n > 0 {
+            conn.read_exact(&mut payload).await.unwrap();
+          }
+          seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(payload);
+          write_cmd(&mut conn, "250 2.0.0 chunk accepted\r\n").await;
+          continue;
+        }
+        if upper.starts_with("QUIT") {
+          write_cmd(&mut conn, "221 bye\r\n").await;
+          return;
+        }
+        write_cmd(&mut conn, "502 5.5.2 unimplemented\r\n").await;
+      }
+    }
+
+    fn bdat_size(line: &[u8]) -> Option<usize> {
+      let body = line.strip_suffix(b"\r\n").unwrap_or(line);
+      let mut parts = body.split(|byte| *byte == b' ' || *byte == b'\t').filter(|part| !part.is_empty());
+      let verb = parts.next()?;
+      if !verb.eq_ignore_ascii_case(b"BDAT") {
+        return None;
+      }
+      let size = std::str::from_utf8(parts.next()?).ok()?;
+      size.parse().ok()
+    }
+
+    #[tokio::test]
+    async fn bdat_payload_is_spliced_and_chunking_is_hidden() {
+      let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+      let fx = mitm_fixture(|port| {
+        vec![smtp_grant(
+          &format!("smtp://agent%40demo.test:{FAKE}@localhost:{port}"),
+          &format!("smtp://agent%40demo.test:{VALUE}@localhost:{port}"),
+        )]
+      })
+      .await;
+      let stub_seen = Arc::clone(&seen);
+      let stub_task = tokio::spawn(async move {
+        let (conn, _) = fx.stub.accept().await.unwrap();
+        serve_bdat(conn, stub_seen).await;
+      });
+
+      let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(fx.proxy_addr).await.unwrap();
+        stream
+          .write_all(format!("CONNECT localhost:{} HTTP/1.1\r\nHost: localhost\r\n\r\n", fx.stub_port).as_bytes())
+          .await
+          .unwrap();
+        let mut head = [0u8; 19];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+        let greeting = read_reply(&mut stream).await;
+        assert!(greeting.starts_with("220"), "{greeting}");
+        write_cmd(&mut stream, "EHLO client\r\n").await;
+        let ehlo = read_reply(&mut stream).await;
+        assert_eq!(ehlo, "250-mail.demo.test\r\n250 PIPELINING\r\n");
+        assert!(!ehlo.to_ascii_uppercase().contains("CHUNKING"), "{ehlo}");
+        write_cmd(&mut stream, "BDAT 5\r\n").await;
+        stream.write_all(b"hello").await.unwrap();
+        stream.flush().await.unwrap();
+        let accepted = read_reply(&mut stream).await;
+        assert!(accepted.starts_with("250"), "{accepted}");
+        write_cmd(&mut stream, "BDAT 0 LAST\r\n").await;
+        let last = read_reply(&mut stream).await;
+        assert!(last.starts_with("250"), "{last}");
+        write_cmd(&mut stream, "BDAT\r\n").await;
+        let missing = read_reply(&mut stream).await;
+        assert!(missing.starts_with("501"), "{missing}");
+        write_cmd(&mut stream, "QUIT\r\n").await;
+      })
+      .await;
+      fx.proxy.abort();
+      result.expect("BDAT splice timed out");
+      let _ = tokio::time::timeout(Duration::from_secs(2), stub_task).await;
+      let recorded = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+      assert_eq!(recorded, vec![b"hello".to_vec(), Vec::new()]);
+    }
+
     #[tokio::test]
     async fn smtp_plaintext_swaps_when_starttls_is_not_required() {
       let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

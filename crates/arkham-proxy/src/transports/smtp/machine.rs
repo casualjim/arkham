@@ -3,9 +3,12 @@
 //! Downstream client commands are CRLF lines. `AUTH PLAIN`, `AUTH LOGIN`,
 //! `AUTH XOAUTH2`, and `AUTH OAUTHBEARER` reframe to the upstream spelling
 //! at any length, inline or on the continuation line after a `334`. Every
-//! other command relays unchanged. Upstream redacts the real secret from
+//! other command relays unchanged. Upstream redacts the real password from
 //! replies, including a base64 `334` challenge, so a refusal cannot carry
-//! it back to the guest.
+//! it back to the guest. The username is not a secret and is left as the
+//! server wrote it. A `250` reply advertising `CHUNKING` loses that line,
+//! so a client falls back to `DATA`; the session still splices a `BDAT`
+//! payload when one arrives.
 //!
 //! `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are challenge-response mechanisms
 //! and are relayed unchanged.
@@ -41,6 +44,7 @@ const COMMANDS: &[&[u8]] = &[
   b"HELP",
   b"STARTTLS",
   b"AUTH",
+  // The command line only. The session splices the following octet count.
   b"BDAT",
 ];
 
@@ -66,6 +70,9 @@ struct Down {
 /// Upstream redaction state.
 struct Up {
   buf: Vec<u8>,
+  /// Lines of the current reply, held until the final line so a trailing
+  /// `CHUNKING` advertisement can be dropped without leaving a `250-`.
+  held: Vec<u8>,
   creds: Creds,
   closed: bool,
 }
@@ -122,6 +129,7 @@ impl Smtp {
         down: None,
         up: creds.map(|creds| Up {
           buf: Vec::new(),
+          held: Vec::new(),
           creds,
           closed: false,
         }),
@@ -176,11 +184,12 @@ impl Smtp {
       return (Cow::Borrowed(chunk), Vec::new());
     };
     if chunk.is_empty() {
-      let rest = std::mem::take(&mut up.buf);
-      if rest.is_empty() {
+      let mut pending = std::mem::take(&mut up.held);
+      pending.append(&mut up.buf);
+      if pending.is_empty() {
         return (Cow::Borrowed(&[]), Vec::new());
       }
-      let (line, hits) = redact_line(&rest, &up.creds);
+      let (line, hits) = redact_reply(&pending, &up.creds);
       return (Cow::Owned(line), hits);
     }
     up.buf.extend_from_slice(chunk);
@@ -192,9 +201,14 @@ impl Smtp {
     let mut hits = Vec::new();
     while let Some(end) = line_end(&up.buf) {
       let line: Vec<u8> = up.buf.drain(..end).collect();
-      let (redacted, found) = redact_line(&line, &up.creds);
-      out.extend_from_slice(&redacted);
-      hits.extend(found);
+      let finished = is_final_reply_line(&line);
+      up.held.extend_from_slice(&line);
+      if finished {
+        let reply = std::mem::take(&mut up.held);
+        let (redacted, found) = redact_reply(&reply, &up.creds);
+        out.extend_from_slice(&redacted);
+        hits.extend(found);
+      }
     }
     (Cow::Owned(out), hits)
   }
@@ -451,7 +465,81 @@ fn rewrite_bearer_raw(raw: &[u8], creds: &Creds, protected: bool) -> Option<Vec<
   Some(out)
 }
 
-/// Redact one server line. A `334` challenge is base64; the secret is
+/// Redact one complete reply. `CHUNKING` is dropped first so the final
+/// line still uses a space separator, then each line redacts the password.
+fn redact_reply(reply: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
+  let stripped = strip_chunking(reply);
+  let mut out = Vec::with_capacity(stripped.len());
+  let mut hits = Vec::new();
+  let mut rest = stripped.as_slice();
+  while !rest.is_empty() {
+    let end = line_end(rest).unwrap_or(rest.len());
+    let Some(line_bytes) = rest.get(..end) else {
+      break;
+    };
+    let (line, found) = redact_line(line_bytes, creds);
+    out.extend_from_slice(&line);
+    hits.extend(found);
+    if end == rest.len() {
+      break;
+    }
+    rest = rest.get(end..).unwrap_or(&[]);
+  }
+  (out, hits)
+}
+
+/// Drop `250 CHUNKING` advertisements. When the dropped line was the
+/// final one, the new last line's `-` becomes a space so the reply ends.
+fn strip_chunking(reply: &[u8]) -> Vec<u8> {
+  let mut lines = Vec::new();
+  let mut rest = reply;
+  while !rest.is_empty() {
+    let end = line_end(rest).unwrap_or(rest.len());
+    let line = rest.get(..end).unwrap_or(&[]);
+    if !is_chunking_advertisement(line) {
+      lines.push(line.to_vec());
+    }
+    if end == rest.len() {
+      break;
+    }
+    rest = rest.get(end..).unwrap_or(&[]);
+  }
+  if lines.is_empty() {
+    return reply.to_vec();
+  }
+  if let Some(last) = lines.last_mut()
+    && let Some(separator) = last.get_mut(3)
+    && *separator == b'-'
+  {
+    *separator = b' ';
+  }
+  let mut out = Vec::with_capacity(reply.len());
+  for line in &lines {
+    out.extend_from_slice(line);
+  }
+  out
+}
+
+/// `250 CHUNKING` or `250-CHUNKING`, and nothing else on the line.
+fn is_chunking_advertisement(line: &[u8]) -> bool {
+  let body = line_body(line);
+  if body.get(..3) != Some(b"250".as_slice()) {
+    return false;
+  }
+  let rest = body.get(4..).unwrap_or(b"");
+  let keyword = rest
+    .split(|byte| *byte == b' ' || *byte == b'\t')
+    .find(|part| !part.is_empty())
+    .unwrap_or(b"");
+  keyword.eq_ignore_ascii_case(b"CHUNKING")
+}
+
+/// A reply line is final when it is not a `DDD-` continuation.
+fn is_final_reply_line(line: &[u8]) -> bool {
+  line_body(line).get(3) != Some(&b'-')
+}
+
+/// Redact one server line. A `334` challenge is base64; the password is
 /// replaced inside the payload and the line is re-encoded.
 fn redact_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
   let body = line_body(line);
@@ -475,16 +563,11 @@ fn redact_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
   }
 }
 
-/// Replace the real password, then the real user when it differs.
+/// Replace the real password. The username is not redacted: a short or
+/// common one would rewrite unrelated reply text.
 fn replace_secrets(buf: &[u8], creds: &Creds) -> (Vec<u8>, bool) {
   let mut out = buf.to_vec();
-  let mut found = false;
-  if creds.real_pass != creds.fake_pass && replace_into(&mut out, &creds.real_pass, &creds.fake_pass) {
-    found = true;
-  }
-  if creds.real_user != creds.fake_user && !creds.real_user.is_empty() && replace_into(&mut out, &creds.real_user, &creds.fake_user) {
-    found = true;
-  }
+  let found = creds.real_pass != creds.fake_pass && replace_into(&mut out, &creds.real_pass, &creds.fake_pass);
   (out, found)
 }
 
@@ -802,6 +885,36 @@ mod tests {
     assert_eq!(hits, 1);
     assert_eq!(out, format!("535 5.7.8 authentication failed for {FAKE_PASS}\r\n").into_bytes());
     assert!(!out.windows(REAL_PASS.len()).any(|window| window == REAL_PASS.as_bytes()));
+  }
+
+  #[tokio::test]
+  async fn response_redacts_the_password_and_leaves_the_username() {
+    let mut machine = Smtp::new(&grant("guest@demo.test", "a"), "mail", 587, Direction::Upstream);
+    let line = format!("535 5.7.8 a rejected {REAL_PASS}\r\n");
+    let (out, hits) = emit(&mut machine, line.as_bytes()).await;
+    assert_eq!(hits, 1);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("535 5.7.8 a rejected"), "{text}");
+    assert!(text.contains(FAKE_PASS), "{text}");
+    assert!(!text.contains(REAL_PASS), "{text}");
+  }
+
+  #[tokio::test]
+  async fn ehlo_reply_drops_chunking_and_keeps_a_final_line() {
+    let mut machine = up();
+    let reply = b"250-mail.demo.test\r\n250-PIPELINING\r\n250 CHUNKING\r\n";
+    let (out, hits) = emit(&mut machine, reply).await;
+    assert_eq!(hits, 0);
+    assert_eq!(out, b"250-mail.demo.test\r\n250 PIPELINING\r\n");
+  }
+
+  #[tokio::test]
+  async fn chunking_in_the_middle_of_ehlo_is_dropped() {
+    let mut machine = up();
+    let (held, _) = emit(&mut machine, b"250-CHUNKING\r\n").await;
+    assert_eq!(held, b"");
+    let (out, _) = emit(&mut machine, b"250 AUTH PLAIN LOGIN\r\n").await;
+    assert_eq!(out, b"250 AUTH PLAIN LOGIN\r\n");
   }
 
   #[tokio::test]

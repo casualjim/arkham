@@ -27,7 +27,7 @@ Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy` (`
 
 6. **Transparent host.** Capture has a destination address and a port, not a URL host, and some clients send no SNI. Mint the leaf and key the swap on the host of the scope `expect` already selected, not on the captured address.
 
-7. **Mid-stream TLS.** A protocol that upgrades after a cleartext greeting (SMTP `STARTTLS`) keeps the same framing machines across the upgrade. Relay plaintext until the client command and the server's acceptance are both forwarded, then terminate guest TLS and handshake upstream on the same sockets. Do not read past the acceptance line: the next bytes are a `ClientHello`. Implicit TLS stays a separate scheme (`smtps`) and settles both legs before the machines run, the way `rediss` does. A plaintext posture that never upgrades rewrites on the cleartext relay.
+7. **Mid-stream TLS.** A protocol that upgrades after a cleartext greeting keeps the same framing machines across the upgrade. Relay plaintext until the client command and the server's acceptance are both forwarded, then terminate guest TLS and handshake upstream on the same sockets. Do not read past the acceptance line: the next bytes are a handshake. Acceptance is whatever the protocol defines (an SMTP `220`, an LDAP StartTLS extended-response success). Implicit TLS stays a separate scheme and settles both legs before the machines run. A plaintext posture that never upgrades rewrites on the cleartext relay. A later protocol with the same upgrade folds into this step.
 
 8. **Client certificates.** Support an upstream client certificate, or document in `integration/README.md` why the compose demo disables client auth. A CA file on the server can make it demand one.
 
@@ -42,6 +42,8 @@ Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy` (`
 13. **Pull request.** The PR body says `Closes #N`, or `Refs #N` when the issue title starts with `Tracking:`.
 
 ## Done
+
+An in-process test shows authentication before the upgrade carries the decoy and authentication after the upgrade carries the real secret. The upgrade stops at the acceptance line; bytes after it are the handshake, and reading them as framing fails that handshake.
 
 From the repo root. The last arguments are the new schemes, one word each (`redis rediss` when both variants exist). `pipefail` is required: `| tee` would otherwise hide `test:ssh`'s status, and `&&` then stops the chain.
 

@@ -56,6 +56,8 @@ impl SmtpTransport {
     })
   }
 
+  // TODO: `leaf`, `leaf_mtls`, and `roots_for` match the Redis transport.
+  // A later TLS protocol should share them instead of copying them again.
   /// Leaf for one name, cached. Minted before insert so two guests naming
   /// the same host keygen at most twice.
   ///

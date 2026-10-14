@@ -98,9 +98,11 @@ A rule whose `value` states an `smtp://` or `smtps://` connection string is an S
 
 `smtp://` is cleartext. `smtps://` is TLS from the first byte. The default ports are 25 and 465. The user and the password are both required, and the user is percent-encoded when it contains `@` (`agent%40demo.test`). A path is rejected. `sslmode` and `sslnegotiation` are rejected: the scheme states the transport.
 
-`starttls=required` is legal only on a real `smtp://` string. Until that upgrade completes, AUTH is forwarded unchanged, so the real password never sits on a cleartext upstream. Absent, AUTH is rewritten immediately, which is what a plaintext port 25 relay needs. `sslrootcert` (a PEM path, or `system`) and `sslcert`/`sslkey` together belong on `smtps://` or on `smtp://` with `starttls=required`.
+`starttls=required` is legal only on a real `smtp://` string. Until that upgrade completes, AUTH is forwarded unchanged, so the real password never sits on a cleartext upstream. Absent, AUTH is rewritten immediately, which is what a plaintext port 25 relay needs, and loading that grant logs a warning because the real password goes upstream in cleartext. `sslrootcert` (a PEM path, or `system`) and `sslcert`/`sslkey` together belong on `smtps://` or on `smtp://` with `starttls=required`.
 
-The wire machine rewrites `AUTH PLAIN` (inline or after `334`), `AUTH LOGIN` (two-step, or with the username inline), `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`. `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are relayed unchanged. Replies, including a base64 `334`, have the real secret redacted. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name.
+EHLO replies have a `CHUNKING` line removed, and the reply's last line stays a final `250`. A client that sends `BDAT` anyway has that chunk spliced for the octet count on the command. `AUTH` replies redact the real password, including inside a base64 `334`, and leave the username as the server wrote it.
+
+The wire machine rewrites `AUTH PLAIN` (inline or after `334`), `AUTH LOGIN` (two-step, or with the username inline), `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`. `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are relayed unchanged. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name.
 
 ```toml
 [rules.smtp]

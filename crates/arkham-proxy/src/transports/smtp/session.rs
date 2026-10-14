@@ -3,8 +3,9 @@
 //!
 //! The same framing machines run before and after the upgrade. The reader
 //! stops at the acceptance line, because the next guest bytes are a
-//! `ClientHello`. `DATA` is spliced until the terminating dot so a decoy
-//! inside a message is left alone.
+//! `ClientHello`. `DATA` is spliced until the terminating dot, and `BDAT n`
+//! splices the next `n` octets, so a payload is never held while the
+//! session waits for a reply the server will not send yet.
 
 use std::io::ErrorKind;
 use std::time::Duration;
@@ -84,6 +85,13 @@ where
     }
   }
 
+  async fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+    match self {
+      Self::Plain(stream) => read_some(stream, buf).await,
+      Self::Tls(stream) => read_some(stream.as_mut(), buf).await,
+    }
+  }
+
   async fn write_flush(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
     match self {
       Self::Plain(stream) => write_flush(stream, bytes).await,
@@ -153,8 +161,14 @@ where
       }
       let data = is_command(&line, b"DATA");
       let starttls = is_command(&line, b"STARTTLS");
+      let bdat = bdat_octets(&line);
       if !self.forward_downstream(&line).await? {
         return Ok(());
+      }
+      // `BDAT n` is followed by n octets before the server replies.
+      // Reading the reply first deadlocks until the budget expires.
+      if let Some(octets) = bdat {
+        self.splice_octets(octets).await?;
       }
       let Some(response) = self.read_server().await? else {
         return Ok(());
@@ -269,6 +283,32 @@ where
     Ok(true)
   }
 
+  /// Copy `octets` of a `BDAT` chunk unchanged. The count is the size on
+  /// the command line; the bytes are not a line and are not rewritten.
+  async fn splice_octets(&mut self, mut remaining: u64) -> Result<(), Error> {
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+      let want = usize::try_from(remaining).unwrap_or(buf.len()).min(buf.len());
+      let got = self.read_guest_some(&mut buf[..want]).await?;
+      if got == 0 {
+        return Ok(());
+      }
+      let Some(chunk) = buf.get(..got) else {
+        return Err(Error::GuestRead {
+          source: std::io::Error::other("read length past buffer"),
+        });
+      };
+      self.write_server(chunk).await?;
+      let Some(advance) = u64::try_from(got).ok() else {
+        return Err(Error::GuestRead {
+          source: std::io::Error::other("read length does not fit"),
+        });
+      };
+      remaining = remaining.saturating_sub(advance);
+    }
+    Ok(())
+  }
+
   /// Copy the message body unchanged until the terminating dot line.
   async fn splice_body(&mut self) -> Result<(), Error> {
     let mut buf = Vec::new();
@@ -300,6 +340,11 @@ where
   async fn read_guest_byte(&mut self) -> Result<Option<u8>, Error> {
     let guest = self.guest.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
     guest.read_byte().await.map_err(|source| Error::GuestRead { source })
+  }
+
+  async fn read_guest_some(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    let guest = self.guest.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
+    guest.read_some(buf).await.map_err(|source| Error::GuestRead { source })
   }
 
   async fn read_server(&mut self) -> Result<Option<Vec<u8>>, Error> {
@@ -404,10 +449,23 @@ where
   R: AsyncRead + Unpin,
 {
   let mut buf = [0u8; 1];
-  match reader.read(&mut buf).await {
-    Ok(0) => Ok(None),
-    Ok(_) => Ok(Some(buf[0])),
-    Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(None),
+  match read_some(reader, &mut buf).await? {
+    0 => Ok(None),
+    _ => Ok(buf.first().copied()),
+  }
+}
+
+async fn read_some<R>(reader: &mut R, buf: &mut [u8]) -> Result<usize, std::io::Error>
+where
+  R: AsyncRead + Unpin,
+{
+  if buf.is_empty() {
+    return Ok(0);
+  }
+  match reader.read(buf).await {
+    Ok(0) => Ok(0),
+    Ok(n) => Ok(n),
+    Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(0),
     Err(err) => Err(err),
   }
 }
@@ -459,6 +517,22 @@ where
   writer.write_all(bytes).await?;
   writer.flush().await?;
   Ok(())
+}
+
+/// Size on `BDAT <n> [LAST]`. Missing or non-numeric sizes are `None`:
+/// the command is still forwarded, and the server rejects it with no payload.
+fn bdat_octets(line: &[u8]) -> Option<u64> {
+  let body = strip_crlf(line);
+  let mut parts = body.split(|byte| *byte == b' ' || *byte == b'\t').filter(|part| !part.is_empty());
+  let verb = parts.next()?;
+  if !verb.eq_ignore_ascii_case(b"BDAT") {
+    return None;
+  }
+  let size = parts.next()?;
+  if size.is_empty() || !size.iter().all(u8::is_ascii_digit) {
+    return None;
+  }
+  std::str::from_utf8(size).ok()?.parse().ok()
 }
 
 fn is_command(line: &[u8], verb: &[u8]) -> bool {
@@ -514,4 +588,18 @@ pub(super) fn plain_server(stream: TcpStream) -> ServerLeg {
 /// Upstream leg whose TLS handshake already finished.
 pub(super) fn tls_server(stream: ClientTlsStream<TcpStream>) -> ServerLeg {
   ServerLeg::Tls(Box::new(stream))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::bdat_octets;
+
+  #[test]
+  fn bdat_size_is_the_octet_count() {
+    assert_eq!(bdat_octets(b"BDAT 5\r\n"), Some(5));
+    assert_eq!(bdat_octets(b"bdat 0 LAST\r\n"), Some(0));
+    assert_eq!(bdat_octets(b"BDAT\r\n"), None);
+    assert_eq!(bdat_octets(b"BDAT LAST\r\n"), None);
+    assert_eq!(bdat_octets(b"DATA\r\n"), None);
+  }
 }

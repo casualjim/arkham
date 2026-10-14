@@ -246,6 +246,18 @@ services:
       - |
         set -euo pipefail
         apt-get update -qq && apt-get install -qq -y openssh-client python3
+        # Decoy AUTH straight at the mail server. The mark is the capture
+        # bypass (tproxy egress 0x89, tun fib 0x88), so this dial is not
+        # rewritten. A success here is the server refusing the decoy.
+        ok=0
+        for _ in 1 2 3 4 5; do
+          if python3 /srv/smtp.py direct | tee /tmp/smtp-direct.txt; then
+            ok=1
+            break
+          fi
+          sleep 2
+        done
+        test "$$ok" = 1
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -278,6 +290,9 @@ services:
       SMTP_URL: smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587 # nosemgrep: deterministic demo decoy, not a credential
       SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
+      ARKHAM_BACKEND: ${ARKHAM_BACKEND:-tproxy}
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro

@@ -325,6 +325,14 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     }
     scope.guest_tls = tls.guest_tls_mode;
   }
+  if !scope.is_upstream_tls && !scope.starttls_required {
+    tracing::warn!(
+      label,
+      host = %scope.upstream.host,
+      port = scope.upstream.port,
+      "real smtp:// password is forwarded in cleartext; set starttls=required or use smtps://"
+    );
+  }
   let credential = Credential {
     label: label.to_string(),
     fake: scope.downstream.password.expose_secret().to_string(),
