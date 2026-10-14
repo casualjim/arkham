@@ -20,9 +20,12 @@ use secrecy::ExposeSecret as _;
 use crate::transports::engine::{Direction, Hit, Location, Rewritten, Wire};
 
 /// Cap for one downstream LDAP message. A simple bind is tens of bytes;
-/// anything past this is not a bind we will reframe. The cap is per message,
-/// and the upstream leg does not use it: a search result can be larger.
+/// anything past this is not a bind we will reframe. The cap is per message.
 const MAX_MESSAGE: usize = 64 * 1024;
+
+/// Cap for one upstream LDAP message. A search result can be far larger than
+/// a bind, and anything past this is not buffered.
+const MAX_UPSTREAM: usize = 16 * 1024 * 1024;
 
 /// `StartTLS` extended operation OID (RFC 4511).
 const STARTTLS_OID: &[u8] = b"1.3.6.1.4.1.1466.20037";
@@ -247,7 +250,7 @@ impl Ldap {
     let mut out = Vec::new();
     let mut hits = Vec::new();
     loop {
-      let frame = match take_message(&mut up.buf, None) {
+      let frame = match take_message(&mut up.buf, Some(MAX_UPSTREAM)) {
         Ok(None) => break,
         Ok(Some(frame)) => frame,
         Err(()) => {
@@ -799,7 +802,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn upstream_message_over_the_cap_is_forwarded() {
+  async fn upstream_message_larger_than_a_bind_is_forwarded() {
     let content_len = MAX_MESSAGE + 1;
     let mut frame = vec![0x30, 0x84];
     let len = u32::try_from(content_len).unwrap();
@@ -808,6 +811,14 @@ mod tests {
     let mut machine = up();
     let out = emit(&mut machine, &frame).await;
     assert_eq!(out, frame);
+  }
+
+  #[tokio::test]
+  async fn upstream_message_over_sixteen_mib_closes() {
+    let header = [0x30, 0x84, 0x01, 0x00, 0x00, 0x01];
+    let mut machine = up();
+    let (rewritten, _) = machine.feed(&header).await;
+    assert!(matches!(rewritten, Rewritten::Close));
   }
 
   #[tokio::test]

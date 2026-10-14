@@ -77,9 +77,9 @@ Scenarios 13–16 use `quay.io/389ds/dirsrv` (the manifest list was last
 pushed June 2025; the pin is a multi-arch digest, not a Docker Hub tag)
 and `ldapts` 9.2.0. The directory listens on 3389 and 3636. After it is
 up, `dsconf` sets `nsslapd-require-secure-binds: on`. Before the
-service waits, `ldapsearch` inside the container binds over LDAPS with
-the decoy password and must exit 49. That bind does not pass through
-the proxy. The flag requires TLS
+service waits, `ldapsearch` inside the container binds with the decoy
+password over LDAPS and again over StartTLS. Both must exit 49. Those
+binds do not pass through the proxy. The flag requires TLS
 for a simple bind. It does not require a client certificate, and this
 demo does not present one: the proxy's upstream leg has no client
 identity, the same way the Redis demo sets `tls-auth-clients no`. The
