@@ -2845,8 +2845,10 @@ mod tests {
       assert_eq!(recorded, vec![b"hello".to_vec(), Vec::new()]);
     }
 
+    /// A session that never upgrades stays cleartext upstream. The decoy
+    /// is what the server records; the real password is not on that wire.
     #[tokio::test]
-    async fn smtp_plaintext_swaps_when_starttls_is_not_required() {
+    async fn smtp_cleartext_session_forwards_the_decoy() {
       let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
       let fx = mitm_fixture(|port| {
         vec![smtp_grant(
@@ -2881,7 +2883,15 @@ mod tests {
       let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
       let recorded = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
       assert_eq!(recorded.len(), 1, "{recorded:?}");
-      assert!(recorded[0].contains(&plain_initial(USER, VALUE)), "{recorded:?}");
+      assert!(
+        recorded[0].contains(&plain_initial(USER, FAKE)),
+        "cleartext AUTH must carry the decoy: {}",
+        recorded[0]
+      );
+      assert!(
+        !recorded[0].contains(&plain_initial(USER, VALUE)),
+        "cleartext AUTH must not carry the real password"
+      );
       fx.proxy.abort();
     }
 

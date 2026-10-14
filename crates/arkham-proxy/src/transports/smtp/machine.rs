@@ -60,8 +60,8 @@ pub(crate) struct Smtp {
 struct Down {
   buf: Vec<u8>,
   phase: Phase,
-  /// AUTH payloads are rewritten. False while a `starttls=required`
-  /// upstream is still in cleartext: the decoy is forwarded as-is.
+  /// AUTH payloads are rewritten only when the upstream writer is TLS.
+  /// A cleartext upstream forwards the decoy.
   protected: bool,
   creds: Creds,
   closed: bool,
@@ -119,7 +119,7 @@ impl Smtp {
         down: creds.map(|creds| Down {
           buf: Vec::new(),
           phase: Phase::Command,
-          protected: true,
+          protected: false,
           creds,
           closed: false,
         }),
@@ -137,9 +137,8 @@ impl Smtp {
     }
   }
 
-  /// Allow or withhold AUTH rewriting. A `starttls=required` session
-  /// starts unprotected and becomes protected once the upstream leg is
-  /// encrypted.
+  /// Allow AUTH rewriting. True only while the upstream leg is TLS. A
+  /// cleartext upstream forwards the decoy.
   pub(crate) fn set_protected(&mut self, protected: bool) {
     if let Some(down) = self.down.as_mut() {
       down.protected = protected;

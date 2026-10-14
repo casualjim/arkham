@@ -239,10 +239,11 @@ where
     Ok(())
   }
 
-  /// Real credentials stay off a cleartext upstream while `starttls=required`.
+  /// Real credentials stay off a cleartext upstream. AUTH is rewritten
+  /// only once this leg is TLS.
   fn sync_protected(&mut self) {
     let encrypted = self.server.as_ref().is_some_and(|leg| !leg.is_plain());
-    self.down.set_protected(encrypted || !self.scope.starttls_required);
+    self.down.set_protected(encrypted);
   }
 
   async fn forward_downstream(&mut self, line: &[u8]) -> Result<bool, Error> {
@@ -412,8 +413,9 @@ where
     budget,
   } = dialogue;
   let mut down = Smtp::new(grants, host, port, Direction::Downstream);
-  let protected = scope.is_upstream_tls || !scope.starttls_required;
-  down.set_protected(protected);
+  // Swap only when the upstream writer is already TLS (`smtps://`). A
+  // cleartext `smtp://` session forwards the decoy until STARTTLS completes.
+  down.set_protected(scope.is_upstream_tls);
   let session = Session {
     transport,
     scope,

@@ -2,9 +2,10 @@
 //! and the rule-to-scope assembly.
 //!
 //! `smtp://` is a cleartext session that may upgrade with STARTTLS.
-//! `smtps://` is implicit TLS from the first byte. `starttls=required` on
-//! an `smtp://` string withholds the real password until that upgrade
-//! completes, which is what submission (port 587) demands.
+//! `smtps://` is implicit TLS from the first byte. The real password is
+//! swapped only once the upstream leg is TLS. `starttls=required` on an
+//! `smtp://` string is what submission (port 587) demands, and it is what
+//! makes trust material legal on that scheme.
 
 use std::path::PathBuf;
 
@@ -46,8 +47,7 @@ pub struct SmtpScope {
   pub upstream: SmtpLeg,
   /// Whether the upstream leg is implicit TLS (an `smtps://` real string).
   pub is_upstream_tls: bool,
-  /// The real string says AUTH is only legal after STARTTLS. The real
-  /// password stays off the upstream wire until that upgrade completes.
+  /// The real string says the server requires STARTTLS before AUTH.
   pub starttls_required: bool,
   /// Trust anchor for upstream verification, when the real string names one.
   pub root_cert: Option<RootCert>,
@@ -330,7 +330,7 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
       label,
       host = %scope.upstream.host,
       port = scope.upstream.port,
-      "real smtp:// password is forwarded in cleartext; set starttls=required or use smtps://"
+      "smtp:// upstream is cleartext; AUTH forwards the decoy until that leg is TLS"
     );
   }
   let credential = Credential {
