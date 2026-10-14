@@ -46,6 +46,14 @@ openssl x509 -req -in "$dir/mail.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
 # file. A demo CA key stays 600; this leaf key is world-readable on purpose.
 chmod 644 "$dir/mail.key" "$dir/mail.crt"
 
+# LDAP TLS: 389ds imports this leaf at bootstrap. SAN carries the hostname
+# the connection strings dial and the static address on the server net.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/ldap.key"
+openssl req -new -key "$dir/ldap.key" -out "$dir/ldap.csr" -subj "/CN=ldap"
+printf "subjectAltName=IP:10.202.0.80,DNS:ldap\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature,keyEncipherment\n" >"$dir/ldap.ext"
+openssl x509 -req -in "$dir/ldap.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+  -CAcreateserial -out "$dir/ldap.crt" -days 2 -extfile "$dir/ldap.ext"
+
 cat "$dir/ca.crt" "$dir/ca.key" >"$dir/ca.pem"
 chmod 600 "$dir/ca.key" "$dir/ca.pem"
 

@@ -1,0 +1,8 @@
+{
+  "name": "arkham-integration-client",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ldapts": "9.2.0"
+  }
+}

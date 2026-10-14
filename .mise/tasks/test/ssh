@@ -58,7 +58,10 @@ for backend in $backends; do
   code=""
   state=running
   direct=arkham-integration-smtp-direct-1
-  for _ in $(seq 1 120); do
+  # 389ds creates its instance on first start, then the entry turns on
+  # secure binds. That is slower than the other servers; the loop exits
+  # as soon as the client does.
+  for _ in $(seq 1 300); do
     dstatus=$(docker inspect -f '{{.State.Status}}' "$direct" 2>/dev/null || echo missing)
     if [ "$dstatus" = exited ]; then
       dcode=$(docker inspect -f '{{.State.ExitCode}}' "$direct" 2>/dev/null || echo 1)

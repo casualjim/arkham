@@ -9,6 +9,7 @@ import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile, writeFile } from "node:fs/promises";
 import { RedisClient } from "bun";
+import { Client } from "ldapts";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
@@ -18,6 +19,9 @@ const REDIS_URL = process.env.REDIS_URL ?? "";
 const REDIS_TLS_URL = process.env.REDIS_TLS_URL ?? "";
 const SMTP_URL = process.env.SMTP_URL ?? "";
 const SMTPS_URL = process.env.SMTPS_URL ?? "";
+const LDAP_URL = process.env.LDAP_URL ?? "";
+const LDAP_TLS_URL = process.env.LDAP_TLS_URL ?? "";
+const LDAP_REAL = "arkham_real_ldap_pass_01";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -540,6 +544,124 @@ if (SMTPS_URL) {
   });
 } else {
   stage("smtps scenarios skipped: no SMTPS_URL");
+}
+
+function ldapCode(err: unknown): number | undefined {
+  if (err && typeof err === "object" && "code" in err && typeof err.code === "number") {
+    return err.code;
+  }
+  return undefined;
+}
+
+function ldapParts(raw: string) {
+  const url = new URL(raw);
+  return {
+    dn: decodeURIComponent(url.username),
+    password: decodeURIComponent(url.password),
+    host: url.hostname,
+    port: url.port,
+  };
+}
+
+function ldapPlain(raw: string) {
+  const parts = ldapParts(raw);
+  return new Client({
+    url: `ldap://${parts.host}:${parts.port}`,
+    timeout: 4000,
+    connectTimeout: 4000,
+  });
+}
+
+function ldapTls(raw: string) {
+  const parts = ldapParts(raw);
+  return new Client({
+    url: `ldaps://${parts.host}:${parts.port}`,
+    timeout: 4000,
+    connectTimeout: 4000,
+    tlsOptions: { ca, rejectUnauthorized: true, servername: parts.host },
+  });
+}
+
+async function closeLdap(client: Client) {
+  try {
+    await client.unbind();
+  } catch {
+    // A refused bind may already have dropped the socket.
+  }
+}
+
+if (LDAP_URL) {
+  const parts = ldapParts(LDAP_URL);
+  await retry("ldap", "ldap plain simple bind before starttls is refused", async () => {
+    const client = ldapPlain(LDAP_URL);
+    try {
+      await client.bind(parts.dn, parts.password);
+      return false;
+    } catch (err) {
+      const text = String(err);
+      stage(`ldap plain bind error: ${text}`);
+      return ldapCode(err) === 13 && !text.includes(LDAP_REAL);
+    } finally {
+      await closeLdap(client);
+    }
+  });
+
+  await retry("ldap", "ldap starttls simple bind swaps the decoy password", async () => {
+    const client = ldapPlain(LDAP_URL);
+    try {
+      await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+      await client.bind(parts.dn, parts.password);
+      return true;
+    } finally {
+      await closeLdap(client);
+    }
+  });
+
+  await retry("ldap", "ldap starttls non-decoy password is not swapped", async () => {
+    const client = ldapPlain(LDAP_URL);
+    try {
+      await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+      await client.bind(parts.dn, "not-the-ldap-decoy");
+      return false;
+    } catch (err) {
+      const text = String(err);
+      stage(`ldap unswapped bind error: ${text}`);
+      return ldapCode(err) === 49 && !text.includes(LDAP_REAL);
+    } finally {
+      await closeLdap(client);
+    }
+  });
+} else {
+  stage("ldap scenarios skipped: no LDAP_URL");
+}
+
+if (LDAP_TLS_URL) {
+  const parts = ldapParts(LDAP_TLS_URL);
+  await retry("ldaps", "ldaps simple bind swaps the decoy password", async () => {
+    const client = ldapTls(LDAP_TLS_URL);
+    try {
+      await client.bind(parts.dn, parts.password);
+      return true;
+    } finally {
+      await closeLdap(client);
+    }
+  });
+
+  await retry("ldaps", "ldaps non-decoy password is not swapped", async () => {
+    const client = ldapTls(LDAP_TLS_URL);
+    try {
+      await client.bind(parts.dn, "not-the-ldap-decoy");
+      return false;
+    } catch (err) {
+      const text = String(err);
+      stage(`ldaps unswapped bind error: ${text}`);
+      return ldapCode(err) === 49 && !text.includes(LDAP_REAL);
+    } finally {
+      await closeLdap(client);
+    }
+  });
+} else {
+  stage("ldaps scenarios skipped: no LDAP_TLS_URL");
 }
 
 const coveredPath = process.env.ARKHAM_COVERED ?? "";

@@ -91,3 +91,17 @@ value = "smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587"
 [rules.smtps]
 env = "SMTPS_URL"
 value = "smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465"
+
+# LDAP plaintext on the directory's cleartext port. The fake string is what
+# the client dials. StartTLS upgrades that leg; the real string's
+# `sslrootcert` is the anchor for the upstream handshake after the upgrade.
+# The decoy password is shorter than the real one: BER reframes the bind.
+[rules.ldap_plain]
+env = "LDAP_URL"
+value = "ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3389"
+
+# LDAPS: TLS from the first byte on both legs. The real string carries the
+# same trust anchor. No allow entries; the connection string is the grant.
+[rules.ldap_tls]
+env = "LDAP_TLS_URL"
+value = "ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636"
