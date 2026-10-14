@@ -592,6 +592,10 @@ async function closeLdap(client: Client) {
 
 if (LDAP_URL) {
   const parts = ldapParts(LDAP_URL);
+  // nsslapd-require-secure-binds answers every cleartext bind with 13, decoy
+  // or real, so this check cannot see whether the password was swapped. The
+  // in-process test compares those bytes. The directory's rejection of the
+  // decoy itself (result 49) is an LDAPS bind inside the ldap container.
   await retry("ldap", "ldap plain simple bind before starttls is refused", async () => {
     const client = ldapPlain(LDAP_URL);
     try {

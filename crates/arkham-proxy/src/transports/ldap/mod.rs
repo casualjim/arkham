@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf, split};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
@@ -17,7 +16,6 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use arkham_config::grants::{GuestTlsMode, LdapScope, RootCert};
 use arkham_pki::ca::CertAuthority;
-use arkham_pki::ca::generate_domain_pair;
 
 use super::PairCtx;
 use super::{ServeStream, TlsHalves, Transport};
@@ -27,6 +25,7 @@ use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
 use crate::relay::{log_hits, relay_guarded};
 use crate::transports::engine::{Direction, Ldap, Rewritten, Wire};
+use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
 use machine::starttls_success;
 use rama::tls::client::ClientAuth;
 
@@ -57,104 +56,6 @@ impl LdapTransport {
       roots: DashMap::new(),
     })
   }
-
-  /// Leaf for one name, cached.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted.
-  fn leaf(&self, sni: &str) -> Result<Arc<ServerConfig>, Error> {
-    if let Some(config) = self.leaves.get(sni) {
-      return Ok(config.clone());
-    }
-    let config = Arc::new((*self.ca.generate_domain_cert(sni)?.server_config).clone());
-    self.leaves.insert(sni.to_string(), Arc::clone(&config));
-    Ok(config)
-  }
-
-  /// `mtls` variant of [`Self::leaf`].
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the verifier cannot
-  /// be built.
-  fn leaf_mtls(&self, sni: &str) -> Result<Arc<ServerConfig>, Error> {
-    let cache_key = format!("{sni}|mtls");
-    if let Some(config) = self.leaves.get(&cache_key) {
-      return Ok(config.clone());
-    }
-    let (chain, key_der) = generate_domain_pair(&self.ca, sni)?;
-    let mut roots = RootCertStore::empty();
-    roots
-      .add(self.ca.cert_der().clone())
-      .map_err(|err| Error::MtlsGuestRoots { source: err })?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-      .build()
-      .map_err(|err| Error::MtlsGuestVerifier { source: err.into() })?;
-    let config = Arc::new(
-      rustls::server::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(chain, key_der)
-        .map_err(|err| Error::MtlsLeaf { source: err })?,
-    );
-    self.leaves.insert(cache_key, Arc::clone(&config));
-    Ok(config)
-  }
-
-  /// Trust anchors for the upstream leg.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the anchor cannot be read or holds no certificates.
-  fn roots_for(&self, root: &RootCert) -> Result<Arc<RootCertStore>, Error> {
-    if let Some(store) = self.roots.get(root) {
-      return Ok(store.clone());
-    }
-    let store = match root {
-      RootCert::Path(path) => {
-        let pem = std::fs::read(path).map_err(|err| Error::SslRootCert {
-          path: path.clone(),
-          source: err.into(),
-        })?;
-        let mut store = RootCertStore::empty();
-        let mut anchors = 0usize;
-        for cert in CertificateDer::pem_slice_iter(&pem) {
-          let cert = cert.map_err(|err| Error::SslRootCert {
-            path: path.clone(),
-            source: err.into(),
-          })?;
-          store.add(cert).map_err(|err| Error::SslRootCert {
-            path: path.clone(),
-            source: err.into(),
-          })?;
-          anchors += 1;
-        }
-        if anchors == 0 {
-          return Err(Error::EmptyRootCert { path: path.clone() });
-        }
-        store
-      }
-      RootCert::System => {
-        let mut native = rustls_native_certs::load_native_certs();
-        if !native.errors.is_empty() {
-          return Err(Error::SystemStore {
-            source: native.errors.remove(0).into(),
-          });
-        }
-        let mut store = RootCertStore::empty();
-        for cert in native.certs {
-          store.add(cert).map_err(|err| Error::SystemStore { source: err.into() })?;
-        }
-        if store.is_empty() {
-          return Err(Error::EmptySystemStore);
-        }
-        store
-      }
-    };
-    let store = Arc::new(store);
-    self.roots.insert(root.clone(), Arc::clone(&store));
-    Ok(store)
-  }
 }
 
 impl TlsHalves for LdapTransport {
@@ -170,8 +71,8 @@ impl TlsHalves for LdapTransport {
     G: AsyncRead + AsyncWrite + Unpin,
   {
     let config = match guest_tls {
-      GuestTlsMode::Tls => self.leaf(name)?,
-      GuestTlsMode::Mtls => self.leaf_mtls(name)?,
+      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, None)?,
+      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, None)?,
     };
     TlsAcceptor::from(config)
       .accept(guest)
@@ -190,7 +91,7 @@ impl TlsHalves for LdapTransport {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     let root = scope.root_cert.clone().unwrap_or(RootCert::System);
-    let roots = self.roots_for(&root)?;
+    let roots = cached_roots(&self.roots, &root)?;
     let builder = ClientConfig::builder().with_root_certificates(roots);
     let config = match (&scope.client_cert, &scope.client_key) {
       (Some(cert), Some(key)) => {
@@ -315,8 +216,8 @@ struct Split<G, S> {
 }
 
 impl LdapTransport {
-  /// Both legs already know their transport. LDAPS, or cleartext with no
-  /// upgrade, lands here.
+  /// Both legs already know their transport. The password is swapped only
+  /// when the upstream writer is TLS. A cleartext upstream keeps the decoy.
   async fn relay_settled<G, S>(&self, guest: OpenGuest<G>, upstream: S, pump: &Pump<'_>, upstream_name: &str) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -324,29 +225,31 @@ impl LdapTransport {
   {
     let OpenGuest { stream, head, tls } = guest;
     let scope = pump.scope;
+    let swap = scope.is_upstream_tls;
     match (tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx).await,
+      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx, swap).await,
       (Some((hello_buf, identity)), false) => {
         let plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
-        relay(plain, upstream, pump.ctx).await
+        relay(plain, upstream, pump.ctx, swap).await
       }
       (None, true) => {
         let plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(head, stream), plain, pump.ctx).await
+        relay(Prefixed::new(head, stream), plain, pump.ctx, swap).await
       }
       (Some((hello_buf, identity)), true) => {
         let guest_plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
         let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, pump.ctx).await
+        relay(guest_plain, server_plain, pump.ctx, swap).await
       }
     }
   }
 
   /// Plaintext LDAP until a `StartTLS` request has been answered, then TLS.
+  /// The pre-upgrade pair swaps only when the upstream socket is already TLS.
   async fn until_starttls<G, S>(&self, guest: G, server: S, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -354,7 +257,7 @@ impl LdapTransport {
   {
     let (mut guest_r, mut guest_w) = split(guest);
     let (mut server_r, mut server_w) = split(server);
-    let (mut down, mut up) = ldap_pair(pump.ctx);
+    let (mut down, mut up) = ldap_pair(pump.ctx, !pump.upgrade_upstream);
     let mut guest_buf = vec![0u8; 16 * 1024];
     let mut server_buf = vec![0u8; 16 * 1024];
     loop {
@@ -429,7 +332,7 @@ impl LdapTransport {
     let guest_plain = self
       .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls)
       .await?;
-    let (mut downstream, mut upstream) = ldap_pair(pump.ctx);
+    let (mut downstream, mut upstream) = ldap_pair(pump.ctx, true);
     if pump.upgrade_upstream {
       let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
       relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[]).await
@@ -549,20 +452,21 @@ where
   }
 }
 
-/// Pump one settled pair. Both legs are plaintext by the time this runs.
-async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>) -> Result<(), Error>
+/// Pump one settled pair. `swap` is set only when `server` is already TLS.
+async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, swap: bool) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let (mut downstream, mut upstream) = ldap_pair(ctx);
+  let (mut downstream, mut upstream) = ldap_pair(ctx, swap);
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[]).await
 }
 
-/// Both directions for an LDAP scope.
-pub(crate) fn ldap_pair(ctx: &PairCtx<'_>) -> (Ldap, Ldap) {
+/// Both directions for an LDAP scope. `swap` applies to the downstream leg:
+/// a cleartext upstream must keep the decoy.
+pub(crate) fn ldap_pair(ctx: &PairCtx<'_>, swap: bool) -> (Ldap, Ldap) {
   (
-    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream),
-    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream),
+    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap),
+    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream, false),
   )
 }

@@ -288,6 +288,17 @@ services:
           exit 1
         fi
         dsconf localhost config replace nsslapd-require-secure-binds=on
+        # The decoy itself is not a directory credential. This bind stays
+        # inside the container, so the proxy cannot rewrite it. Result 49
+        # is invalid credentials. A different password would not prove this.
+        set +e
+        LDAPTLS_REQCERT=never ldapsearch -H ldaps://127.0.0.1:3636 -x -D "cn=Directory Manager" -w "arkham_fake_ldap_pass" -b "" -s base >/dev/null 2>&1 # nosemgrep: deterministic demo decoy, not a credential
+        code=$$?
+        set -e
+        if [ "$$code" != 49 ]; then
+          echo "decoy bind returned $$code" >&2
+          exit 1
+        fi
         wait "$$child"
     healthcheck:
       test: ["CMD-SHELL", "dsconf localhost config get nsslapd-require-secure-binds | grep -q 'nsslapd-require-secure-binds: on'"]

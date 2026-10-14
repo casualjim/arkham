@@ -1,12 +1,14 @@
 //! LDAP wire format: simple-bind password rewrite over BER.
 //!
-//! Downstream frames `LDAPMessage` values with a BER length reader, then
-//! `rasn` decodes each one. A simple bind whose password is the decoy is
-//! re-encoded with the real password (and the upstream bind DN, when the
-//! two legs name different ones). Every other message, including `StartTLS`,
-//! is forwarded byte-identical. Upstream redacts a diagnostic that carries
-//! the real password back to the decoy and closes if the real password
-//! would still leave the proxy.
+//! Downstream frames `LDAPMessage` values with a definite-length BER reader
+//! (RFC 4511). A simple bind whose password is the decoy is re-encoded with
+//! the real password only when `swap` is set, which the transport sets once
+//! the upstream writer is TLS. A cleartext upstream keeps the decoy bytes.
+//! The upstream bind DN is written when the two legs name different ones.
+//! `StartTLS` is forwarded byte-identical either way. Upstream fully decodes
+//! a message only when its bytes contain the real password or it is the
+//! `StartTLS` reply being waited on. A diagnostic that still carries the
+//! real password after redaction closes the leg.
 
 use std::borrow::Cow;
 
@@ -17,15 +19,19 @@ use secrecy::ExposeSecret as _;
 
 use crate::transports::engine::{Direction, Hit, Location, Rewritten, Wire};
 
-/// Cap for one buffered LDAP message. A simple bind is tens of bytes;
-/// anything past this is a drip or an attack, never a bind.
+/// Cap for one downstream LDAP message. A simple bind is tens of bytes;
+/// anything past this is not a bind we will reframe. The cap is per message,
+/// and the upstream leg does not use it: a search result can be larger.
 const MAX_MESSAGE: usize = 64 * 1024;
-
-/// Nested BER depth past which a message is not a bind we will reframe.
-const MAX_DEPTH: usize = 32;
 
 /// `StartTLS` extended operation OID (RFC 4511).
 const STARTTLS_OID: &[u8] = b"1.3.6.1.4.1.1466.20037";
+
+/// `APPLICATION 0` constructed: `BindRequest`.
+const BIND_REQUEST_TAG: u8 = 0x60;
+
+/// `APPLICATION 23` constructed: `ExtendedRequest`.
+const EXTENDED_REQUEST_TAG: u8 = 0x77;
 
 /// One LDAP direction leg.
 pub(crate) struct Ldap {
@@ -49,6 +55,8 @@ struct Down {
   upstream_dn: String,
   label: String,
   closed: bool,
+  /// Rewrite a matching simple bind. False while the upstream writer is cleartext.
+  swap: bool,
 }
 
 /// Upstream redaction state.
@@ -63,8 +71,10 @@ struct Up {
 }
 
 impl Ldap {
-  /// Fresh leg. Downstream swaps binds; upstream redacts diagnostics.
-  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction) -> Self {
+  /// Fresh leg. `swap` is downstream only: a simple bind is rewritten when
+  /// the upstream writer is already TLS. A cleartext upstream keeps the decoy.
+  /// Upstream always redacts a diagnostic that carries the real password.
+  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction, swap: bool) -> Self {
     let down = if dir == Direction::Downstream {
       grants.iter().find_map(|grant| {
         let scope = grant.ldap(Some(host), port)?;
@@ -76,6 +86,7 @@ impl Ldap {
           upstream_dn: scope.upstream.dn.clone(),
           label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
           closed: false,
+          swap,
         })
       })
     } else {
@@ -180,14 +191,10 @@ impl Ldap {
       };
     }
     down.buf.extend_from_slice(chunk);
-    if down.buf.len() > MAX_MESSAGE {
-      down.closed = true;
-      return (Rewritten::Close, Vec::new());
-    }
     let mut out = Vec::new();
     let mut hits = Vec::new();
     loop {
-      let frame = match take_message(&mut down.buf) {
+      let frame = match take_message(&mut down.buf, Some(MAX_MESSAGE)) {
         Ok(None) => break,
         Ok(Some(frame)) => frame,
         Err(()) => {
@@ -237,14 +244,10 @@ impl Ldap {
       };
     }
     up.buf.extend_from_slice(chunk);
-    if up.buf.len() > MAX_MESSAGE {
-      up.closed = true;
-      return (Rewritten::Close, Vec::new());
-    }
     let mut out = Vec::new();
     let mut hits = Vec::new();
     loop {
-      let frame = match take_message(&mut up.buf) {
+      let frame = match take_message(&mut up.buf, None) {
         Ok(None) => break,
         Ok(Some(frame)) => frame,
         Err(()) => {
@@ -294,21 +297,41 @@ enum Redacted {
   },
 }
 
-/// Swap a simple bind, or notice `StartTLS`. Unchanged messages stay the
-/// original bytes so a non-matching bind is byte-identical.
+/// Swap a simple bind, or notice `StartTLS`. Only those two operations are
+/// fully decoded. Everything else, including a bind while `swap` is off,
+/// stays the original bytes.
 fn rewrite_down(frame: &[u8], down: &Down) -> Result<RewrittenDown, ()> {
-  let message: LdapMessage = rasn::ber::decode(frame).map_err(|_err| ())?;
-  match message.protocol_op {
-    ProtocolOp::BindRequest(request) => rewrite_bind(&request, message.message_id, down),
-    ProtocolOp::ExtendedReq(request) if request.request_name.as_ref() == STARTTLS_OID && request.request_value.is_none() => {
-      Ok(RewrittenDown::StartTls { id: message.message_id })
-    }
-    _ => Ok(RewrittenDown::Same),
+  let Some(tag) = protocol_op_tag(frame) else {
+    return Err(());
+  };
+  if tag == EXTENDED_REQUEST_TAG {
+    return rewrite_extended(frame);
   }
+  if tag == BIND_REQUEST_TAG && down.swap {
+    let message: LdapMessage = rasn::ber::decode(frame).map_err(|_err| ())?;
+    let ProtocolOp::BindRequest(request) = &message.protocol_op else {
+      return Ok(RewrittenDown::Same);
+    };
+    return rewrite_bind(request, &message, down);
+  }
+  Ok(RewrittenDown::Same)
+}
+
+/// Notice a `StartTLS` extended request. Any other extended request is
+/// forwarded as the original bytes.
+fn rewrite_extended(frame: &[u8]) -> Result<RewrittenDown, ()> {
+  let message: LdapMessage = rasn::ber::decode(frame).map_err(|_err| ())?;
+  if let ProtocolOp::ExtendedReq(request) = &message.protocol_op
+    && request.request_name.as_ref() == STARTTLS_OID
+    && request.request_value.is_none()
+  {
+    return Ok(RewrittenDown::StartTls { id: message.message_id });
+  }
+  Ok(RewrittenDown::Same)
 }
 
 /// Re-encode a simple bind whose password is the decoy.
-fn rewrite_bind(request: &BindRequest, message_id: u32, down: &Down) -> Result<RewrittenDown, ()> {
+fn rewrite_bind(request: &BindRequest, message: &LdapMessage, down: &Down) -> Result<RewrittenDown, ()> {
   let AuthenticationChoice::Simple(password) = &request.authentication else {
     return Ok(RewrittenDown::Same);
   };
@@ -325,10 +348,23 @@ fn rewrite_bind(request: &BindRequest, message_id: u32, down: &Down) -> Result<R
     dn,
     AuthenticationChoice::Simple(OctetString::from(down.real.as_bytes())),
   );
-  let encoded = rasn::ber::encode(&LdapMessage::new(message_id, ProtocolOp::BindRequest(swapped))).map_err(|_err| ())?;
-  // A re-encode that still carries the decoy, or that dropped the real
-  // password, is not a swap. Close rather than send the decoy upstream.
-  if contains_bytes(&encoded, down.fake.as_bytes()) || !contains_bytes(&encoded, down.real.as_bytes()) {
+  let mut encoded_message = LdapMessage::new(message.message_id, ProtocolOp::BindRequest(swapped));
+  encoded_message.controls = message.controls.clone();
+  let encoded = rasn::ber::encode(&encoded_message).map_err(|_err| ())?;
+  // The password field of the re-encoded bind must be the real password.
+  // Comparing the whole encoding would reject a decoy that is a substring
+  // of the DN or of the real password.
+  let check: LdapMessage = rasn::ber::decode(&encoded).map_err(|_err| ())?;
+  if check.controls != message.controls {
+    return Err(());
+  }
+  let ProtocolOp::BindRequest(checked) = &check.protocol_op else {
+    return Err(());
+  };
+  let AuthenticationChoice::Simple(checked_password) = &checked.authentication else {
+    return Err(());
+  };
+  if checked_password.as_ref() != down.real.as_bytes() {
     return Err(());
   }
   Ok(RewrittenDown::Swapped {
@@ -344,6 +380,13 @@ fn rewrite_bind(request: &BindRequest, message_id: u32, down: &Down) -> Result<R
 fn redact_up(frame: &[u8], up: &mut Up) -> Result<Redacted, ()> {
   let secret = up.real.as_bytes();
   let leaked = contains_bytes(frame, secret);
+  let awaiting = match up.expect_id {
+    Some(expect) => message_id(frame).is_none_or(|id| id == expect),
+    None => false,
+  };
+  if !leaked && !awaiting {
+    return Ok(Redacted::Same);
+  }
   let mut message: LdapMessage = rasn::ber::decode(frame).map_err(|_err| ())?;
   let starttls_ok = starttls_result(&message, up.expect_id);
   if starttls_ok.is_some() {
@@ -408,115 +451,113 @@ fn diagnostic_mut(op: &mut ProtocolOp) -> Option<&mut LdapString> {
   }
 }
 
-/// Take one complete LDAP message off `buf`. `Ok(None)` while it is short.
-/// `Err` when the bytes cannot be a BER LDAP message.
-fn take_message(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, ()> {
-  let Some(&first) = buf.first() else {
+/// Take one complete LDAP message off `buf`. `cap` limits that one message;
+/// `None` does not. `Ok(None)` while the header or contents are still short.
+/// `Err` when the outer tag is not a definite-length `SEQUENCE`, the length
+/// is illegal, or the message exceeds `cap`. RFC 4511 is definite-length only.
+fn take_message(buf: &mut Vec<u8>, cap: Option<usize>) -> Result<Option<Vec<u8>>, ()> {
+  let Some(&tag) = buf.first() else {
     return Ok(None);
   };
-  if first != 0x30 {
+  if tag != 0x30 {
     return Err(());
   }
-  let Some(len) = ber_value_len(buf)? else {
+  let Some(&len_byte) = buf.get(1) else {
     return Ok(None);
   };
-  if len > buf.len() {
-    return Ok(None);
-  }
-  Ok(Some(buf.drain(..len).collect()))
-}
-
-/// Total length of one BER value, tag and length octets included.
-/// `Ok(None)` while the header or contents are still short.
-fn ber_value_len(input: &[u8]) -> Result<Option<usize>, ()> {
-  ber_value_len_at(input, 0)
-}
-
-/// `depth` counts nested indefinite values.
-fn ber_value_len_at(input: &[u8], depth: usize) -> Result<Option<usize>, ()> {
-  if depth > MAX_DEPTH {
-    return Err(());
-  }
-  let Some(&tag) = input.first() else {
-    return Ok(None);
-  };
-  let mut index = 1usize;
-  if tag & 0x1f == 0x1f {
-    loop {
-      let Some(&byte) = input.get(index) else {
-        return Ok(None);
-      };
-      index = index.checked_add(1).ok_or(())?;
-      if index > 8 {
-        return Err(());
-      }
-      if byte & 0x80 == 0 {
-        break;
-      }
-    }
-  }
-  let Some(&len_byte) = input.get(index) else {
-    return Ok(None);
-  };
-  index = index.checked_add(1).ok_or(())?;
   if len_byte == 0x80 {
-    if tag & 0x20 == 0 {
-      return Err(());
-    }
-    return indefinite_end(input, index, depth);
+    return Err(());
   }
   let (content_len, header_end) = if len_byte < 0x80 {
-    (usize::from(len_byte), index)
+    (usize::from(len_byte), 2usize)
   } else {
     let octets = usize::from(len_byte & 0x7f);
     if octets == 0 || octets > 4 {
       return Err(());
     }
-    let end = index.checked_add(octets).ok_or(())?;
-    if input.len() < end {
+    let end = 2usize.checked_add(octets).ok_or(())?;
+    if buf.len() < end {
       return Ok(None);
     }
     let mut len = 0usize;
-    let bytes = input.get(index..end).ok_or(())?;
+    let bytes = buf.get(2..end).ok_or(())?;
     for byte in bytes {
       len = len.checked_shl(8).ok_or(())?.checked_add(usize::from(*byte)).ok_or(())?;
     }
     (len, end)
   };
   let total = header_end.checked_add(content_len).ok_or(())?;
-  if total > MAX_MESSAGE {
+  if cap.is_some_and(|limit| total > limit) {
     return Err(());
   }
-  if input.len() < total { Ok(None) } else { Ok(Some(total)) }
+  if buf.len() < total {
+    return Ok(None);
+  }
+  Ok(Some(buf.drain(..total).collect()))
 }
 
-/// End offset of an indefinite-length value, including the end-of-contents.
-fn indefinite_end(input: &[u8], mut index: usize, depth: usize) -> Result<Option<usize>, ()> {
-  let nested = depth.checked_add(1).ok_or(())?;
-  loop {
-    if index > MAX_MESSAGE {
-      return Err(());
-    }
-    let Some(&first) = input.get(index) else {
-      return Ok(None);
-    };
-    let next = index.checked_add(1).ok_or(())?;
-    if first == 0 {
-      let Some(&second) = input.get(next) else {
-        return Ok(None);
-      };
-      if second == 0 {
-        return Ok(next.checked_add(1));
-      }
-    }
-    let Some(rest) = input.get(index..) else {
-      return Ok(None);
-    };
-    match ber_value_len_at(rest, nested)? {
-      None => return Ok(None),
-      Some(len) => index = index.checked_add(len).ok_or(())?,
-    }
+/// Content of the outer definite-length `SEQUENCE`, when `frame` is one.
+fn sequence_content(frame: &[u8]) -> Option<&[u8]> {
+  let (&tag, rest) = frame.split_first()?;
+  if tag != 0x30 {
+    return None;
   }
+  let (content_len, header) = definite_length(rest)?;
+  let end = header.checked_add(content_len)?;
+  rest.get(header..end)
+}
+
+/// `(content length, octets consumed from `rest`)`. `rest` starts at the
+/// length byte. `None` for a short, indefinite, or illegal length.
+fn definite_length(rest: &[u8]) -> Option<(usize, usize)> {
+  let (&len_byte, _) = rest.split_first()?;
+  if len_byte == 0x80 {
+    return None;
+  }
+  if len_byte < 0x80 {
+    return Some((usize::from(len_byte), 1));
+  }
+  let octets = usize::from(len_byte & 0x7f);
+  if octets == 0 || octets > 4 {
+    return None;
+  }
+  let header = 1usize.checked_add(octets)?;
+  let bytes = rest.get(1..header)?;
+  let mut len = 0usize;
+  for byte in bytes {
+    len = len.checked_shl(8)?.checked_add(usize::from(*byte))?;
+  }
+  Some((len, header))
+}
+
+/// `messageID`, the first `INTEGER` inside the outer `SEQUENCE`.
+fn message_id(frame: &[u8]) -> Option<u32> {
+  let content = sequence_content(frame)?;
+  let (&tag, rest) = content.split_first()?;
+  if tag != 0x02 {
+    return None;
+  }
+  let (len, header) = definite_length(rest)?;
+  if len == 0 || len > 4 {
+    return None;
+  }
+  let bytes = rest.get(header..header.checked_add(len)?)?;
+  let mut id = 0u32;
+  for byte in bytes {
+    id = id.checked_shl(8)?.checked_add(u32::from(*byte))?;
+  }
+  Some(id)
+}
+
+/// Tag of `protocolOp`, the value after `messageID`.
+fn protocol_op_tag(frame: &[u8]) -> Option<u8> {
+  let content = sequence_content(frame)?;
+  let (&tag, rest) = content.split_first()?;
+  if tag != 0x02 {
+    return None;
+  }
+  let (len, header) = definite_length(rest)?;
+  rest.get(header.checked_add(len)?).copied()
 }
 
 /// `true` when `needle` occurs in `hay`. An empty needle never matches.
@@ -563,11 +604,11 @@ mod tests {
   }
 
   fn down() -> Ldap {
-    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream)
+    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, true)
   }
 
   fn up() -> Ldap {
-    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Upstream)
+    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Upstream, false)
   }
 
   fn bind_frame(id: u32, dn: &str, password: &str) -> Vec<u8> {
@@ -652,6 +693,141 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn cleartext_bind_forwards_the_decoy() {
+    let frame = bind_frame(1, DN, FAKE_PW);
+    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false);
+    let out = emit(&mut machine, &frame).await;
+    assert_eq!(out, frame);
+  }
+
+  #[tokio::test]
+  async fn starttls_is_noticed_while_the_password_stays_put() {
+    let mut bytes = bind_frame(1, DN, FAKE_PW);
+    bytes.extend_from_slice(&starttls_frame(2));
+    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false);
+    let out = emit(&mut machine, &bytes).await;
+    assert_eq!(out, bytes);
+    assert_eq!(machine.take_starttls(), Some(2));
+  }
+
+  #[tokio::test]
+  async fn bind_controls_survive_the_swap() {
+    let mut message = LdapMessage::new(
+      3,
+      ProtocolOp::BindRequest(BindRequest::new(
+        3,
+        LdapString::from(DN),
+        AuthenticationChoice::Simple(OctetString::from(FAKE_PW.as_bytes())),
+      )),
+    );
+    message.controls = Some(vec![rasn_ldap::Control::new(
+      OctetString::from_static(b"1.2.840.113556.1.4.319"),
+      true,
+      Some(OctetString::from_static(b"page")),
+    )]);
+    let frame = rasn::ber::encode(&message).unwrap();
+    let mut machine = down();
+    let out = emit(&mut machine, &frame).await;
+    let decoded: LdapMessage = rasn::ber::decode(&out).unwrap();
+    assert_eq!(decoded.controls, message.controls);
+    let ProtocolOp::BindRequest(request) = decoded.protocol_op else {
+      panic!("bind");
+    };
+    let AuthenticationChoice::Simple(password) = request.authentication else {
+      panic!("simple");
+    };
+    assert_eq!(password.as_ref(), REAL_PW.as_bytes());
+  }
+
+  #[tokio::test]
+  async fn decoy_that_is_a_substring_of_the_dn_still_swaps() {
+    let dn = "cn=Directory Manager";
+    let fake = "cn";
+    let real = "cn-real-secret";
+    let parsed = LdapScope::from_strings(
+      &format!("ldap://{}:{fake}@ldap:389", encode_user(dn)),
+      &format!("ldap://{}:{real}@ldap:389", encode_user(dn)),
+    )
+    .unwrap();
+    let grants = vec![Grant::Ldap {
+      credential: Credential {
+        label: "ldap".into(),
+        fake: fake.into(),
+        value: SecretString::from(real),
+      },
+      scope: Box::new(parsed),
+    }];
+    let mut machine = Ldap::new(&grants, "ldap", 389, Direction::Downstream, true);
+    let out = emit(&mut machine, &bind_frame(1, dn, fake)).await;
+    let message: LdapMessage = rasn::ber::decode(&out).unwrap();
+    let ProtocolOp::BindRequest(request) = message.protocol_op else {
+      panic!("bind");
+    };
+    let AuthenticationChoice::Simple(password) = request.authentication else {
+      panic!("simple");
+    };
+    assert_eq!(password.as_ref(), real.as_bytes());
+    assert_eq!(request.name.0, dn);
+  }
+
+  #[tokio::test]
+  async fn many_small_messages_past_the_cap_still_forward() {
+    let frame = bind_frame(1, DN, "not-the-decoy");
+    let mut bytes = Vec::new();
+    while bytes.len() <= MAX_MESSAGE {
+      bytes.extend_from_slice(&frame);
+    }
+    let mut machine = down();
+    let out = emit(&mut machine, &bytes).await;
+    assert_eq!(out, bytes);
+    assert!(out.len() > MAX_MESSAGE);
+  }
+
+  #[tokio::test]
+  async fn downstream_message_over_the_cap_closes() {
+    let header = [0x30, 0x84, 0x00, 0x01, 0x00, 0x01];
+    let mut machine = down();
+    let (rewritten, _) = machine.feed(&header).await;
+    assert!(matches!(rewritten, Rewritten::Close));
+  }
+
+  #[tokio::test]
+  async fn indefinite_length_closes() {
+    let mut machine = down();
+    let (rewritten, _) = machine.feed(&[0x30, 0x80]).await;
+    assert!(matches!(rewritten, Rewritten::Close));
+  }
+
+  #[tokio::test]
+  async fn upstream_message_over_the_cap_is_forwarded() {
+    let content_len = MAX_MESSAGE + 1;
+    let mut frame = vec![0x30, 0x84];
+    let len = u32::try_from(content_len).unwrap();
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.resize(frame.len() + content_len, 0x00);
+    let mut machine = up();
+    let out = emit(&mut machine, &frame).await;
+    assert_eq!(out, frame);
+  }
+
+  #[tokio::test]
+  async fn upstream_non_secret_message_is_not_decoded() {
+    let frame = [0x30, 0x06, 0x02, 0x01, 0x01, 0x42, 0x01, 0x00];
+    let mut machine = up();
+    let out = emit(&mut machine, &frame).await;
+    assert_eq!(out, frame);
+  }
+
+  #[tokio::test]
+  async fn unreadable_starttls_response_closes() {
+    let frame = [0x30, 0x06, 0x02, 0x01, 0x04, 0x42, 0x01, 0x00];
+    let mut machine = up();
+    machine.expect_starttls(4);
+    let (rewritten, _) = machine.feed(&frame).await;
+    assert!(matches!(rewritten, Rewritten::Close));
+  }
+
+  #[tokio::test]
   async fn non_matching_password_is_byte_identical() {
     let frame = bind_frame(1, DN, "not-the-decoy");
     let mut machine = down();
@@ -661,7 +837,7 @@ mod tests {
 
   #[tokio::test]
   async fn differing_dns_swap_with_the_password() {
-    let mut machine = Ldap::new(&grant(DN, "cn=svc,dc=example,dc=com"), "ldap", 389, Direction::Downstream);
+    let mut machine = Ldap::new(&grant(DN, "cn=svc,dc=example,dc=com"), "ldap", 389, Direction::Downstream, true);
     let out = emit(&mut machine, &bind_frame(1, DN, FAKE_PW)).await;
     let message: LdapMessage = rasn::ber::decode(&out).unwrap();
     let ProtocolOp::BindRequest(request) = message.protocol_op else {

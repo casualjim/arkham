@@ -13,6 +13,7 @@ pub(crate) mod redis;
 pub(crate) mod smtp;
 pub(crate) mod ssh;
 pub(crate) mod tcp;
+pub(crate) mod tls;
 
 use arkham_config::grants::{Grant, GuestTlsMode};
 use tokio::io::{AsyncRead, AsyncWrite};

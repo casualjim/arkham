@@ -1,5 +1,5 @@
-//! LDAP simple bind through the MITM: cleartext swap, `StartTLS` upgrade,
-//! and LDAPS with no SNI.
+//! LDAP simple bind through the MITM: a cleartext upstream keeps the decoy,
+//! `StartTLS` swaps only after the upgrade, and LDAPS swaps from the first byte.
 
 use super::*;
 use arkham_config::grants::LdapScope;
@@ -81,7 +81,7 @@ async fn connect_through_proxy(proxy_addr: SocketAddr, stub_port: u16) -> TcpStr
 }
 
 #[tokio::test]
-async fn ldap_simple_bind_swaps_over_cleartext() {
+async fn ldap_cleartext_bind_forwards_the_decoy() {
   let fx = mitm_fixture(|port| {
     vec![ldap_grant(
       &format!("ldap://{}:{FAKE}@localhost:{port}", user(DN)),
@@ -92,11 +92,11 @@ async fn ldap_simple_bind_swaps_over_cleartext() {
   let stub_task = tokio::spawn(async move {
     let (mut conn, _) = fx.stub.accept().await.unwrap();
     let request = read_message(&mut conn).await;
-    assert_eq!(simple_password(&request), VALUE.as_bytes());
+    assert_eq!(simple_password(&request), FAKE.as_bytes());
     let response = LdapMessage::new(
       request.message_id,
       ProtocolOp::BindResponse(BindResponse::new(
-        ResultCode::Success,
+        ResultCode::InvalidCredentials,
         LdapString::from(""),
         LdapString::from(""),
         None,
@@ -111,7 +111,7 @@ async fn ldap_simple_bind_swaps_over_cleartext() {
   let ProtocolOp::BindResponse(body) = response.protocol_op else {
     panic!("bind response");
   };
-  assert_eq!(body.result_code, ResultCode::Success);
+  assert_eq!(body.result_code, ResultCode::InvalidCredentials);
   drop(stream);
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   fx.proxy.abort();
