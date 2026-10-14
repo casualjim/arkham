@@ -24,6 +24,12 @@ ignore = [
   "RUSTSEC-2026-0099",
   "RUSTSEC-2026-0104",
 
+  # rustls 0.21.12 (same hyper-rustls 0.24 leg) has no backport of the
+  # 0.23.46 fixes. Direct rustls is locked at >=0.23.46, so these match
+  # only the 0.21 copy. Unblock with that hyper 0.14 drop.
+  "RUSTSEC-2026-0346",
+  "RUSTSEC-2026-0349",
+
   # Marvinattack on rsa; no fixed release exists upstream, both locked
   # versions are affected. Revisit when a fix ships.
   "RUSTSEC-2023-0071",
