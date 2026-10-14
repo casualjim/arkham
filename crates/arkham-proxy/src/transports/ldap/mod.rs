@@ -262,32 +262,30 @@ impl LdapTransport {
         let (mut downstream, mut upstream) = ldap_pair(pump.ctx, swap);
         relay_guarded(guest, server, &mut downstream, &mut upstream, &prefix).await
       }
-      First::StartTls { id, request, handshake } => self.starttls(id, &request, &handshake, guest, server, pump).await,
+      First::StartTls(open) => self.starttls(&open, guest, server, pump).await,
     }
   }
 
   /// Forward one `StartTLS` exchange, or answer it locally when the upstream
   /// leg is already TLS, then hand both plaintext legs to [`relay_guarded`].
-  async fn starttls<G, S>(
-    &self,
-    id: u32,
-    request: &[u8],
-    handshake: &[u8],
-    mut guest: G,
-    mut server: S,
-    pump: &Pump<'_>,
-  ) -> Result<(), Error>
+  async fn starttls<G, S>(&self, open: &StartTlsOpen, mut guest: G, mut server: S, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
     let success = if pump.upgrade_upstream {
-      write_server(&mut server, request).await?;
+      write_server(&mut server, &open.request).await?;
+      if open.tail > 0 && !copy_exact(&mut guest, &mut server, open.tail).await? {
+        return Ok(());
+      }
       let mut upstream = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Upstream, false);
-      upstream.expect_starttls(id);
+      upstream.expect_starttls(open.id);
       read_starttls_result(&mut server, &mut guest, &mut upstream, pump.budget).await?
     } else {
-      let bytes = starttls_success(id).map_err(|source| Error::LdapEncode { source })?;
+      if open.tail > 0 && !discard_exact(&mut guest, open.tail).await? {
+        return Ok(());
+      }
+      let bytes = starttls_success(open.id).map_err(|source| Error::LdapEncode { source })?;
       write_guest(&mut guest, &bytes).await?;
       true
     };
@@ -296,7 +294,7 @@ impl LdapTransport {
       return Ok(());
     }
     let authority = Some(pump.scope.downstream.host.as_str());
-    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, handshake, pump.budget, authority, pump.mint).await? else {
+    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &open.handshake, pump.budget, authority, pump.mint).await? else {
       return Ok(());
     };
     let guest_plain = self
@@ -320,8 +318,20 @@ enum First {
   Close,
   /// Not `StartTLS`. `bytes` is the prefix already taken off the guest.
   Relay(Vec<u8>),
-  /// One `StartTLS` request, plus handshake bytes already read past it.
-  StartTls { id: u32, request: Vec<u8>, handshake: Vec<u8> },
+  /// One `StartTLS` request. Its controls are still on the guest socket.
+  StartTls(StartTlsOpen),
+}
+
+/// The `StartTLS` head already read, plus how many control bytes follow it.
+struct StartTlsOpen {
+  /// LDAP message id.
+  id: u32,
+  /// Bytes through the `StartTLS` OID. Controls are not included.
+  request: Vec<u8>,
+  /// Unread control bytes still on the guest socket.
+  tail: usize,
+  /// Bytes already taken that belong to the following handshake.
+  handshake: Vec<u8>,
 }
 
 /// `UnexpectedEof` from rustls is a normal FIN.
@@ -334,8 +344,8 @@ fn read_count(result: Result<usize, IoError>) -> Result<usize, IoError> {
 
 /// Read the guest one byte at a time until the first message is `StartTLS`
 /// or it is clearly something else. Stopping at that point leaves the
-/// handshake, or the rest of a bind, unread in the socket. A `StartTLS`
-/// control tail longer than [`machine::STARTTLS_CONTROLS_MAX`] closes.
+/// handshake, or the rest of a bind, unread in the socket. Controls after
+/// a `StartTLS` OID stay unread so the caller can stream them.
 async fn read_first<R>(guest: &mut R, grants: &[Grant], host: &str, port: u16) -> Result<First, Error>
 where
   R: AsyncRead + Unpin,
@@ -363,14 +373,20 @@ where
         return Ok(First::Close);
       }
       got.truncate(start);
-      return Ok(First::StartTls {
+      return Ok(First::StartTls(StartTlsOpen {
         id,
         request: got,
+        tail: 0,
         handshake,
-      });
+      }));
     }
-    if probe.is_starttls_tail() {
-      continue;
+    if let Some((id, tail)) = probe.starttls_tail() {
+      return Ok(First::StartTls(StartTlsOpen {
+        id,
+        request: got,
+        tail,
+        handshake: Vec::new(),
+      }));
     }
     match rewritten {
       Rewritten::Close => return Ok(First::Close),
@@ -463,6 +479,61 @@ where
   Ok(())
 }
 
+/// How many guest bytes one control-tail write holds. The tail itself is not stored.
+const TAIL_CHUNK: usize = 8 * 1024;
+
+/// Copy `count` guest bytes upstream. Each read is at most [`TAIL_CHUNK`].
+/// `false` when the guest closes first.
+async fn copy_exact<R, W>(guest: &mut R, server: &mut W, mut count: usize) -> Result<bool, Error>
+where
+  R: AsyncRead + Unpin,
+  W: AsyncWrite + Unpin,
+{
+  let mut buf = vec![0u8; count.min(TAIL_CHUNK)];
+  while count > 0 {
+    let want = count.min(buf.len());
+    let Some(window) = buf.get_mut(..want) else {
+      return Ok(false);
+    };
+    let n = read_count(guest.read(window).await).map_err(|source| Error::GuestRead { source })?;
+    if n == 0 {
+      return Ok(false);
+    }
+    let Some(chunk) = window.get(..n) else {
+      return Ok(false);
+    };
+    server
+      .write_all(chunk)
+      .await
+      .map_err(|source| Error::RequestChunkToUpstream { source })?;
+    count = count.saturating_sub(n);
+  }
+  server.flush().await.map_err(|source| Error::RequestHeadFlush { source })?;
+  Ok(true)
+}
+
+/// Drop `count` guest bytes. Used when `StartTLS` is answered locally and the
+/// controls must not be forwarded onto an upstream that is already TLS.
+/// `false` when the guest closes first.
+async fn discard_exact<R>(guest: &mut R, mut count: usize) -> Result<bool, Error>
+where
+  R: AsyncRead + Unpin,
+{
+  let mut buf = vec![0u8; count.min(TAIL_CHUNK)];
+  while count > 0 {
+    let want = count.min(buf.len());
+    let Some(window) = buf.get_mut(..want) else {
+      return Ok(false);
+    };
+    let n = read_count(guest.read(window).await).map_err(|source| Error::GuestRead { source })?;
+    if n == 0 {
+      return Ok(false);
+    }
+    count = count.saturating_sub(n);
+  }
+  Ok(true)
+}
+
 /// Pump one settled pair. `swap` is set only when `server` is already TLS.
 async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, swap: bool) -> Result<(), Error>
 where
@@ -491,7 +562,6 @@ mod tests {
   use rasn_ldap::{AuthenticationChoice, BindRequest, Control, ExtendedRequest, LdapMessage, LdapString, ProtocolOp};
   use secrecy::SecretString;
 
-  use super::machine::STARTTLS_CONTROLS_MAX;
   use super::*;
 
   const FAKE_PW: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
@@ -575,29 +645,55 @@ mod tests {
     let mut bytes = frame.clone();
     bytes.extend_from_slice(extra);
     let mut guest = Cursor::new(bytes);
-    let First::StartTls { id, request, handshake } = read_first(&mut guest, &grants(), "ldap", 389).await.unwrap() else {
+    let First::StartTls(StartTlsOpen {
+      id,
+      request,
+      tail,
+      handshake,
+    }) = read_first(&mut guest, &grants(), "ldap", 389).await.unwrap()
+    else {
       panic!("starttls");
     };
     assert_eq!(id, 4);
-    assert_eq!(request, frame);
     assert_eq!(handshake, [] as [u8; 0]);
+    assert!(tail > 0);
+    assert!(request.len() < frame.len());
+    let mut upstream = Cursor::new(request);
+    let pos = u64::try_from(upstream.get_ref().len()).unwrap();
+    upstream.set_position(pos);
+    assert!(copy_exact(&mut guest, &mut upstream, tail).await.unwrap());
+    assert_eq!(upstream.into_inner(), frame);
     let mut rest = Vec::new();
-    guest.read_to_end(&mut rest).await.unwrap();
+    std::io::Read::read_to_end(&mut guest, &mut rest).unwrap();
     assert_eq!(rest, extra);
   }
 
   #[tokio::test]
-  async fn starttls_control_tail_over_the_bound_closes() {
-    let head = announce_extra(&starttls_frame(false), STARTTLS_CONTROLS_MAX + 1);
-    let unread = [0x11, 0x22, 0x33, 0x44];
-    let mut bytes = head;
-    bytes.extend_from_slice(&unread);
+  async fn starttls_control_tail_is_forwarded_not_stored() {
+    let tail_len = TAIL_CHUNK + 64;
+    let head = announce_extra(&starttls_frame(false), tail_len);
+    let controls = vec![0x5a; tail_len];
+    let extra = b"\x16handshake";
+    let mut bytes = head.clone();
+    bytes.extend_from_slice(&controls);
+    bytes.extend_from_slice(extra);
     let mut guest = Cursor::new(bytes);
-    let first = read_first(&mut guest, &grants(), "ldap", 389).await.unwrap();
-    assert!(matches!(first, First::Close));
+    let First::StartTls(StartTlsOpen { request, tail, .. }) = read_first(&mut guest, &grants(), "ldap", 389).await.unwrap() else {
+      panic!("starttls");
+    };
+    assert_eq!(request, head);
+    assert_eq!(tail, tail_len);
+    assert!(request.len() < tail);
+    let mut upstream = Cursor::new(request);
+    let pos = u64::try_from(upstream.get_ref().len()).unwrap();
+    upstream.set_position(pos);
+    assert!(copy_exact(&mut guest, &mut upstream, tail).await.unwrap());
+    let mut expect = head;
+    expect.extend_from_slice(&controls);
+    assert_eq!(upstream.into_inner(), expect);
     let mut rest = Vec::new();
-    guest.read_to_end(&mut rest).await.unwrap();
-    assert_eq!(rest, unread);
+    std::io::Read::read_to_end(&mut guest, &mut rest).unwrap();
+    assert_eq!(rest, extra);
   }
 
   #[tokio::test]
@@ -610,7 +706,7 @@ mod tests {
     assert!(prefix.len() < frame.len());
     assert!(frame.starts_with(&prefix));
     let mut rest = Vec::new();
-    guest.read_to_end(&mut rest).await.unwrap();
+    std::io::Read::read_to_end(&mut guest, &mut rest).unwrap();
     let mut whole = prefix;
     whole.extend(rest);
     assert_eq!(whole, frame);

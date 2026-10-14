@@ -23,10 +23,6 @@ use crate::transports::engine::{
 /// `StartTLS` extended operation OID (RFC 4511).
 const STARTTLS_OID: &[u8] = b"1.3.6.1.4.1.1466.20037";
 
-/// Controls that may follow a `StartTLS` OID. A real control set is a few
-/// small TLVs. A longer announcement is closed and not read.
-pub(crate) const STARTTLS_CONTROLS_MAX: usize = 512;
-
 /// `APPLICATION 0` constructed: `BindRequest`.
 const BIND_REQUEST_TAG: u8 = 0x60;
 
@@ -269,11 +265,13 @@ impl Ldap {
     self.starttls_ok.take()
   }
 
-  /// The cursor is still inside a `StartTLS` message (controls after the OID).
-  /// The opening reader keeps going until [`Self::take_starttls`] fires, and
-  /// does not hand those bytes to the relay early.
-  pub(crate) fn is_starttls_tail(&self) -> bool {
-    matches!(self.phase, Phase::Tail { .. })
+  /// Message id and unread control bytes after a recognized `StartTLS` OID.
+  /// The opening streams those bytes and does not store them.
+  pub(crate) fn starttls_tail(&self) -> Option<(u32, usize)> {
+    match self.phase {
+      Phase::Tail { left, id } => Some((id, left)),
+      Phase::Head(_) | Phase::Peek(_) | Phase::Forward(_) => None,
+    }
   }
 }
 
@@ -503,9 +501,6 @@ impl Ldap {
         Ok(Step::Done)
       }
       ExtParse::StartTls { id } => {
-        if peek.left > STARTTLS_CONTROLS_MAX {
-          return Err(());
-        }
         self.pass(&peek.buf, out, hits).await?;
         if peek.left == 0 {
           self.prefix = input.to_vec();
