@@ -286,6 +286,33 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
+  /// A guest SMTP TLS handshake fails.
+  #[error("guest smtp TLS: {source}")]
+  GuestSmtpTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A server SMTP TLS handshake fails.
+  #[error("server smtp TLS: {source}")]
+  ServerSmtpTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// An SMTP upstream name cannot become a TLS server name.
+  #[error("smtp server name: {source}")]
+  SmtpServerName {
+    /// Underlying name failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+  },
+  /// An SMTP TLS handshake exceeded the configured budget.
+  #[error("smtp handshake timed out")]
+  SmtpHandshakeTimeout,
+  /// An SMTP leg was asked to start TLS when it was already in TLS.
+  #[error("smtp leg is already TLS")]
+  SmtpLegAlreadyTls,
   /// The configured client identity is empty.
   #[error("client identity `{path}` is empty", path = path.display())]
   EmptyClientIdentity {

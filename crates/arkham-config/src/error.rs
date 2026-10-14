@@ -458,6 +458,26 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
+  /// An SMTP connection string does not parse.
+  #[error("rule `{label}`: {detail}")]
+  SmtpScope {
+    /// Rule label.
+    label: String,
+    /// Parse failure.
+    detail: String,
+  },
+  /// An SMTP rule states its upstream identity outside the connection string.
+  #[error("rule `{label}`: smtp states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
+  SmtpIdentity {
+    /// Rule label.
+    label: String,
+  },
+  /// An SMTP rule states its upstream trust outside the connection string.
+  #[error("rule `{label}`: smtp states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
+  SmtpTrust {
+    /// Rule label.
+    label: String,
+  },
   /// An ssh rule mixes `ssh://` entries with other schemes.
   #[error("rule `{label}`: ssh entries cannot mix with other schemes in one rule")]
   SshMixedSchemes {

@@ -24,6 +24,8 @@ services:
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?copy integration/.env.example to integration/.env}
       ARKHAM_REDIS_REAL: ${ARKHAM_REDIS_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_REDIS_TLS_REAL: ${ARKHAM_REDIS_TLS_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_SMTP_REAL: ${ARKHAM_SMTP_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_SMTPS_REAL: ${ARKHAM_SMTPS_REAL:?copy integration/.env.example to integration/.env}
     volumes:
       - ./gen-certs.sh:/srv/gen-certs.sh:ro
       - ./gen-secrets.sh:/srv/gen-secrets.sh:ro
@@ -184,6 +186,53 @@ services:
       certs:
         condition: service_completed_successfully
 
+  # Official docker-mailserver. SMTP_ONLY stays unset: Dovecot is what
+  # answers SASL AUTH. The heavy scanners stay off so startup is the
+  # mail stack, not clamav. STARTTLS is required on 587 (the image
+  # default); 465 is implicit TLS. The account is added before
+  # supervisord, so Dovecot's user database includes it at first start.
+  mail:
+    image: mailserver/docker-mailserver@sha256:d0fe7668defe157aad57ea31b1707ad1e2fb57d7a91bdf17cbdf876549946c86
+    hostname: mail.demo.test
+    command: ["/bin/bash", "/tmp/docker-mailserver/add-account.sh"]
+    environment:
+      SSL_TYPE: manual
+      SSL_CERT_PATH: /certs/mail.crt
+      SSL_KEY_PATH: /certs/mail.key
+      PERMIT_DOCKER: connected-networks
+      POSTMASTER_ADDRESS: postmaster@demo.test
+      OVERRIDE_HOSTNAME: mail.demo.test
+      ENABLE_RSPAMD: 0
+      ENABLE_CLAMAV: 0
+      ENABLE_AMAVIS: 0
+      ENABLE_FAIL2BAN: 0
+      ENABLE_SPAMASSASSIN: 0
+      ENABLE_OPENDKIM: 0
+      ENABLE_OPENDMARC: 0
+      ENABLE_POLICYD_SPF: 0
+      ENABLE_SRS: 0
+      ENABLE_UPDATE_CHECK: 0
+      ARKHAM_SMTP_PASS: ${ARKHAM_SMTP_PASS:?copy integration/.env.example to integration/.env}
+    volumes:
+      - certs:/certs:ro
+      - ./mail/add-account.sh:/tmp/docker-mailserver/add-account.sh:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "setup email list | grep -q agent@demo.test && timeout 5 bash -c 'echo >/dev/tcp/127.0.0.1/587' && timeout 5 bash -c 'echo >/dev/tcp/127.0.0.1/465'",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 20s
+    networks:
+      server:
+        ipv4_address: 10.202.0.60
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
   client:
     image: oven/bun:1
     working_dir: /srv
@@ -196,7 +245,7 @@ services:
       - -c
       - |
         set -euo pipefail
-        apt-get update -qq && apt-get install -qq -y openssh-client
+        apt-get update -qq && apt-get install -qq -y openssh-client python3
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -226,6 +275,8 @@ services:
       OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `arkham fake OIDC_CLIENT_SECRET`, not a credential
       REDIS_URL: redis://arkham_user:arkham_fake_redis_pass@redis:6379/0 # nosemgrep: deterministic demo decoy, not a credential
       REDIS_TLS_URL: rediss://arkham_user:arkham_fake_redis_pass@redis:6380/0 # nosemgrep: deterministic demo decoy, not a credential
+      SMTP_URL: smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587 # nosemgrep: deterministic demo decoy, not a credential
+      SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
@@ -242,6 +293,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      mail:
         condition: service_healthy
 
 networks:

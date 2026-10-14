@@ -79,3 +79,15 @@ value = "redis://arkham_user:arkham_fake_redis_pass@redis:6379/0"
 [rules.redis_tls]
 env = "REDIS_TLS_URL"
 value = "rediss://arkham_user:arkham_fake_redis_pass@redis:6380/0"
+
+# SMTP submission. The fake string is what the client dials. The real
+# string in fnox says `starttls=required`, so AUTH before STARTTLS keeps
+# the decoy and AUTH after it carries the real password.
+[rules.smtp]
+env = "SMTP_URL"
+value = "smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587"
+
+# Implicit TLS on 465. Both legs are TLS from the first byte.
+[rules.smtps]
+env = "SMTPS_URL"
+value = "smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465"

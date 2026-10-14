@@ -1,15 +1,17 @@
 //! Grant model: a credential is one real secret, and a grant says what kind
 //! of endpoints that secret may be presented at. A rule is one kind, inferred
 //! from the URL schemes of its `allow` entries. The protocol verticals
-//! (`postgres`, `redis`) own their scope types and their connection-string
+//! (`postgres`, `redis`, `smtp`) own their scope types and their connection-string
 //! laws; this module owns the enum, the matching dispatch, and the
 //! collection of rules into grants.
 
 mod postgres;
 mod redis;
+mod smtp;
 
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
+pub use smtp::{SmtpLeg, SmtpScope};
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -92,6 +94,11 @@ pub enum Scheme {
   /// SSH. The proxy terminates the protocol on both legs; port defaults
   /// to 22 the way ssh itself defaults it.
   Ssh,
+  /// Cleartext SMTP. `STARTTLS` upgrades the session when the peer asks,
+  /// or when the real string says `starttls=required`. Port defaults to 25.
+  Smtp,
+  /// Implicit TLS SMTP from the first byte. Port defaults to 465.
+  Smtps,
 }
 
 impl Scheme {
@@ -106,6 +113,8 @@ impl Scheme {
       Self::Redis => "redis",
       Self::Rediss => "rediss",
       Self::Ssh => "ssh",
+      Self::Smtp => "smtp",
+      Self::Smtps => "smtps",
     }
   }
 
@@ -216,7 +225,7 @@ impl FromStr for EndpointScope {
       "https" => Scheme::Https,
       "tcp" => Scheme::Tcp,
       "ssh" => Scheme::Ssh,
-      "postgres" | "redis" | "rediss" => {
+      "postgres" | "redis" | "rediss" | "smtp" | "smtps" => {
         return Err(format!(
           "bad allow entry `{entry}`: database rules state no allow entries — the connection string is the grant"
         ));
@@ -254,6 +263,8 @@ impl FromStr for EndpointScope {
       (None, Scheme::Postgres) => 5432,
       (None, Scheme::Redis | Scheme::Rediss) => 6379,
       (None, Scheme::Ssh) => 22,
+      (None, Scheme::Smtp) => 25,
+      (None, Scheme::Smtps) => 465,
     };
     reject_endpoint_query(entry, &url)?;
     Ok(EndpointScope {
@@ -376,6 +387,15 @@ pub enum Grant {
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<RedisScope>,
   },
+  /// One SMTP connection-string mapping: fake string to real, 1:1. Each
+  /// string states its own leg's transport in its scheme. `starttls=required`
+  /// on the real `smtp://` string withholds the password until the upgrade.
+  Smtp {
+    /// The wire needles: the fake password and the real password.
+    credential: Credential,
+    /// The one scope this rule maps, carrying both legs' facts.
+    scope: Box<SmtpScope>,
+  },
   /// One SSH identity mapping: the guest presents the decoy key, arkham
   /// presents the real key upstream. No wire substitution, so no credential.
   Ssh {
@@ -390,7 +410,10 @@ impl Grant {
   #[must_use]
   pub fn credential(&self) -> Option<&Credential> {
     match self {
-      Grant::Token { credential, .. } | Grant::Postgres { credential, .. } | Grant::Redis { credential, .. } => Some(credential),
+      Grant::Token { credential, .. }
+      | Grant::Postgres { credential, .. }
+      | Grant::Redis { credential, .. }
+      | Grant::Smtp { credential, .. } => Some(credential),
       Grant::Ssh { .. } => None,
     }
   }
@@ -402,6 +425,7 @@ impl Grant {
       Grant::Token { allow, .. } => allow.iter().any(|entry| endpoint_match(entry, scheme, host, port)),
       Grant::Postgres { scope, .. } => PostgresScope::matches(scope, scheme, host, port),
       Grant::Redis { scope, .. } => RedisScope::matches(scope, scheme, host, port),
+      Grant::Smtp { scope, .. } => SmtpScope::matches(scope, scheme, host, port),
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }
@@ -436,6 +460,17 @@ impl Grant {
   #[must_use]
   pub fn redis(&self, host: Option<&str>, port: u16) -> Option<&RedisScope> {
     let Grant::Redis { scope, .. } = self else {
+      return None;
+    };
+    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+  }
+
+  /// The SMTP scope whose downstream (guest-side) port and host cover a
+  /// destination, `host` optional as above: transparent capture knows the
+  /// port before it knows the host.
+  #[must_use]
+  pub fn smtp(&self, host: Option<&str>, port: u16) -> Option<&SmtpScope> {
+    let Grant::Smtp { scope, .. } = self else {
       return None;
     };
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
@@ -550,6 +585,7 @@ impl GrantCollector {
     let grant = match scheme {
       Scheme::Postgres => postgres::grant(label, rule, real.expose_secret()),
       Scheme::Redis | Scheme::Rediss => redis::grant(label, rule, real.expose_secret()),
+      Scheme::Smtp | Scheme::Smtps => smtp::grant(label, rule, real.expose_secret()),
       _ => {
         return Err(Error::ConnectionStringScheme {
           label: label.to_string(),
@@ -924,6 +960,167 @@ mod tests {
     let resolved = resolve(&cfg).unwrap();
     let Some(Grant::Redis { scope, .. }) = resolved.grants.first() else {
       panic!("a redis rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+  }
+
+  /// A resolved SMTP scope, through [`resolve`] exactly as serve does.
+  fn smtp_scope(fake: &str, real: &str) -> SmtpScope {
+    let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
+    let Some(Grant::Smtp { scope, .. }) = resolved.grants.first() else {
+      panic!("an smtp rule resolves to an smtp grant");
+    };
+    (**scope).clone()
+  }
+
+  /// A resolved SMTP grant.
+  fn smtp_grant(fake: &str, real: &str) -> Grant {
+    let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
+    resolved.grants.into_iter().next().unwrap()
+  }
+
+  #[test]
+  fn smtp_grant_answers_for_smtp_schemes() {
+    let grant = smtp_grant(
+      "smtp://agent%40demo.test:fake@mail.internal:587",                   // betterleaks:allow
+      "smtp://agent%40demo.test:real@mail.internal:587?starttls=required", // betterleaks:allow
+    );
+    assert!(grant.matches(Scheme::Smtp, "mail.internal", 587));
+    assert!(grant.matches(Scheme::Smtps, "mail.internal", 587));
+    assert!(!grant.matches(Scheme::Tcp, "mail.internal", 587));
+    assert!(!grant.matches(Scheme::Smtp, "mail.internal", 25));
+    assert!(!grant.matches(Scheme::Smtp, "other.internal", 587));
+    assert!(grant.endpoint(Scheme::Smtp, Some("mail.internal"), 587).is_none());
+    assert!(grant.redis(Some("mail.internal"), 587).is_none());
+    let credential = grant.credential().expect("an smtp grant swaps a credential");
+    assert_eq!(credential.label, "t");
+    assert_eq!(credential.fake, "fake");
+    let scope = grant.smtp(Some("mail.internal"), 587).expect("port and host cover the scope");
+    assert!(scope.starttls_required);
+    assert_eq!(scope.downstream.user, "agent@demo.test");
+    assert!(!scope.is_downstream_tls);
+    assert!(!scope.is_upstream_tls);
+  }
+
+  #[test]
+  fn smtp_default_ports_follow_the_scheme() {
+    let scope = smtp_scope(
+      "smtp://agent:fake@mail.internal",                     // betterleaks:allow
+      "smtps://agent:real@mail.internal?sslrootcert=system", // betterleaks:allow
+    );
+    assert_eq!(scope.downstream.port, 25);
+    assert_eq!(scope.upstream.port, 465);
+    assert!(!scope.is_downstream_tls);
+    assert!(scope.is_upstream_tls);
+    assert!(!scope.starttls_required);
+    assert_eq!(scope.root_cert, Some(RootCert::System));
+  }
+
+  #[test]
+  fn smtp_strings_need_user_and_password() {
+    let cfg = cfg_with_db("smtp://mail.internal:587", "smtp://agent:real@mail.internal:587"); // betterleaks:allow
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("the user is required"), "{err}");
+    let cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:587", // betterleaks:allow
+      "smtp://agent@mail.internal:587",
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("the password is required"), "{err}");
+  }
+
+  #[test]
+  fn smtp_strings_reject_transport_queries_and_a_path() {
+    let cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:587",                 // betterleaks:allow
+      "smtp://agent:real@mail.internal:587?sslmode=require", // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("sslmode"), "{err}");
+    let cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:587/inbox", // betterleaks:allow
+      "smtp://agent:real@mail.internal:587",       // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("no path"), "{err}");
+  }
+
+  #[test]
+  fn smtp_starttls_is_required_or_absent_and_only_on_cleartext() {
+    let cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:587",                        // betterleaks:allow
+      "smtp://agent:real@mail.internal:587?starttls=opportunistic", // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("required"), "{err}");
+    let cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:587",                    // betterleaks:allow
+      "smtps://agent:real@mail.internal:465?starttls=required", // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("already TLS"), "{err}");
+  }
+
+  #[test]
+  fn smtp_trust_belongs_on_a_tls_leg() {
+    let scope = smtp_scope(
+      "smtp://agent:fake@mail.internal:587", // betterleaks:allow
+      "smtp://agent:real@mail.internal:587?starttls=required&sslrootcert=/ca.pem&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
+    );
+    assert_eq!(scope.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
+    assert_eq!(scope.client_cert, Some(PathBuf::from("/c.pem")));
+    assert_eq!(scope.client_key, Some(PathBuf::from("/c.key")));
+    let cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:25",                     // betterleaks:allow
+      "smtp://agent:real@mail.internal:25?sslrootcert=/ca.pem", // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("no TLS state"), "{err}");
+  }
+
+  #[test]
+  fn smtp_rules_state_no_allow_entries() {
+    let mut cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:587", // betterleaks:allow
+      "smtp://agent:real@mail.internal:587", // betterleaks:allow
+    );
+    cfg.rules.get_mut("t").unwrap().allow = vec!["https://api.github.com".to_string()];
+    resolve(&cfg).unwrap_err();
+  }
+
+  #[test]
+  fn smtp_schemes_are_not_endpoint_grants() {
+    "smtp://mail.internal:587".parse::<EndpointScope>().unwrap_err();
+    "smtps://mail.internal:465".parse::<EndpointScope>().unwrap_err();
+  }
+
+  #[test]
+  fn rule_table_for_an_smtp_rule_keys_by_its_env() {
+    let mut cfg = cfg_with_db(
+      "smtp://agent:fake@mail.internal:587",                   // betterleaks:allow
+      "smtp://agent:real@mail.internal:587?starttls=required", // betterleaks:allow
+    );
+    let entry = || HostTlsCfg {
+      client_cert: None,
+      client_key: None,
+      root_cert: None,
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: Some(PathBuf::from("/in/cert.pem")),
+      guest_key: Some(PathBuf::from("/in/key.pem")),
+    };
+    let mut tls = BTreeMap::new();
+    let mut e = entry();
+    e.root_cert = Some(PathBuf::from("/ca.pem"));
+    tls.insert("DATABASE_URL".to_string(), e);
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("never in the rule table"), "{err}");
+    let mut tls = BTreeMap::new();
+    tls.insert("DATABASE_URL".to_string(), entry());
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let resolved = resolve(&cfg).unwrap();
+    let Some(Grant::Smtp { scope, .. }) = resolved.grants.first() else {
+      panic!("an smtp rule");
     };
     assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
   }

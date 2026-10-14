@@ -92,6 +92,30 @@ value = "rediss://app:decoy@cache.internal:6380/0"
 
 The real `rediss://` value in fnox carries the trust anchor, for example `rediss://app:real@cache.internal:6380/0?sslrootcert=/path/ca.pem`.
 
+### SMTP rules
+
+A rule whose `value` states an `smtp://` or `smtps://` connection string is an SMTP rule. The rule states the FAKE string in `value`. The REAL string resolves from the secret source under `env`/`fnox_key` into `real`. No `allow` entries: the connection string is the grant, matched on the fake string's port.
+
+`smtp://` is cleartext. `smtps://` is TLS from the first byte. The default ports are 25 and 465. The user and the password are both required, and the user is percent-encoded when it contains `@` (`agent%40demo.test`). A path is rejected. `sslmode` and `sslnegotiation` are rejected: the scheme states the transport.
+
+`starttls=required` is legal only on a real `smtp://` string. Until that upgrade completes, AUTH is forwarded unchanged, so the real password never sits on a cleartext upstream. Absent, AUTH is rewritten immediately, which is what a plaintext port 25 relay needs. `sslrootcert` (a PEM path, or `system`) and `sslcert`/`sslkey` together belong on `smtps://` or on `smtp://` with `starttls=required`.
+
+The wire machine rewrites `AUTH PLAIN` (inline or after `334`), `AUTH LOGIN` (two-step, or with the username inline), `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`. `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are relayed unchanged. Replies, including a base64 `334`, have the real secret redacted. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name.
+
+```toml
+[rules.smtp]
+env = "SMTP_URL"
+value = "smtp://agent%40demo.test:decoy@mail.internal:587"
+```
+
+```toml
+[rules.smtps]
+env = "SMTPS_URL"
+value = "smtps://agent%40demo.test:decoy@mail.internal:465"
+```
+
+The real submission value in fnox carries the upgrade and the trust anchor, for example `smtp://agent%40demo.test:real@mail.internal:587?starttls=required&sslrootcert=/path/ca.pem`.
+
 ## `[rules.<label>.tls."<entry>"]`
 
 Per-entry TLS, keyed by the exact `allow` entry string. All keys optional.

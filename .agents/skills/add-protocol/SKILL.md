@@ -27,17 +27,19 @@ Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy` (`
 
 6. **Transparent host.** Capture has a destination address and a port, not a URL host, and some clients send no SNI. Mint the leaf and key the swap on the host of the scope `expect` already selected, not on the captured address.
 
-7. **Client certificates.** Support an upstream client certificate, or document in `integration/README.md` why the compose demo disables client auth. A CA file on the server can make it demand one.
+7. **Mid-stream TLS.** A protocol that upgrades after a cleartext greeting (SMTP `STARTTLS`) keeps the same framing machines across the upgrade. Relay plaintext until the client command and the server's acceptance are both forwarded, then terminate guest TLS and handshake upstream on the same sockets. Do not read past the acceptance line: the next bytes are a `ClientHello`. Implicit TLS stays a separate scheme (`smtps`) and settles both legs before the machines run, the way `rediss` does. A plaintext posture that never upgrades rewrites on the cleartext relay.
 
-8. **Registry.** A connection-string protocol does not get a `[providers.*]` host list. Add a provider only for an HTTP API with allow-list hosts.
+8. **Client certificates.** Support an upstream client certificate, or document in `integration/README.md` why the compose demo disables client auth. A CA file on the server can make it demand one.
 
-9. **Capture.** nft, tun, and eBPF do not special-case a protocol port. The only special case is UDP/443 (QUIC). Leave this protocol's port out of those crates.
+9. **Registry.** A connection-string protocol does not get a `[providers.*]` host list. Add a provider only for an HTTP API with allow-list hosts.
 
-10. **Tests.** Unit tests sit next to the machine and the grant parser. In-process tests go in `mod tests` in `crates/arkham-proxy/src/e2e.rs`, including a no-SNI case, as `redis_tls_without_sni_mints_for_the_grant_host` does. Property tests follow `crates/arkham-proxy/src/transports/engine/fuzz_props.rs`: invariants on valid framing, and no panic on arbitrary bytes. The compose scenario uses the official server image and a maintained client. `retry`'s first argument is the scheme; a scenario that covers none passes `""` and is not recorded. Gate the scenario on its env var so `integration/client/run.ts` still runs when that service is absent. `integration/bwrap/run.sh` does not run `run.ts`.
+10. **Capture.** nft, tun, and eBPF do not special-case a protocol port. The only special case is UDP/443 (QUIC). Leave this protocol's port out of those crates.
 
-11. **Docs.** Add a row to the protocol table in `README.md` and the scenario list in `integration/README.md`. Document the rule in `docs/user/reference/configuration.md` and add a fake rule to `integration/arkham.toml`. The existing `rust` jobs already run `mise run test:ssh` on x86_64 and ARM. Do not add a job per protocol.
+11. **Tests.** Unit tests sit next to the machine and the grant parser. In-process tests go in `mod tests` in `crates/arkham-proxy/src/e2e.rs`, including a no-SNI case, as `redis_tls_without_sni_mints_for_the_grant_host` does. Property tests follow `crates/arkham-proxy/src/transports/engine/fuzz_props.rs`: invariants on valid framing, and no panic on arbitrary bytes. The compose scenario uses the official server image and a maintained client. `retry`'s first argument is the scheme; a scenario that covers none passes `""` and is not recorded. Gate the scenario on its env var so `integration/client/run.ts` still runs when that service is absent. `integration/bwrap/run.sh` does not run `run.ts`.
 
-12. **Pull request.** The PR body says `Closes #N`, or `Refs #N` when the issue title starts with `Tracking:`.
+12. **Docs.** Add a row to the protocol table in `README.md` and the scenario list in `integration/README.md`. Document the rule in `docs/user/reference/configuration.md` and add a fake rule to `integration/arkham.toml`. The existing `rust` jobs already run `mise run test:ssh` on x86_64 and ARM. Do not add a job per protocol.
+
+13. **Pull request.** The PR body says `Closes #N`, or `Refs #N` when the issue title starts with `Tracking:`.
 
 ## Done
 
