@@ -9,6 +9,11 @@ name: arkham-integration
 # tproxy, not ebpf: the eBPF backend captures by cgroup membership, and a
 # compose service's cgroup path is not something this file can pin. Use
 # `ARKHAM_BACKEND=ebpf mise run demo:bwrap` for the same scenarios over eBPF.
+
+# One value for smtp-direct and the client. Unset keeps the demo decoy.
+# An empty value skips the direct dial and the client SMTP scenario.
+x-smtp-url: &smtp-url "${SMTP_URL-smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587}" # nosemgrep: deterministic demo decoy, not a credential
+
 services:
   certs:
     image: oven/bun:1
@@ -238,7 +243,7 @@ services:
   # confined agent and must not hold NET_ADMIN. An empty SMTP_URL skips
   # the dial so the client still reaches run.ts.
   smtp-direct:
-    image: python:3-slim
+    image: python:3-slim@sha256:db3231d3fce4c59182f8364dbec08b8bad4fdfca673dfb226f3c9e77b6b48cd2
     working_dir: /srv
     # The image entrypoint is python3. Replace it so the shell is the process.
     entrypoint: ["bash", "-c"]
@@ -259,8 +264,14 @@ services:
           sleep 2
         done
         test "$$ok" = 1
+        if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
+          gid="$${HOST_GID:-$$HOST_UID}"
+          chown "$$HOST_UID:$$gid" /out/smtp-direct.txt /out
+        fi
     environment:
-      SMTP_URL: smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587 # nosemgrep: deterministic demo decoy, not a credential
+      SMTP_URL: *smtp-url
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
@@ -317,7 +328,7 @@ services:
       OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `arkham fake OIDC_CLIENT_SECRET`, not a credential
       REDIS_URL: redis://arkham_user:arkham_fake_redis_pass@redis:6379/0 # nosemgrep: deterministic demo decoy, not a credential
       REDIS_TLS_URL: rediss://arkham_user:arkham_fake_redis_pass@redis:6380/0 # nosemgrep: deterministic demo decoy, not a credential
-      SMTP_URL: smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587 # nosemgrep: deterministic demo decoy, not a credential
+      SMTP_URL: *smtp-url
       SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
     volumes:
