@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Confirm test:ssh ran a capture backend and recorded every named scheme.
+# Confirm every backend test:ssh started passed, and recorded every named scheme.
 # Usage: covered.sh LOG SCHEME [SCHEME...]
 set -euo pipefail
 
@@ -21,10 +21,25 @@ if grep -q 'skip: test:ssh' "$log"; then
   exit 1
 fi
 
-if ! grep -Eq '=== backend .+ passed ===' "$log"; then
-  echo "test:ssh log has no passing backend" >&2
+if grep -Fq 'FAILED (exit' "$log"; then
+  echo "test:ssh log records a failed backend" >&2
   exit 1
 fi
+
+started=$(grep -Eo '=== backend: [^ ]+ ===' "$log" || true)
+if [ -z "$started" ]; then
+  echo "test:ssh log names no backend" >&2
+  exit 1
+fi
+
+while IFS= read -r line; do
+  backend=${line#=== backend: }
+  backend=${backend% ===}
+  if ! grep -Fq "=== backend ${backend} passed ===" "$log"; then
+    echo "backend ${backend} has no passed line" >&2
+    exit 1
+  fi
+done <<< "$started"
 
 root=$(git rev-parse --show-toplevel)
 covered="$root/integration/out/covered.json"
@@ -40,4 +55,4 @@ for scheme in "$@"; do
   fi
 done
 
-echo "backend ran; schemes present in $covered"
+echo "every backend passed; schemes present in $covered"
