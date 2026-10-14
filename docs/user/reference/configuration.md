@@ -100,7 +100,7 @@ A rule whose `value` states an `smtp://` or `smtps://` connection string is an S
 
 `starttls=required` is legal only on a real `smtp://` string. AUTH is rewritten only once the upstream leg is TLS: after that upgrade, or on `smtps://` from the first byte. A session that stays cleartext forwards the decoy. Loading a real `smtp://` string with no `starttls` query logs that the decoy is what travels until the upstream leg is TLS. `sslrootcert` (a PEM path, or `system`) and `sslcert`/`sslkey` together belong on `smtps://` or on `smtp://` with `starttls=required`.
 
-EHLO replies have a `CHUNKING` line removed, and the reply's last line stays a final `250`. A client that sends `BDAT` anyway has that chunk spliced for the octet count on the command. `AUTH` replies redact the real password, including inside a base64 `334`, and leave the username as the server wrote it.
+`DATA` passes bytes until the terminating dot, and `BDAT n` passes the next `n` octets. Neither payload is buffered. Upstream replies redact an equal-length password and leave the username as the server wrote it. A `334` challenge is not rewritten.
 
 The wire machine rewrites `AUTH PLAIN` (inline or after `334`), `AUTH LOGIN` (two-step, or with the username inline), `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`. `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are relayed unchanged. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name.
 

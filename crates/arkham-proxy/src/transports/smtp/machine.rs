@@ -1,29 +1,37 @@
-//! SMTP wire format: AUTH credential rewrite, then line relay.
+//! SMTP wire format: AUTH credential rewrite, then the shared relay.
 //!
-//! Downstream client commands are CRLF lines. `AUTH PLAIN`, `AUTH LOGIN`,
-//! `AUTH XOAUTH2`, and `AUTH OAUTHBEARER` reframe to the upstream spelling
-//! at any length, inline or on the continuation line after a `334`. Every
-//! other command relays unchanged. Upstream redacts the real password from
-//! replies, including a base64 `334` challenge, so a refusal cannot carry
-//! it back to the guest. The username is not a secret and is left as the
-//! server wrote it. A `250` reply advertising `CHUNKING` loses that line,
-//! so a client falls back to `DATA`; the session still splices a `BDAT`
-//! payload when one arrives.
+//! Downstream buffers one command line, capped like a Redis command.
+//! `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`
+//! reframe to the upstream spelling at any length, inline or on the
+//! continuation line after a `334`. `DATA` passes bytes until the
+//! terminating dot, holding back only the suffix that might still grow
+//! into `\r\n.\r\n`. `BDAT n` passes the next `n` octets and nothing more.
+//! Every other command is forwarded as it arrives. Upstream is the engine's
+//! [`Raw`] machine: equal-length password bytes are redacted, and a `334`
+//! challenge is not rewritten.
 //!
 //! `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are challenge-response mechanisms
 //! and are relayed unchanged.
 
 use std::borrow::Cow;
 
-use arkham_config::grants::Grant;
+use arkham_config::grants::{Grant, Scheme};
 use base64::Engine as _;
 use secrecy::ExposeSecret as _;
 
-use crate::transports::engine::{Direction, Hit, Location, Rewritten, Wire};
+use crate::transports::engine::{Direction, Hit, Location, Raw, Rewritten, Wire};
 
-/// Cap for one buffered line. A real AUTH command is a few kilobytes;
+/// Cap for one buffered AUTH line. A real AUTH command is a few kilobytes;
 /// anything past this is a drip or an attack, never an auth command.
-const MAX_LINE: usize = 16 * 1024;
+pub(super) const MAX_COMMAND: usize = 16_384;
+
+/// Local reply when the upstream leg is already TLS and the guest asks for
+/// `STARTTLS`. The command is not written into that encrypted leg.
+const STARTTLS_READY: &[u8] = b"220 2.0.0 Ready to start TLS\r\n";
+
+/// Terminator of a `DATA` body: the CRLF that ends the previous line, a
+/// single dot, and the CRLF that ends the dot line.
+const DATA_END: &[u8] = b"\r\n.\r\n";
 
 /// SASL field separator used by XOAUTH2 and OAUTHBEARER (RFC 7628).
 const SASL_SEP: u8 = 0x01;
@@ -44,40 +52,34 @@ const COMMANDS: &[&[u8]] = &[
   b"HELP",
   b"STARTTLS",
   b"AUTH",
-  // The command line only. The session splices the following octet count.
   b"BDAT",
 ];
 
 /// One SMTP direction leg.
 pub(crate) struct Smtp {
-  /// Parse state. `None` on a direction this leg does not own.
+  /// Parse state. `None` on the response leg.
   down: Option<Down>,
-  /// Response redaction. `None` on the request leg.
-  up: Option<Up>,
+  /// Equal-length redaction. `None` on the request leg.
+  raw: Option<Raw>,
 }
 
 /// Downstream parse state.
 struct Down {
+  /// Incomplete AUTH or command line. Payloads never land here.
   buf: Vec<u8>,
+  /// Suffix of a `DATA` body that may still grow into [`DATA_END`].
+  tail: Vec<u8>,
   phase: Phase,
   /// AUTH payloads are rewritten only when the upstream writer is TLS.
   /// A cleartext upstream forwards the decoy.
   protected: bool,
-  creds: Creds,
+  creds: Option<Creds>,
+  /// Guest-bound bytes queued for [`Wire::take_reply`].
+  reply: Option<Vec<u8>>,
   closed: bool,
 }
 
-/// Upstream redaction state.
-struct Up {
-  buf: Vec<u8>,
-  /// Lines of the current reply, held until the final line so a trailing
-  /// `CHUNKING` advertisement can be dropped without leaving a `250-`.
-  held: Vec<u8>,
-  creds: Creds,
-  closed: bool,
-}
-
-/// Where the next client line sits in an AUTH exchange.
+/// Where the next client bytes sit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
   /// A command verb.
@@ -90,6 +92,17 @@ enum Phase {
   LoginPass,
   /// Base64 XOAUTH2 or OAUTHBEARER payload after a bare `AUTH`.
   Bearer,
+  /// Message body after `DATA`, until the terminating dot line.
+  Data {
+    /// True until a body byte has been committed, so a leading `.\r\n`
+    /// (empty body) is the terminator.
+    at_start: bool,
+  },
+  /// The next `remaining` octets are a `BDAT` chunk, passed unchanged.
+  Bdat {
+    /// Octets still to pass.
+    remaining: u64,
+  },
 }
 
 /// The credential pair one grant contributes to this connection.
@@ -102,7 +115,8 @@ struct Creds {
 }
 
 impl Smtp {
-  /// Fresh leg. A direction with no covering grant splices.
+  /// Fresh leg. A direction with no covering grant still frames `DATA` and
+  /// `BDAT`; it just has nothing to swap. Upstream is always [`Raw`].
   pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction) -> Self {
     let creds = grants.iter().find_map(|grant| {
       let scope = grant.smtp(Some(host), port)?;
@@ -116,23 +130,20 @@ impl Smtp {
     });
     match dir {
       Direction::Downstream => Self {
-        down: creds.map(|creds| Down {
+        down: Some(Down {
           buf: Vec::new(),
+          tail: Vec::new(),
           phase: Phase::Command,
           protected: false,
           creds,
+          reply: None,
           closed: false,
         }),
-        up: None,
+        raw: None,
       },
       Direction::Upstream => Self {
         down: None,
-        up: creds.map(|creds| Up {
-          buf: Vec::new(),
-          held: Vec::new(),
-          creds,
-          closed: false,
-        }),
+        raw: Some(Raw::new(grants, Scheme::Smtp, host, port, Direction::Upstream)),
       },
     }
   }
@@ -145,93 +156,228 @@ impl Smtp {
     }
   }
 
-  /// Feed one downstream chunk through the line parser.
-  fn feed_down<'a>(&mut self, chunk: &'a [u8]) -> (Cow<'a, [u8]>, Vec<Hit>) {
-    let Some(down) = self.down.as_mut() else {
-      return (Cow::Borrowed(chunk), Vec::new());
-    };
-    if chunk.is_empty() {
-      let rest = std::mem::take(&mut down.buf);
-      if rest.is_empty() {
-        return (Cow::Borrowed(&[]), Vec::new());
-      }
-      let (line, hits) = rewrite_down_line(&rest, down);
-      return (Cow::Owned(line), hits);
-    }
-    down.buf.extend_from_slice(chunk);
-    if down.buf.len() > MAX_LINE && line_end(&down.buf).is_none() {
-      down.closed = true;
-      return (Cow::Borrowed(&[]), Vec::new());
-    }
-    let mut out = Vec::new();
-    let mut hits = Vec::new();
-    while let Some(end) = line_end(&down.buf) {
-      let line: Vec<u8> = down.buf.drain(..end).collect();
-      let (rewritten, found) = rewrite_down_line(&line, down);
-      out.extend_from_slice(&rewritten);
-      hits.extend(found);
-      if down.closed {
-        return (Cow::Owned(out), hits);
-      }
-    }
-    (Cow::Owned(out), hits)
+  /// True while the next guest line is an AUTH continuation, not a verb.
+  pub(crate) fn awaiting_auth_payload(&self) -> bool {
+    matches!(
+      self.down.as_ref().map(|down| down.phase),
+      Some(Phase::Plain | Phase::LoginUser | Phase::LoginPass | Phase::Bearer)
+    )
   }
 
-  /// Feed one upstream chunk through response redaction.
-  fn feed_up<'a>(&mut self, chunk: &'a [u8]) -> (Cow<'a, [u8]>, Vec<Hit>) {
-    let Some(up) = self.up.as_mut() else {
-      return (Cow::Borrowed(chunk), Vec::new());
-    };
-    if chunk.is_empty() {
-      let mut pending = std::mem::take(&mut up.held);
-      pending.append(&mut up.buf);
-      if pending.is_empty() {
-        return (Cow::Borrowed(&[]), Vec::new());
-      }
-      let (line, hits) = redact_reply(&pending, &up.creds);
-      return (Cow::Owned(line), hits);
+  /// Queue the local `STARTTLS` acceptance. The opening drains it with
+  /// [`Wire::take_reply`] and writes it before the guest handshake.
+  pub(crate) fn queue_starttls_ready(&mut self) {
+    if let Some(down) = self.down.as_mut() {
+      down.reply = Some(STARTTLS_READY.to_vec());
     }
-    up.buf.extend_from_slice(chunk);
-    if up.buf.len() > MAX_LINE && line_end(&up.buf).is_none() {
-      up.closed = true;
-      return (Cow::Borrowed(&[]), Vec::new());
+  }
+
+  /// Feed one downstream chunk. Command lines stay in `buf` until they end.
+  /// `DATA` and `BDAT` payloads are emitted as they arrive.
+  fn feed_down(&mut self, chunk: &[u8]) -> (Vec<u8>, Vec<Hit>) {
+    let Some(down) = self.down.as_mut() else {
+      return (chunk.to_vec(), Vec::new());
+    };
+    if down.closed {
+      return (Vec::new(), Vec::new());
     }
     let mut out = Vec::new();
     let mut hits = Vec::new();
-    while let Some(end) = line_end(&up.buf) {
-      let line: Vec<u8> = up.buf.drain(..end).collect();
-      let finished = is_final_reply_line(&line);
-      up.held.extend_from_slice(&line);
-      if finished {
-        let reply = std::mem::take(&mut up.held);
-        let (redacted, found) = redact_reply(&reply, &up.creds);
-        out.extend_from_slice(&redacted);
-        hits.extend(found);
+    if chunk.is_empty() {
+      flush_down(down, &mut out, &mut hits);
+      return (out, hits);
+    }
+    match down.phase {
+      Phase::Data { .. } | Phase::Bdat { .. } => {
+        drive_payload(down, chunk, &mut out);
+        if is_line_phase(down.phase) {
+          drain_lines(down, &mut out, &mut hits);
+        }
+      }
+      _ => {
+        down.buf.extend_from_slice(chunk);
+        drain_lines(down, &mut out, &mut hits);
       }
     }
-    (Cow::Owned(out), hits)
+    (out, hits)
   }
 }
 
 impl Wire for Smtp {
-  fn feed<'a>(&mut self, chunk: &'a [u8]) -> impl Future<Output = (Rewritten<'a>, Vec<Hit>)> + Send {
-    let (out, hits) = if self.down.is_some() {
-      self.feed_down(chunk)
-    } else if self.up.is_some() {
-      self.feed_up(chunk)
-    } else {
-      (Cow::Borrowed(chunk), Vec::new())
-    };
-    let closed = self.down.as_ref().is_some_and(|down| down.closed) || self.up.as_ref().is_some_and(|up| up.closed);
-    let rewritten = if closed {
-      Rewritten::Close
-    } else if out.is_empty() && !chunk.is_empty() {
-      Rewritten::Hold
-    } else {
-      Rewritten::Emit(out)
-    };
-    std::future::ready((rewritten, hits))
+  async fn feed<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
+    if self.down.is_some() {
+      let (out, hits) = self.feed_down(chunk);
+      let closed = self.down.as_ref().is_some_and(|down| down.closed);
+      let rewritten = if closed {
+        Rewritten::Close
+      } else if out.is_empty() && !chunk.is_empty() {
+        Rewritten::Hold
+      } else {
+        Rewritten::Emit(Cow::Owned(out))
+      };
+      return (rewritten, hits);
+    }
+    if let Some(raw) = self.raw.as_mut() {
+      return raw.feed(chunk).await;
+    }
+    (Rewritten::Emit(Cow::Borrowed(chunk)), Vec::new())
   }
+
+  fn take_reply(&mut self) -> Option<Vec<u8>> {
+    self.down.as_mut().and_then(|down| down.reply.take())
+  }
+}
+
+fn is_line_phase(phase: Phase) -> bool {
+  matches!(
+    phase,
+    Phase::Command | Phase::Plain | Phase::LoginUser | Phase::LoginPass | Phase::Bearer
+  )
+}
+
+fn flush_down(down: &mut Down, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
+  match down.phase {
+    Phase::Data { .. } => out.extend_from_slice(&std::mem::take(&mut down.tail)),
+    Phase::Bdat { .. } => {}
+    _ => {
+      let rest = std::mem::take(&mut down.buf);
+      if !rest.is_empty() {
+        let (line, found) = rewrite_down_line(&rest, down);
+        out.extend_from_slice(&line);
+        hits.extend(found);
+      }
+    }
+  }
+}
+
+/// Take complete lines out of `buf`. A line that enters `DATA` or `BDAT`
+/// consumes the bytes that followed it in this chunk as payload.
+fn drain_lines(down: &mut Down, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
+  loop {
+    if down.closed {
+      return;
+    }
+    if !is_line_phase(down.phase) {
+      let pending = std::mem::take(&mut down.buf);
+      if pending.is_empty() {
+        if matches!(down.phase, Phase::Bdat { remaining: 0 }) {
+          down.phase = Phase::Command;
+          continue;
+        }
+        return;
+      }
+      drive_payload(down, &pending, out);
+      if !is_line_phase(down.phase) {
+        return;
+      }
+      continue;
+    }
+    let Some(end) = line_end(&down.buf) else {
+      if down.buf.len() > MAX_COMMAND {
+        down.closed = true;
+      }
+      return;
+    };
+    if end > MAX_COMMAND {
+      down.closed = true;
+      return;
+    }
+    let line: Vec<u8> = down.buf.drain(..end).collect();
+    let (rewritten, found) = rewrite_down_line(&line, down);
+    out.extend_from_slice(&rewritten);
+    hits.extend(found);
+  }
+}
+
+/// Pass a `DATA` body or a `BDAT` chunk. Leftover bytes after the payload
+/// land back in the line buffer.
+fn drive_payload(down: &mut Down, input: &[u8], out: &mut Vec<u8>) {
+  match down.phase {
+    Phase::Bdat { remaining } => {
+      if remaining == 0 {
+        down.phase = Phase::Command;
+        down.buf.extend_from_slice(input);
+        return;
+      }
+      let want = match usize::try_from(remaining) {
+        Ok(n) => n.min(input.len()),
+        Err(_) => input.len(),
+      };
+      let Some(taken) = input.get(..want) else {
+        down.closed = true;
+        return;
+      };
+      out.extend_from_slice(taken);
+      let Ok(got) = u64::try_from(want) else {
+        down.closed = true;
+        return;
+      };
+      let left = remaining.saturating_sub(got);
+      let rest = input.get(want..).unwrap_or(&[]);
+      if left == 0 {
+        down.phase = Phase::Command;
+        down.buf.extend_from_slice(rest);
+      } else {
+        down.phase = Phase::Bdat { remaining: left };
+      }
+    }
+    Phase::Data { mut at_start } => {
+      let (emitted, done, leftover) = consume_data(&mut down.tail, &mut at_start, input);
+      out.extend_from_slice(&emitted);
+      if done {
+        down.phase = Phase::Command;
+        down.tail.clear();
+        down.buf.extend_from_slice(&leftover);
+      } else {
+        down.phase = Phase::Data { at_start };
+      }
+    }
+    Phase::Command | Phase::Plain | Phase::LoginUser | Phase::LoginPass | Phase::Bearer => {}
+  }
+}
+
+/// Emit `input`, keeping only a suffix that is still a proper prefix of the
+/// `DATA` terminator. `done` carries the bytes that followed the terminator.
+fn consume_data(tail: &mut Vec<u8>, at_start: &mut bool, input: &[u8]) -> (Vec<u8>, bool, Vec<u8>) {
+  let mut emit = Vec::new();
+  let mut held = std::mem::take(tail);
+  for (index, byte) in input.iter().copied().enumerate() {
+    held.push(byte);
+    if terminator_ready(&held, *at_start) {
+      emit.extend_from_slice(&held);
+      let next = index.saturating_add(1);
+      let leftover = input.get(next..).unwrap_or(&[]).to_vec();
+      *at_start = false;
+      return (emit, true, leftover);
+    }
+    shed_prefix(&mut held, &mut emit, at_start);
+  }
+  *tail = held;
+  (emit, false, Vec::new())
+}
+
+fn terminator_ready(held: &[u8], at_start: bool) -> bool {
+  held == DATA_END || (at_start && held == b".\r\n")
+}
+
+/// Emit leading bytes that can no longer grow into the terminator.
+fn shed_prefix(held: &mut Vec<u8>, emit: &mut Vec<u8>, at_start: &mut bool) {
+  let mut keep_from = 0;
+  while keep_from < held.len() && !held_is_prefix(held.get(keep_from..).unwrap_or(&[]), *at_start) {
+    keep_from = keep_from.saturating_add(1);
+    *at_start = false;
+  }
+  if keep_from > 0 {
+    emit.extend_from_slice(held.get(..keep_from).unwrap_or(&[]));
+    held.drain(..keep_from);
+  }
+}
+
+fn held_is_prefix(held: &[u8], at_start: bool) -> bool {
+  if held.is_empty() || DATA_END.starts_with(held) {
+    return true;
+  }
+  at_start && matches!(held, b"." | b".\r")
 }
 
 /// Rewrite one complete downstream line and advance the AUTH phase.
@@ -241,27 +387,44 @@ fn rewrite_down_line(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
     down.phase = Phase::Command;
     return (line.to_vec(), Vec::new());
   }
+  if !is_line_phase(down.phase) {
+    return (line.to_vec(), Vec::new());
+  }
   if down.phase != Phase::Command && is_command(body) {
     down.phase = Phase::Command;
   }
+  let protected = down.protected;
   match down.phase {
     Phase::Plain => {
       down.phase = Phase::Command;
-      rewrite_plain_line(line, &down.creds, down.protected)
+      let Some(creds) = down.creds.as_ref() else {
+        return (line.to_vec(), Vec::new());
+      };
+      rewrite_plain_line(line, creds, protected)
     }
     Phase::LoginUser => {
       down.phase = Phase::LoginPass;
-      rewrite_token_line(line, &down.creds.fake_user, &down.creds.real_user, &down.creds, down.protected)
+      let Some(creds) = down.creds.as_ref() else {
+        return (line.to_vec(), Vec::new());
+      };
+      rewrite_token_line(line, &creds.fake_user, &creds.real_user, creds, protected)
     }
     Phase::LoginPass => {
       down.phase = Phase::Command;
-      rewrite_token_line(line, &down.creds.fake_pass, &down.creds.real_pass, &down.creds, down.protected)
+      let Some(creds) = down.creds.as_ref() else {
+        return (line.to_vec(), Vec::new());
+      };
+      rewrite_token_line(line, &creds.fake_pass, &creds.real_pass, creds, protected)
     }
     Phase::Bearer => {
       down.phase = Phase::Command;
-      rewrite_bearer_line(line, &down.creds, down.protected)
+      let Some(creds) = down.creds.as_ref() else {
+        return (line.to_vec(), Vec::new());
+      };
+      rewrite_bearer_line(line, creds, protected)
     }
     Phase::Command => rewrite_command(line, down),
+    Phase::Data { .. } | Phase::Bdat { .. } => (line.to_vec(), Vec::new()),
   }
 }
 
@@ -273,6 +436,15 @@ fn rewrite_command(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
   let Some(verb) = tokens.first() else {
     return (line.to_vec(), Vec::new());
   };
+  if verb.eq_ignore_ascii_case(b"DATA") {
+    down.tail.clear();
+    down.phase = Phase::Data { at_start: true };
+    return (line.to_vec(), Vec::new());
+  }
+  if let Some(octets) = bdat_octets(line) {
+    down.phase = Phase::Bdat { remaining: octets };
+    return (line.to_vec(), Vec::new());
+  }
   if !verb.eq_ignore_ascii_case(b"AUTH") {
     return (line.to_vec(), Vec::new());
   }
@@ -285,20 +457,22 @@ fn rewrite_command(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
       down.phase = Phase::Plain;
       return (line.to_vec(), Vec::new());
     };
-    return rewrite_auth_arg(line, mech, arg, ending, &down.creds, down.protected, rewrite_plain_raw);
+    let protected = down.protected;
+    let Some(creds) = down.creds.as_ref() else {
+      return (line.to_vec(), Vec::new());
+    };
+    return rewrite_auth_arg(line, mech, arg, ending, creds, protected, rewrite_plain_raw);
   }
   if mech.eq_ignore_ascii_case(b"LOGIN") {
     let Some(arg) = initial else {
       down.phase = Phase::LoginUser;
       return (line.to_vec(), Vec::new());
     };
-    let (rewritten, hits) = rewrite_token_line(
-      &join_line(arg, ending),
-      &down.creds.fake_user,
-      &down.creds.real_user,
-      &down.creds,
-      down.protected,
-    );
+    let protected = down.protected;
+    let Some(creds) = down.creds.as_ref() else {
+      return (line.to_vec(), Vec::new());
+    };
+    let (rewritten, hits) = rewrite_token_line(&join_line(arg, ending), &creds.fake_user, &creds.real_user, creds, protected);
     down.phase = Phase::LoginPass;
     let arg_body = line_body(&rewritten);
     return (join_auth(mech, Some(arg_body), ending), hits);
@@ -308,9 +482,29 @@ fn rewrite_command(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
       down.phase = Phase::Bearer;
       return (line.to_vec(), Vec::new());
     };
-    return rewrite_auth_arg(line, mech, arg, ending, &down.creds, down.protected, rewrite_bearer_raw);
+    let protected = down.protected;
+    let Some(creds) = down.creds.as_ref() else {
+      return (line.to_vec(), Vec::new());
+    };
+    return rewrite_auth_arg(line, mech, arg, ending, creds, protected, rewrite_bearer_raw);
   }
   (line.to_vec(), Vec::new())
+}
+
+/// Size on `BDAT <n> [LAST]`. Missing or non-numeric sizes are `None`:
+/// the command is still forwarded, and the server rejects it with no payload.
+fn bdat_octets(line: &[u8]) -> Option<u64> {
+  let body = line_body(line);
+  let mut parts = body.split(|byte| *byte == b' ' || *byte == b'\t').filter(|part| !part.is_empty());
+  let verb = parts.next()?;
+  if !verb.eq_ignore_ascii_case(b"BDAT") {
+    return None;
+  }
+  let size = parts.next()?;
+  if size.is_empty() || !size.iter().all(u8::is_ascii_digit) {
+    return None;
+  }
+  std::str::from_utf8(size).ok()?.parse().ok()
 }
 
 /// Replace the initial-response argument of an `AUTH` line.
@@ -418,37 +612,21 @@ fn rewrite_bearer_raw(raw: &[u8], creds: &Creds, protected: bool) -> Option<Vec<
   }
   let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
   if creds.fake_pass != creds.real_pass
-    && let Some(pos) = find_sub(raw, b"auth=Bearer ")
+    && let Some((start, end)) = marked_span(raw, b"auth=Bearer ", |byte| byte == SASL_SEP)
+    && raw.get(start..end) == Some(creds.fake_pass.as_slice())
   {
-    let start = pos.saturating_add(b"auth=Bearer ".len());
-    let end = raw[start..]
-      .iter()
-      .position(|byte| *byte == SASL_SEP)
-      .map_or(raw.len(), |at| start.saturating_add(at));
-    if raw.get(start..end) == Some(creds.fake_pass.as_slice()) {
-      spans.push((start, end, creds.real_pass.clone()));
-    }
+    spans.push((start, end, creds.real_pass.clone()));
   }
   if creds.fake_user != creds.real_user {
-    if let Some(pos) = find_sub(raw, b"user=") {
-      let start = pos.saturating_add(b"user=".len());
-      let end = raw[start..]
-        .iter()
-        .position(|byte| *byte == SASL_SEP)
-        .map_or(raw.len(), |at| start.saturating_add(at));
-      if raw.get(start..end) == Some(creds.fake_user.as_slice()) {
-        spans.push((start, end, creds.real_user.clone()));
-      }
+    if let Some((start, end)) = marked_span(raw, b"user=", |byte| byte == SASL_SEP)
+      && raw.get(start..end) == Some(creds.fake_user.as_slice())
+    {
+      spans.push((start, end, creds.real_user.clone()));
     }
-    if let Some(pos) = find_sub(raw, b"n,a=") {
-      let start = pos.saturating_add(b"n,a=".len());
-      let end = raw[start..]
-        .iter()
-        .position(|byte| *byte == b',' || *byte == SASL_SEP)
-        .map_or(raw.len(), |at| start.saturating_add(at));
-      if raw.get(start..end) == Some(creds.fake_user.as_slice()) {
-        spans.push((start, end, creds.real_user.clone()));
-      }
+    if let Some((start, end)) = marked_span(raw, b"n,a=", |byte| byte == b',' || byte == SASL_SEP)
+      && raw.get(start..end) == Some(creds.fake_user.as_slice())
+    {
+      spans.push((start, end, creds.real_user.clone()));
     }
   }
   if spans.is_empty() {
@@ -464,128 +642,19 @@ fn rewrite_bearer_raw(raw: &[u8], creds: &Creds, protected: bool) -> Option<Vec<
   Some(out)
 }
 
-/// Redact one complete reply. `CHUNKING` is dropped first so the final
-/// line still uses a space separator, then each line redacts the password.
-fn redact_reply(reply: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
-  let stripped = strip_chunking(reply);
-  let mut out = Vec::with_capacity(stripped.len());
-  let mut hits = Vec::new();
-  let mut rest = stripped.as_slice();
-  while !rest.is_empty() {
-    let end = line_end(rest).unwrap_or(rest.len());
-    let Some(line_bytes) = rest.get(..end) else {
-      break;
-    };
-    let (line, found) = redact_line(line_bytes, creds);
-    out.extend_from_slice(&line);
-    hits.extend(found);
-    if end == rest.len() {
-      break;
-    }
-    rest = rest.get(end..).unwrap_or(&[]);
+/// Byte range of the field after `marker`, ending at the first byte `ends` accepts.
+fn marked_span(raw: &[u8], marker: &[u8], ends: impl Fn(u8) -> bool) -> Option<(usize, usize)> {
+  if marker.is_empty() || raw.len() < marker.len() {
+    return None;
   }
-  (out, hits)
-}
-
-/// Drop `250 CHUNKING` advertisements. When the dropped line was the
-/// final one, the new last line's `-` becomes a space so the reply ends.
-fn strip_chunking(reply: &[u8]) -> Vec<u8> {
-  let mut lines = Vec::new();
-  let mut rest = reply;
-  while !rest.is_empty() {
-    let end = line_end(rest).unwrap_or(rest.len());
-    let line = rest.get(..end).unwrap_or(&[]);
-    if !is_chunking_advertisement(line) {
-      lines.push(line.to_vec());
-    }
-    if end == rest.len() {
-      break;
-    }
-    rest = rest.get(end..).unwrap_or(&[]);
-  }
-  if lines.is_empty() {
-    return reply.to_vec();
-  }
-  if let Some(last) = lines.last_mut()
-    && let Some(separator) = last.get_mut(3)
-    && *separator == b'-'
-  {
-    *separator = b' ';
-  }
-  let mut out = Vec::with_capacity(reply.len());
-  for line in &lines {
-    out.extend_from_slice(line);
-  }
-  out
-}
-
-/// `250 CHUNKING` or `250-CHUNKING`, and nothing else on the line.
-fn is_chunking_advertisement(line: &[u8]) -> bool {
-  let body = line_body(line);
-  if body.get(..3) != Some(b"250".as_slice()) {
-    return false;
-  }
-  let rest = body.get(4..).unwrap_or(b"");
-  let keyword = rest
-    .split(|byte| *byte == b' ' || *byte == b'\t')
-    .find(|part| !part.is_empty())
-    .unwrap_or(b"");
-  keyword.eq_ignore_ascii_case(b"CHUNKING")
-}
-
-/// A reply line is final when it is not a `DDD-` continuation.
-fn is_final_reply_line(line: &[u8]) -> bool {
-  line_body(line).get(3) != Some(&b'-')
-}
-
-/// Redact one server line. A `334` challenge is base64; the password is
-/// replaced inside the payload and the line is re-encoded.
-fn redact_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
-  let body = line_body(line);
-  let ending = line_ending(line);
-  if let Some(payload) = body.strip_prefix(b"334 ").filter(|payload| !payload.is_empty())
-    && let Some(decoded) = b64_decode(payload)
-  {
-    let (redacted, found) = replace_secrets(&decoded, creds);
-    if found {
-      let mut out = b"334 ".to_vec();
-      out.extend_from_slice(&b64_encode(&redacted));
-      out.extend_from_slice(ending);
-      return (out, vec![hit(creds)]);
-    }
-  }
-  let (redacted, found) = replace_secrets(line, creds);
-  if found {
-    (redacted, vec![hit(creds)])
-  } else {
-    (line.to_vec(), Vec::new())
-  }
-}
-
-/// Replace the real password. The username is not redacted: a short or
-/// common one would rewrite unrelated reply text.
-fn replace_secrets(buf: &[u8], creds: &Creds) -> (Vec<u8>, bool) {
-  let mut out = buf.to_vec();
-  let found = creds.real_pass != creds.fake_pass && replace_into(&mut out, &creds.real_pass, &creds.fake_pass);
-  (out, found)
-}
-
-/// Replace every non-overlapping occurrence. Returns whether any matched.
-fn replace_into(buf: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) -> bool {
-  if needle.is_empty() || find_sub(buf, needle).is_none() {
-    return false;
-  }
-  let mut out = Vec::with_capacity(buf.len());
-  let mut index = 0;
-  while let Some(at) = find_sub(&buf[index..], needle) {
-    let pos = index.saturating_add(at);
-    out.extend_from_slice(&buf[index..pos]);
-    out.extend_from_slice(replacement);
-    index = pos.saturating_add(needle.len());
-  }
-  out.extend_from_slice(&buf[index..]);
-  *buf = out;
-  true
+  let pos = raw.windows(marker.len()).position(|window| window == marker)?;
+  let start = pos.saturating_add(marker.len());
+  let rest = raw.get(start..)?;
+  let end = rest
+    .iter()
+    .position(|byte| ends(*byte))
+    .map_or(raw.len(), |at| start.saturating_add(at));
+  Some((start, end))
 }
 
 fn hit(creds: &Creds) -> Hit {
@@ -667,13 +736,6 @@ fn line_ending(line: &[u8]) -> &[u8] {
   }
 }
 
-fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
-  if needle.is_empty() || hay.len() < needle.len() {
-    return None;
-  }
-  hay.windows(needle.len()).position(|window| window == needle)
-}
-
 fn trim_ascii(text: &[u8]) -> &[u8] {
   let start = text.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(text.len());
   let end = text
@@ -745,6 +807,15 @@ mod tests {
       (Rewritten::Hold, hits) => (Vec::new(), hits.len()),
       (Rewritten::Close, _) => panic!("line closed the machine"),
     }
+  }
+
+  /// Downstream tests use [`emit`]. Upstream [`Raw`] may hold a suffix; this
+  /// flushes it so a complete reply is asserted whole.
+  async fn emit_flushed(machine: &mut Smtp, chunk: &[u8]) -> (Vec<u8>, usize) {
+    let (mut out, hits) = emit(machine, chunk).await;
+    let (rest, more) = emit(machine, &[]).await;
+    out.extend_from_slice(&rest);
+    (out, hits.saturating_add(more))
   }
 
   fn plain(user: &str, pass: &str) -> String {
@@ -880,7 +951,7 @@ mod tests {
   async fn response_redacts_the_real_password() {
     let mut machine = up();
     let line = format!("535 5.7.8 authentication failed for {REAL_PASS}\r\n");
-    let (out, hits) = emit(&mut machine, line.as_bytes()).await;
+    let (out, hits) = emit_flushed(&mut machine, line.as_bytes()).await;
     assert_eq!(hits, 1);
     assert_eq!(out, format!("535 5.7.8 authentication failed for {FAKE_PASS}\r\n").into_bytes());
     assert!(!out.windows(REAL_PASS.len()).any(|window| window == REAL_PASS.as_bytes()));
@@ -890,7 +961,7 @@ mod tests {
   async fn response_redacts_the_password_and_leaves_the_username() {
     let mut machine = Smtp::new(&grant("guest@demo.test", "a"), "mail", 587, Direction::Upstream);
     let line = format!("535 5.7.8 a rejected {REAL_PASS}\r\n");
-    let (out, hits) = emit(&mut machine, line.as_bytes()).await;
+    let (out, hits) = emit_flushed(&mut machine, line.as_bytes()).await;
     assert_eq!(hits, 1);
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("535 5.7.8 a rejected"), "{text}");
@@ -899,36 +970,68 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn ehlo_reply_drops_chunking_and_keeps_a_final_line() {
+  async fn ehlo_reply_keeps_chunking() {
     let mut machine = up();
     let reply = b"250-mail.demo.test\r\n250-PIPELINING\r\n250 CHUNKING\r\n";
-    let (out, hits) = emit(&mut machine, reply).await;
+    let (out, hits) = emit_flushed(&mut machine, reply).await;
     assert_eq!(hits, 0);
-    assert_eq!(out, b"250-mail.demo.test\r\n250 PIPELINING\r\n");
+    assert_eq!(out, reply);
   }
 
   #[tokio::test]
-  async fn chunking_in_the_middle_of_ehlo_is_dropped() {
-    let mut machine = up();
-    let (held, _) = emit(&mut machine, b"250-CHUNKING\r\n").await;
-    assert_eq!(held, b"");
-    let (out, _) = emit(&mut machine, b"250 AUTH PLAIN LOGIN\r\n").await;
-    assert_eq!(out, b"250 AUTH PLAIN LOGIN\r\n");
-  }
-
-  #[tokio::test]
-  async fn challenge_334_redacts_a_base64_token() {
+  async fn challenge_334_is_left_unchanged() {
     let mut machine = up();
     let payload = format!("{{\"status\":\"400\",\"scope\":\"{REAL_PASS}\"}}");
     let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-    let (out, hits) = emit(&mut machine, format!("334 {encoded}\r\n").as_bytes()).await;
-    assert_eq!(hits, 1);
-    let text = String::from_utf8(out).unwrap();
-    let b64 = text.trim().strip_prefix("334 ").unwrap();
-    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
-    let decoded = String::from_utf8(decoded).unwrap();
-    assert!(decoded.contains(FAKE_PASS), "{decoded}");
-    assert!(!decoded.contains(REAL_PASS), "{decoded}");
+    let line = format!("334 {encoded}\r\n");
+    let (out, hits) = emit_flushed(&mut machine, line.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert_eq!(out, line.as_bytes());
+  }
+
+  #[tokio::test]
+  async fn data_passes_until_the_dot_line() {
+    let mut machine = down();
+    let body = b"DATA\r\nhello\r\n.\r\nQUIT\r\n";
+    let (out, hits) = emit(&mut machine, body).await;
+    assert_eq!(hits, 0);
+    assert_eq!(out, body);
+  }
+
+  #[tokio::test]
+  async fn data_holds_a_split_terminator() {
+    let mut machine = down();
+    let (head, _) = emit(&mut machine, b"DATA\r\nhello\r\n.").await;
+    assert_eq!(head, b"DATA\r\nhello");
+    let (tail, _) = emit(&mut machine, b"\r\nQUIT\r\n").await;
+    assert_eq!(tail, b"\r\n.\r\nQUIT\r\n");
+  }
+
+  #[tokio::test]
+  async fn empty_data_body_ends_on_the_leading_dot() {
+    let mut machine = down();
+    let (out, _) = emit(&mut machine, b"DATA\r\n.\r\nNOOP\r\n").await;
+    assert_eq!(out, b"DATA\r\n.\r\nNOOP\r\n");
+  }
+
+  #[tokio::test]
+  async fn bdat_passes_exactly_n_bytes() {
+    let mut machine = down();
+    let (head, _) = emit(&mut machine, b"BDAT 5\r\nhe").await;
+    assert_eq!(head, b"BDAT 5\r\nhe");
+    let (tail, _) = emit(&mut machine, b"lloNOOP\r\n").await;
+    assert_eq!(tail, b"lloNOOP\r\n");
+    let (last, _) = emit(&mut machine, b"BDAT 0 LAST\r\n").await;
+    assert_eq!(last, b"BDAT 0 LAST\r\n");
+  }
+
+  #[test]
+  fn bdat_size_is_the_octet_count() {
+    assert_eq!(bdat_octets(b"BDAT 5\r\n"), Some(5));
+    assert_eq!(bdat_octets(b"bdat 0 LAST\r\n"), Some(0));
+    assert_eq!(bdat_octets(b"BDAT\r\n"), None);
+    assert_eq!(bdat_octets(b"BDAT LAST\r\n"), None);
+    assert_eq!(bdat_octets(b"DATA\r\n"), None);
   }
 
   #[tokio::test]

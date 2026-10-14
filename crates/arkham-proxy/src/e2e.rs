@@ -2748,7 +2748,7 @@ mod tests {
     }
 
     /// Server that advertises CHUNKING and accepts `BDAT` chunks. Records
-    /// each payload so the test can see the splice instead of a deadlock.
+    /// each payload so the test can see the octets pass without a deadlock.
     async fn serve_bdat<S>(mut conn: S, seen: Arc<Mutex<Vec<Vec<u8>>>>)
     where
       S: AsyncRead + AsyncWrite + Unpin,
@@ -2794,7 +2794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bdat_payload_is_spliced_and_chunking_is_hidden() {
+    async fn bdat_payload_is_passed_exactly() {
       let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
       let fx = mitm_fixture(|port| {
         vec![smtp_grant(
@@ -2822,8 +2822,7 @@ mod tests {
         assert!(greeting.starts_with("220"), "{greeting}");
         write_cmd(&mut stream, "EHLO client\r\n").await;
         let ehlo = read_reply(&mut stream).await;
-        assert_eq!(ehlo, "250-mail.demo.test\r\n250 PIPELINING\r\n");
-        assert!(!ehlo.to_ascii_uppercase().contains("CHUNKING"), "{ehlo}");
+        assert_eq!(ehlo, "250-mail.demo.test\r\n250-PIPELINING\r\n250 CHUNKING\r\n");
         write_cmd(&mut stream, "BDAT 5\r\n").await;
         stream.write_all(b"hello").await.unwrap();
         stream.flush().await.unwrap();

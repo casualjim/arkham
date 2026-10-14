@@ -1,9 +1,10 @@
-//! SMTP vertical: transport halves and the session that upgrades with
-//! `STARTTLS`.
+//! SMTP vertical: transport halves, then the shared relay.
 //!
-//! `smtp://` is cleartext until `STARTTLS`. `smtps://` is TLS from the
-//! first byte. The upstream `smtps` leg, and a `starttls=required` leg
-//! after it upgrades, verify the chain and the host name.
+//! `smtp://` is cleartext until `STARTTLS`. The cleartext opening reads the
+//! greeting and the upgrade, then both sockets go to `relay_guarded`.
+//! `smtps://` is TLS from the first byte and relays immediately. The
+//! upstream `smtps` leg, and a `starttls=required` leg after it upgrades,
+//! verify the chain and the host name.
 
 mod machine;
 mod session;
@@ -222,8 +223,8 @@ impl TlsHalves for SmtpTransport {
 impl Transport for SmtpTransport {
   type Scope = SmtpScope;
 
-  /// The `smtp://` / `smtps://` arm. Implicit TLS settles here. `STARTTLS`
-  /// upgrades later, inside the session, on the same sockets.
+  /// The `smtp://` / `smtps://` arm. Implicit TLS settles here and relays.
+  /// `STARTTLS` upgrades in the cleartext opening, then both sockets relay.
   async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, SmtpScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,

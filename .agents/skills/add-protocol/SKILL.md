@@ -15,7 +15,7 @@ Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy` (`
 
 ## Checklist
 
-1. **Transport.** Add `crates/arkham-proxy/src/transports/$PROTO/` and `pub(crate) mod` it from `crates/arkham-proxy/src/transports/mod.rs`. `engine` is the shared substitution machine, not a protocol. Add the field and build it in `ProxyState::new` (`crates/arkham-proxy/src/lib.rs`). Add an `Expect::$VARIANT` arm in `Expect::serve` (`crates/arkham-proxy/src/identity.rs`).
+1. **Transport.** Add `crates/arkham-proxy/src/transports/$PROTO/` and `pub(crate) mod` it from `crates/arkham-proxy/src/transports/mod.rs`. `engine` is the shared substitution machine, not a protocol. Add the field and build it in `ProxyState::new` (`crates/arkham-proxy/src/lib.rs`). Add an `Expect::$VARIANT` arm in `Expect::serve` (`crates/arkham-proxy/src/identity.rs`). Reuse `relay_guarded` and the existing streaming path. The only protocol-specific buffer is the per-command credential line, capped like Redis `MAX_COMMAND`. Do not add a session loop or a payload buffer.
 
 2. **Scheme.** Add `VARIANT`. `Scheme::as_str` is an exhaustive match. `Scheme::all` is `strum::EnumIter`, so `arkham schemes` lists the variant without a second array. When a URL omits a port, add an arm in `EndpointScope`'s port match (`crates/arkham-config/src/grants/mod.rs`). `tcp` stays explicit.
 
@@ -27,7 +27,7 @@ Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy` (`
 
 6. **Transparent host.** Capture has a destination address and a port, not a URL host, and some clients send no SNI. Mint the leaf and key the swap on the host of the scope `expect` already selected, not on the captured address.
 
-7. **Mid-stream TLS.** A protocol that upgrades after a cleartext greeting keeps the same framing machines across the upgrade. Relay plaintext until the client command and the server's acceptance are both forwarded, then terminate guest TLS and handshake upstream on the same sockets. Do not read past the acceptance line: the next bytes are a handshake. Acceptance is whatever the protocol defines (an SMTP `220`, an LDAP StartTLS extended-response success). Implicit TLS stays a separate scheme and settles both legs before the machines run. Never swap onto a cleartext upstream; the decoy passes through. A later protocol with the same upgrade folds into this step.
+7. **Mid-stream TLS.** A protocol that upgrades after a cleartext greeting keeps the same framing machines across the upgrade. Handle only that cleartext opening lockstep (the greeting, the client command, and the server's acceptance). Then terminate guest TLS, handshake upstream on the same sockets, and hand both sockets to `relay_guarded`. Do not read past the acceptance line: the next bytes are a handshake. Acceptance is whatever the protocol defines (an SMTP `220`, an LDAP StartTLS extended-response success). Implicit TLS stays a separate scheme, settles both legs before the machines run, and goes straight to `relay_guarded`. A session that never upgrades also goes to `relay_guarded` with swapping off. Never swap onto a cleartext upstream; the decoy passes through. A later protocol with the same upgrade folds into this step.
 
 8. **Client certificates.** Support an upstream client certificate, or document in `integration/README.md` why the compose demo disables client auth. A CA file on the server can make it demand one.
 

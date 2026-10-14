@@ -1,44 +1,30 @@
-//! SMTP dialogue: the server greeting, then one command and one reply,
-//! with `STARTTLS` upgrading both sockets in place.
+//! Cleartext SMTP opening, then the shared relay.
 //!
-//! The same framing machines run before and after the upgrade. The reader
-//! stops at the acceptance line, because the next guest bytes are a
-//! `ClientHello`. `DATA` is spliced until the terminating dot, and `BDAT n`
-//! splices the next `n` octets, so a payload is never held while the
-//! session waits for a reply the server will not send yet.
+//! The greeting, `EHLO` / `HELO`, an `AUTH` that still precedes `STARTTLS`,
+//! and `STARTTLS` plus its acceptance run lockstep. The acceptance reader
+//! stops on the final reply line, so the following handshake bytes stay
+//! unread. After the upgrade, or when the guest sends anything else, both
+//! sockets go to [`relay_guarded`]. Implicit TLS skips the opening. A
+//! session that never upgrades relays with swapping off, and the decoy
+//! passes through.
 
 use std::io::ErrorKind;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::transports::TlsHalves;
-use crate::transports::engine::Wire;
 use arkham_config::grants::{Grant, SmtpScope};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use super::SmtpTransport;
-use super::machine::Smtp;
+use super::machine::{MAX_COMMAND, Smtp};
 use crate::Error;
-use crate::relay::log_hits;
-use crate::transports::engine::{Direction, Rewritten};
-
-/// Cap for one buffered line. Matches the framing machine.
-const MAX_LINE: usize = 16 * 1024;
-
-/// Local reply when the upstream leg is already TLS and the guest asks
-/// for `STARTTLS`. The command is not forwarded into the encrypted leg.
-const STARTTLS_READY: &[u8] = b"220 2.0.0 Ready to start TLS\r\n";
-
-/// What one machine feed produced.
-enum Forward {
-  /// Bytes to write on the other leg. Empty when the machine held a
-  /// partial line.
-  Bytes(Vec<u8>),
-  /// The machine closed the connection. The session ends quietly.
-  Stop,
-}
+use crate::relay::{log_hits, relay_guarded};
+use crate::transports::TlsHalves;
+use crate::transports::engine::{Direction, Rewritten, Wire};
 
 /// Guest socket, cleartext or terminated TLS.
 pub(super) enum GuestLeg<G> {
@@ -63,39 +49,42 @@ where
   fn is_plain(&self) -> bool {
     matches!(self, Self::Plain(_))
   }
+}
 
-  fn into_plain(self) -> Result<G, Error> {
-    match self {
-      Self::Plain(stream) => Ok(stream),
-      Self::Tls(_) => Err(Error::SmtpLegAlreadyTls),
+impl<G> AsyncRead for GuestLeg<G>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+    }
+  }
+}
+
+impl<G> AsyncWrite for GuestLeg<G>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
     }
   }
 
-  async fn read_line(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
-    match self {
-      Self::Plain(stream) => read_line(stream).await,
-      Self::Tls(stream) => read_line(stream.as_mut()).await,
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
     }
   }
 
-  async fn read_byte(&mut self) -> Result<Option<u8>, std::io::Error> {
-    match self {
-      Self::Plain(stream) => read_byte(stream).await,
-      Self::Tls(stream) => read_byte(stream.as_mut()).await,
-    }
-  }
-
-  async fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-    match self {
-      Self::Plain(stream) => read_some(stream, buf).await,
-      Self::Tls(stream) => read_some(stream.as_mut(), buf).await,
-    }
-  }
-
-  async fn write_flush(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
-    match self {
-      Self::Plain(stream) => write_flush(stream, bytes).await,
-      Self::Tls(stream) => write_flush(stream.as_mut(), bytes).await,
+  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
     }
   }
 }
@@ -104,269 +93,37 @@ impl ServerLeg {
   fn is_plain(&self) -> bool {
     matches!(self, Self::Plain(_))
   }
+}
 
-  fn into_plain(self) -> Result<TcpStream, Error> {
-    match self {
-      Self::Plain(stream) => Ok(stream),
-      Self::Tls(_) => Err(Error::SmtpLegAlreadyTls),
-    }
-  }
-
-  async fn read_response(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
-    match self {
-      Self::Plain(stream) => read_response(stream).await,
-      Self::Tls(stream) => read_response(stream.as_mut()).await,
-    }
-  }
-
-  async fn write_flush(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
-    match self {
-      Self::Plain(stream) => write_flush(stream, bytes).await,
-      Self::Tls(stream) => write_flush(stream.as_mut(), bytes).await,
+impl AsyncRead for ServerLeg {
+  fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
     }
   }
 }
 
-/// One SMTP session. The legs sit in `Option` so a TLS upgrade can take
-/// the socket out, handshake it, and put it back.
-struct Session<'a, G> {
-  transport: &'a SmtpTransport,
-  scope: &'a SmtpScope,
-  guest: Option<GuestLeg<G>>,
-  server: Option<ServerLeg>,
-  down: Smtp,
-  up: Smtp,
-  budget: Duration,
-  leaf_name: &'a str,
-}
-
-impl<G> Session<'_, G>
-where
-  G: AsyncRead + AsyncWrite + Unpin,
-{
-  async fn pump(mut self) -> Result<(), Error> {
-    let Some(greeting) = self.read_server().await? else {
-      return Ok(());
-    };
-    if !self.write_guest_redacted(&greeting).await? {
-      return Ok(());
-    }
-    loop {
-      let Some(line) = self.read_guest_line().await? else {
-        self.flush_downstream().await?;
-        return Ok(());
-      };
-      if self.answer_starttls_locally(&line).await? {
-        continue;
-      }
-      let data = is_command(&line, b"DATA");
-      let starttls = is_command(&line, b"STARTTLS");
-      let bdat = bdat_octets(&line);
-      if !self.forward_downstream(&line).await? {
-        return Ok(());
-      }
-      // `BDAT n` is followed by n octets before the server replies.
-      // Reading the reply first deadlocks until the budget expires.
-      if let Some(octets) = bdat {
-        self.splice_octets(octets).await?;
-      }
-      let Some(response) = self.read_server().await? else {
-        return Ok(());
-      };
-      let code = reply_code(&response);
-      if !self.write_guest_redacted(&response).await? {
-        return Ok(());
-      }
-      if data && code == Some(354) {
-        self.splice_body().await?;
-        let Some(final_response) = self.read_server().await? else {
-          return Ok(());
-        };
-        if !self.write_guest_redacted(&final_response).await? {
-          return Ok(());
-        }
-      }
-      if starttls && code == Some(220) {
-        self.upgrade_plain_legs().await?;
-      }
+impl AsyncWrite for ServerLeg {
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
     }
   }
 
-  /// The upstream leg is already encrypted. Answer `STARTTLS` here and
-  /// upgrade only the guest, so the command is not written into TLS.
-  async fn answer_starttls_locally(&mut self, line: &[u8]) -> Result<bool, Error> {
-    let guest_plain = self.guest.as_ref().is_some_and(GuestLeg::is_plain);
-    let server_plain = self.server.as_ref().is_some_and(ServerLeg::is_plain);
-    if !is_command(line, b"STARTTLS") || !guest_plain || server_plain {
-      return Ok(false);
-    }
-    self.write_guest(STARTTLS_READY).await?;
-    self.upgrade_guest().await?;
-    self.sync_protected();
-    Ok(true)
-  }
-
-  async fn upgrade_plain_legs(&mut self) -> Result<(), Error> {
-    if self.guest.as_ref().is_some_and(GuestLeg::is_plain) {
-      self.upgrade_guest().await?;
-    }
-    if self.server.as_ref().is_some_and(ServerLeg::is_plain) {
-      self.upgrade_server().await?;
-    }
-    self.sync_protected();
-    Ok(())
-  }
-
-  async fn upgrade_guest(&mut self) -> Result<(), Error> {
-    let Some(leg) = self.guest.take() else {
-      return Err(Error::SmtpLegAlreadyTls);
-    };
-    let plain = leg.into_plain()?;
-    let mode = self.scope.guest_tls;
-    let tls = handshake(self.budget, self.transport.accept_guest(self.leaf_name, plain, mode)).await?;
-    self.guest = Some(GuestLeg::Tls(Box::new(tls)));
-    Ok(())
-  }
-
-  async fn upgrade_server(&mut self) -> Result<(), Error> {
-    let Some(leg) = self.server.take() else {
-      return Err(Error::SmtpLegAlreadyTls);
-    };
-    let plain = leg.into_plain()?;
-    let name = self.scope.upstream.host.as_str();
-    let tls = handshake(self.budget, self.transport.connect_server(self.scope, name, plain)).await?;
-    self.server = Some(ServerLeg::Tls(Box::new(tls)));
-    Ok(())
-  }
-
-  /// Real credentials stay off a cleartext upstream. AUTH is rewritten
-  /// only once this leg is TLS.
-  fn sync_protected(&mut self) {
-    let encrypted = self.server.as_ref().is_some_and(|leg| !leg.is_plain());
-    self.down.set_protected(encrypted);
-  }
-
-  async fn forward_downstream(&mut self, line: &[u8]) -> Result<bool, Error> {
-    match feed(&mut self.down, line).await {
-      Forward::Stop => Ok(false),
-      Forward::Bytes(bytes) => {
-        if !bytes.is_empty() {
-          self.write_server(&bytes).await?;
-        }
-        Ok(true)
-      }
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
     }
   }
 
-  async fn flush_downstream(&mut self) -> Result<(), Error> {
-    if let Forward::Bytes(bytes) = feed(&mut self.down, &[]).await
-      && !bytes.is_empty()
-    {
-      self.write_server(&bytes).await?;
+  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+      Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
     }
-    Ok(())
-  }
-
-  /// `false` when the response machine closed the session.
-  async fn write_guest_redacted(&mut self, response: &[u8]) -> Result<bool, Error> {
-    match feed(&mut self.up, response).await {
-      Forward::Stop => return Ok(false),
-      Forward::Bytes(bytes) if !bytes.is_empty() => self.write_guest(&bytes).await?,
-      Forward::Bytes(_) if !response.ends_with(b"\n") => {
-        if let Forward::Bytes(rest) = feed(&mut self.up, &[]).await
-          && !rest.is_empty()
-        {
-          self.write_guest(&rest).await?;
-        }
-      }
-      Forward::Bytes(_) => {}
-    }
-    Ok(true)
-  }
-
-  /// Copy `octets` of a `BDAT` chunk unchanged. The count is the size on
-  /// the command line; the bytes are not a line and are not rewritten.
-  async fn splice_octets(&mut self, mut remaining: u64) -> Result<(), Error> {
-    let mut buf = [0u8; 8192];
-    while remaining > 0 {
-      let want = usize::try_from(remaining).unwrap_or(buf.len()).min(buf.len());
-      let got = self.read_guest_some(&mut buf[..want]).await?;
-      if got == 0 {
-        return Ok(());
-      }
-      let Some(chunk) = buf.get(..got) else {
-        return Err(Error::GuestRead {
-          source: std::io::Error::other("read length past buffer"),
-        });
-      };
-      self.write_server(chunk).await?;
-      let Some(advance) = u64::try_from(got).ok() else {
-        return Err(Error::GuestRead {
-          source: std::io::Error::other("read length does not fit"),
-        });
-      };
-      remaining = remaining.saturating_sub(advance);
-    }
-    Ok(())
-  }
-
-  /// Copy the message body unchanged until the terminating dot line.
-  async fn splice_body(&mut self) -> Result<(), Error> {
-    let mut buf = Vec::new();
-    loop {
-      let Some(byte) = self.read_guest_byte().await? else {
-        if !buf.is_empty() {
-          self.write_server(&buf).await?;
-        }
-        return Ok(());
-      };
-      buf.push(byte);
-      if byte != b'\n' && buf.len() < MAX_LINE {
-        continue;
-      }
-      let ended = is_dot(&buf);
-      self.write_server(&buf).await?;
-      buf.clear();
-      if ended {
-        return Ok(());
-      }
-    }
-  }
-
-  async fn read_guest_line(&mut self) -> Result<Option<Vec<u8>>, Error> {
-    let guest = self.guest.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
-    guest.read_line().await.map_err(|source| Error::GuestRead { source })
-  }
-
-  async fn read_guest_byte(&mut self) -> Result<Option<u8>, Error> {
-    let guest = self.guest.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
-    guest.read_byte().await.map_err(|source| Error::GuestRead { source })
-  }
-
-  async fn read_guest_some(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-    let guest = self.guest.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
-    guest.read_some(buf).await.map_err(|source| Error::GuestRead { source })
-  }
-
-  async fn read_server(&mut self) -> Result<Option<Vec<u8>>, Error> {
-    let server = self.server.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
-    server.read_response().await.map_err(|source| Error::UpstreamRead { source })
-  }
-
-  async fn write_guest(&mut self, bytes: &[u8]) -> Result<(), Error> {
-    let guest = self.guest.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
-    guest
-      .write_flush(bytes)
-      .await
-      .map_err(|source| Error::ResponseChunkToGuest { source })
-  }
-
-  async fn write_server(&mut self, bytes: &[u8]) -> Result<(), Error> {
-    let server = self.server.as_mut().ok_or(Error::SmtpLegAlreadyTls)?;
-    server
-      .write_flush(bytes)
-      .await
-      .map_err(|source| Error::RequestChunkToUpstream { source })
   }
 }
 
@@ -391,8 +148,8 @@ pub(super) struct Dialogue<'a, G> {
   pub(super) budget: Duration,
 }
 
-/// Run the dialogue. Implicit TLS is already settled on whichever leg
-/// asked for it; `STARTTLS` is the only upgrade that happens here.
+/// Run the dialogue. Implicit TLS is already settled and goes straight to
+/// the relay. A cleartext guest reads the opening, then relays.
 ///
 /// # Errors
 ///
@@ -416,27 +173,159 @@ where
   // Swap only when the upstream writer is already TLS (`smtps://`). A
   // cleartext `smtp://` session forwards the decoy until STARTTLS completes.
   down.set_protected(scope.is_upstream_tls);
-  let session = Session {
+  let mut up = Smtp::new(grants, host, port, Direction::Upstream);
+  if !guest.is_plain() {
+    return relay_guarded(guest, server, &mut down, &mut up, &[]).await;
+  }
+  Opening {
     transport,
     scope,
-    guest: Some(guest),
-    server: Some(server),
-    down,
-    up: Smtp::new(grants, host, port, Direction::Upstream),
+    guest,
+    server,
+    down: &mut down,
+    up: &mut up,
+    leaf: host,
     budget,
-    leaf_name: host,
-  };
-  session.pump().await
+  }
+  .run()
+  .await
 }
 
-async fn feed(machine: &mut Smtp, chunk: &[u8]) -> Forward {
-  let (rewritten, hits) = machine.feed(chunk).await;
+/// Cleartext sockets plus the machines they hand to the relay.
+struct Opening<'a, G> {
+  transport: &'a SmtpTransport,
+  scope: &'a SmtpScope,
+  guest: GuestLeg<G>,
+  server: ServerLeg,
+  down: &'a mut Smtp,
+  up: &'a mut Smtp,
+  leaf: &'a str,
+  budget: Duration,
+}
+
+impl<G> Opening<'_, G>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  /// Greeting, then pre-transaction commands, until `STARTTLS` or a command
+  /// the relay should own. `AUTH` stays here so a refusal before the upgrade
+  /// can still be followed by `STARTTLS` on the same sockets.
+  async fn run(mut self) -> Result<(), Error> {
+    let Some(greeting) = acceptance_reply(&mut self.server)
+      .await
+      .map_err(|source| Error::UpstreamRead { source })?
+    else {
+      return Ok(());
+    };
+    write_guest(&mut self.guest, &greeting).await?;
+    loop {
+      let Some(line) = guest_line(&mut self.guest).await.map_err(|source| Error::GuestRead { source })? else {
+        return Ok(());
+      };
+      if verb_is(&line, b"STARTTLS") {
+        return self.starttls(&line).await;
+      }
+      if self.down.awaiting_auth_payload() || is_opening_command(&line) {
+        match forward_down(self.down, &mut self.server, &line).await? {
+          Forwarded::Stop => return Ok(()),
+          Forwarded::Held => return relay_guarded(self.guest, self.server, self.down, self.up, &[]).await,
+          Forwarded::Sent => {}
+        }
+        let Some(reply) = acceptance_reply(&mut self.server)
+          .await
+          .map_err(|source| Error::UpstreamRead { source })?
+        else {
+          return Ok(());
+        };
+        write_guest(&mut self.guest, &reply).await?;
+        continue;
+      }
+      return relay_guarded(self.guest, self.server, self.down, self.up, &line).await;
+    }
+  }
+
+  /// Forward `STARTTLS` when the upstream leg is still clear, or answer it
+  /// locally when that leg is already TLS. Either way the sockets then relay.
+  async fn starttls(mut self, line: &[u8]) -> Result<(), Error> {
+    if self.server.is_plain() {
+      write_server(&mut self.server, line).await?;
+      let Some(reply) = acceptance_reply(&mut self.server)
+        .await
+        .map_err(|source| Error::UpstreamRead { source })?
+      else {
+        return Ok(());
+      };
+      write_guest(&mut self.guest, &reply).await?;
+      if is_220(&reply) {
+        let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
+        let server = upgrade_server(self.transport, self.scope, self.server, self.budget).await?;
+        self.down.set_protected(true);
+        return relay_guarded(guest, server, self.down, self.up, &[]).await;
+      }
+    } else if self.guest.is_plain() {
+      self.down.queue_starttls_ready();
+      if let Some(reply) = self.down.take_reply() {
+        write_guest(&mut self.guest, &reply).await?;
+      }
+      let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
+      self.down.set_protected(true);
+      return relay_guarded(guest, self.server, self.down, self.up, &[]).await;
+    }
+    relay_guarded(self.guest, self.server, self.down, self.up, &[]).await
+  }
+}
+
+/// What one downstream feed did with a complete opening line.
+enum Forwarded {
+  /// The line was written upstream.
+  Sent,
+  /// The machine kept the line. The relay continues from there.
+  Held,
+  /// The machine closed the connection.
+  Stop,
+}
+
+async fn forward_down(down: &mut Smtp, server: &mut ServerLeg, line: &[u8]) -> Result<Forwarded, Error> {
+  let (rewritten, hits) = down.feed(line).await;
   log_hits(&hits);
   match rewritten {
-    Rewritten::Close => Forward::Stop,
-    Rewritten::Hold => Forward::Bytes(Vec::new()),
-    Rewritten::Emit(bytes) => Forward::Bytes(bytes.into_owned()),
+    Rewritten::Close => Ok(Forwarded::Stop),
+    Rewritten::Hold => Ok(Forwarded::Held),
+    Rewritten::Emit(bytes) => {
+      if !bytes.is_empty() {
+        write_server(server, &bytes).await?;
+      }
+      Ok(Forwarded::Sent)
+    }
   }
+}
+
+async fn upgrade_guest<G>(
+  transport: &SmtpTransport,
+  scope: &SmtpScope,
+  guest: GuestLeg<G>,
+  leaf: &str,
+  budget: Duration,
+) -> Result<GuestLeg<G>, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  let plain = match guest {
+    GuestLeg::Plain(stream) => stream,
+    GuestLeg::Tls(_) => return Err(Error::SmtpLegAlreadyTls),
+  };
+  let tls = handshake(budget, transport.accept_guest(leaf, plain, scope.guest_tls)).await?;
+  Ok(GuestLeg::Tls(Box::new(tls)))
+}
+
+async fn upgrade_server(transport: &SmtpTransport, scope: &SmtpScope, server: ServerLeg, budget: Duration) -> Result<ServerLeg, Error> {
+  let plain = match server {
+    ServerLeg::Plain(stream) => stream,
+    ServerLeg::Tls(_) => return Err(Error::SmtpLegAlreadyTls),
+  };
+  let name = scope.upstream.host.as_str();
+  let tls = handshake(budget, transport.connect_server(scope, name, plain)).await?;
+  Ok(ServerLeg::Tls(Box::new(tls)))
 }
 
 async fn handshake<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
@@ -446,98 +335,116 @@ async fn handshake<T>(budget: Duration, handshake: impl Future<Output = Result<T
   }
 }
 
-async fn read_byte<R>(reader: &mut R) -> Result<Option<u8>, std::io::Error>
+async fn write_guest<G>(guest: &mut GuestLeg<G>, bytes: &[u8]) -> Result<(), Error>
 where
-  R: AsyncRead + Unpin,
+  G: AsyncRead + AsyncWrite + Unpin,
 {
-  let mut buf = [0u8; 1];
-  match read_some(reader, &mut buf).await? {
-    0 => Ok(None),
-    _ => Ok(buf.first().copied()),
-  }
+  guest
+    .write_all(bytes)
+    .await
+    .map_err(|source| Error::ResponseChunkToGuest { source })?;
+  guest.flush().await.map_err(|source| Error::ResponseChunkToGuest { source })?;
+  Ok(())
 }
 
-async fn read_some<R>(reader: &mut R, buf: &mut [u8]) -> Result<usize, std::io::Error>
-where
-  R: AsyncRead + Unpin,
-{
-  if buf.is_empty() {
-    return Ok(0);
-  }
-  match reader.read(buf).await {
-    Ok(0) => Ok(0),
-    Ok(n) => Ok(n),
-    Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(0),
-    Err(err) => Err(err),
-  }
+async fn write_server(server: &mut ServerLeg, bytes: &[u8]) -> Result<(), Error> {
+  server
+    .write_all(bytes)
+    .await
+    .map_err(|source| Error::RequestChunkToUpstream { source })?;
+  server.flush().await.map_err(|source| Error::RequestChunkToUpstream { source })?;
+  Ok(())
 }
 
-async fn read_line<R>(reader: &mut R) -> Result<Option<Vec<u8>>, std::io::Error>
+/// One guest command, stopping at the newline so the following payload or
+/// handshake stays unread. A line that reaches the AUTH cap is returned
+/// as-is; the machine closes if it is still incomplete.
+async fn guest_line<R>(reader: &mut R) -> Result<Option<Vec<u8>>, std::io::Error>
 where
   R: AsyncRead + Unpin,
 {
-  let mut buf = Vec::new();
+  let mut line = Vec::new();
+  let mut byte = [0u8; 1];
   loop {
-    match read_byte(reader).await? {
-      None if buf.is_empty() => return Ok(None),
-      None => return Ok(Some(buf)),
-      Some(byte) => {
-        buf.push(byte);
-        if byte == b'\n' || buf.len() >= MAX_LINE {
-          return Ok(Some(buf));
+    match reader.read(&mut byte).await {
+      Ok(0) => {
+        if line.is_empty() {
+          return Ok(None);
+        }
+        return Ok(Some(line));
+      }
+      Ok(_) => {
+        let Some(next) = byte.first().copied() else {
+          return Err(std::io::Error::other("empty read"));
+        };
+        line.push(next);
+        if next == b'\n' || line.len() >= MAX_COMMAND {
+          return Ok(Some(line));
         }
       }
+      Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+        if line.is_empty() {
+          return Ok(None);
+        }
+        return Ok(Some(line));
+      }
+      Err(err) => return Err(err),
     }
   }
 }
 
 /// One SMTP reply, including a multiline (`250-` … `250 `) continuation.
-async fn read_response<R>(reader: &mut R) -> Result<Option<Vec<u8>>, std::io::Error>
+/// Stops on the final line. Bytes after it, including a handshake record,
+/// stay in `reader`.
+async fn acceptance_reply<R>(reader: &mut R) -> Result<Option<Vec<u8>>, std::io::Error>
 where
   R: AsyncRead + Unpin,
 {
   let mut all = Vec::new();
+  let mut line = Vec::new();
+  let mut byte = [0u8; 1];
   loop {
-    let Some(line) = read_line(reader).await? else {
-      if all.is_empty() {
-        return Ok(None);
+    match reader.read(&mut byte).await {
+      Ok(0) => {
+        if all.is_empty() && line.is_empty() {
+          return Ok(None);
+        }
+        all.extend_from_slice(&line);
+        return Ok(Some(all));
       }
-      return Ok(Some(all));
-    };
-    let finished = is_final_reply(&line) || !line.ends_with(b"\n");
-    all.extend_from_slice(&line);
-    if finished {
-      return Ok(Some(all));
+      Ok(_) => {
+        let Some(next) = byte.first().copied() else {
+          return Err(std::io::Error::other("empty read"));
+        };
+        line.push(next);
+        if next != b'\n' && line.len() < MAX_COMMAND {
+          continue;
+        }
+        let finished = is_final_line(&line) || !line.ends_with(b"\n");
+        all.extend_from_slice(&line);
+        line.clear();
+        if finished {
+          return Ok(Some(all));
+        }
+      }
+      Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+        if all.is_empty() && line.is_empty() {
+          return Ok(None);
+        }
+        all.extend_from_slice(&line);
+        return Ok(Some(all));
+      }
+      Err(err) => return Err(err),
     }
   }
 }
 
-async fn write_flush<W>(writer: &mut W, bytes: &[u8]) -> Result<(), std::io::Error>
-where
-  W: AsyncWrite + Unpin,
-{
-  writer.write_all(bytes).await?;
-  writer.flush().await?;
-  Ok(())
+fn is_opening_command(line: &[u8]) -> bool {
+  const VERBS: &[&[u8]] = &[b"EHLO", b"HELO", b"NOOP", b"RSET", b"AUTH", b"QUIT"];
+  VERBS.iter().any(|verb| verb_is(line, verb))
 }
 
-/// Size on `BDAT <n> [LAST]`. Missing or non-numeric sizes are `None`:
-/// the command is still forwarded, and the server rejects it with no payload.
-fn bdat_octets(line: &[u8]) -> Option<u64> {
-  let body = strip_crlf(line);
-  let mut parts = body.split(|byte| *byte == b' ' || *byte == b'\t').filter(|part| !part.is_empty());
-  let verb = parts.next()?;
-  if !verb.eq_ignore_ascii_case(b"BDAT") {
-    return None;
-  }
-  let size = parts.next()?;
-  if size.is_empty() || !size.iter().all(u8::is_ascii_digit) {
-    return None;
-  }
-  std::str::from_utf8(size).ok()?.parse().ok()
-}
-
-fn is_command(line: &[u8], verb: &[u8]) -> bool {
+fn verb_is(line: &[u8], verb: &[u8]) -> bool {
   let body = strip_crlf(line);
   body
     .split(|byte| *byte == b' ' || *byte == b'\t')
@@ -545,23 +452,16 @@ fn is_command(line: &[u8], verb: &[u8]) -> bool {
     .is_some_and(|word| word.eq_ignore_ascii_case(verb))
 }
 
-fn is_dot(line: &[u8]) -> bool {
-  strip_crlf(line) == b"."
-}
-
-fn is_final_reply(line: &[u8]) -> bool {
+fn is_final_line(line: &[u8]) -> bool {
   strip_crlf(line).get(3) != Some(&b'-')
 }
 
-/// Status code on the last line of a reply.
-fn reply_code(buf: &[u8]) -> Option<u16> {
-  let line = buf.rsplit(|byte| *byte == b'\n').find(|line| !line.is_empty())?;
+fn is_220(buf: &[u8]) -> bool {
+  let Some(line) = buf.rsplit(|byte| *byte == b'\n').find(|line| !line.is_empty()) else {
+    return false;
+  };
   let line = line.strip_suffix(b"\r").unwrap_or(line);
-  let digits = line.get(..3)?;
-  if !digits.iter().all(u8::is_ascii_digit) {
-    return None;
-  }
-  std::str::from_utf8(digits).ok()?.parse().ok()
+  line.get(..3) == Some(b"220".as_slice())
 }
 
 fn strip_crlf(line: &[u8]) -> &[u8] {
@@ -594,17 +494,6 @@ pub(super) fn tls_server(stream: ClientTlsStream<TcpStream>) -> ServerLeg {
 
 #[cfg(test)]
 mod tests {
-  use super::bdat_octets;
-
-  #[test]
-  fn bdat_size_is_the_octet_count() {
-    assert_eq!(bdat_octets(b"BDAT 5\r\n"), Some(5));
-    assert_eq!(bdat_octets(b"bdat 0 LAST\r\n"), Some(0));
-    assert_eq!(bdat_octets(b"BDAT\r\n"), None);
-    assert_eq!(bdat_octets(b"BDAT LAST\r\n"), None);
-    assert_eq!(bdat_octets(b"DATA\r\n"), None);
-  }
-
   /// The acceptance line is the whole reply. The next bytes are a
   /// handshake record; consuming them as another SMTP line fails it.
   #[tokio::test]
@@ -613,7 +502,7 @@ mod tests {
     let mut payload = banner.to_vec();
     payload.extend_from_slice(&[0x16, 0x03, 0x01]);
     let mut cursor = std::io::Cursor::new(payload);
-    let reply = super::read_response(&mut cursor).await.unwrap().unwrap();
+    let reply = super::acceptance_reply(&mut cursor).await.unwrap().unwrap();
     assert_eq!(reply, banner);
     let at = usize::try_from(cursor.position()).unwrap();
     assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
