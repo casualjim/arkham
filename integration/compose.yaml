@@ -262,12 +262,18 @@ services:
         cp /certs/ldap.crt /data/tls/server.crt
         cp /certs/ca.crt /data/tls/ca/ca.crt
         chmod 600 /data/tls/server.key
-        /usr/libexec/dirsrv/dscontainer -r &
+        # `dscontainer -H` succeeds as soon as LDAPI accepts a connection,
+        # which is during instance creation. Running dsconf then resets
+        # that connection and the installer exits. The started line is
+        # printed only after creation and the Directory Manager password.
+        /usr/libexec/dirsrv/dscontainer -r > /tmp/dscontainer.log 2>&1 &
         child=$$!
-        trap 'kill "$$child" 2>/dev/null || true; wait "$$child" || true' TERM INT
+        tail -n +1 -f /tmp/dscontainer.log &
+        logpid=$$!
+        trap 'kill "$$child" "$$logpid" 2>/dev/null || true; wait "$$child" || true' TERM INT
         ready=0
-        for _ in $$(seq 1 90); do
-          if /usr/libexec/dirsrv/dscontainer -H; then
+        for _ in $$(seq 1 180); do
+          if grep -q "389-ds-container started" /tmp/dscontainer.log; then
             ready=1
             break
           fi
@@ -288,7 +294,7 @@ services:
       interval: 5s
       timeout: 15s
       retries: 40
-      start_period: 120s
+      start_period: 180s
     volumes:
       - certs:/certs:ro
     networks:
