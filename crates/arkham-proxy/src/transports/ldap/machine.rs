@@ -150,20 +150,21 @@ pub(crate) fn starttls_success(id: u32) -> Result<Vec<u8>, rasn::error::EncodeEr
 }
 
 impl Wire for Ldap {
-  async fn feed<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
-    if self.down.is_some() {
-      return self.feed_down(chunk).await;
-    }
-    if self.up.is_some() {
-      return self.feed_up(chunk).await;
-    }
-    (Rewritten::Emit(Cow::Borrowed(chunk)), Vec::new())
+  fn feed<'a>(&mut self, chunk: &'a [u8]) -> impl Future<Output = (Rewritten<'a>, Vec<Hit>)> + Send {
+    let rewritten = if self.down.is_some() {
+      self.feed_down(chunk)
+    } else if self.up.is_some() {
+      self.feed_up(chunk)
+    } else {
+      (Rewritten::Emit(Cow::Borrowed(chunk)), Vec::new())
+    };
+    std::future::ready(rewritten)
   }
 }
 
 impl Ldap {
   /// Guest to upstream.
-  async fn feed_down<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
+  fn feed_down<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
     let Some(down) = self.down.as_mut() else {
       return (Rewritten::Hold, Vec::new());
     };
@@ -220,7 +221,7 @@ impl Ldap {
   }
 
   /// Upstream to guest.
-  async fn feed_up<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
+  fn feed_up<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
     let Some(up) = self.up.as_mut() else {
       return (Rewritten::Hold, Vec::new());
     };
@@ -296,9 +297,9 @@ enum Redacted {
 /// Swap a simple bind, or notice `StartTLS`. Unchanged messages stay the
 /// original bytes so a non-matching bind is byte-identical.
 fn rewrite_down(frame: &[u8], down: &Down) -> Result<RewrittenDown, ()> {
-  let message: LdapMessage = rasn::ber::decode(frame).map_err(|_| ())?;
+  let message: LdapMessage = rasn::ber::decode(frame).map_err(|_err| ())?;
   match message.protocol_op {
-    ProtocolOp::BindRequest(request) => rewrite_bind(request, message.message_id, down),
+    ProtocolOp::BindRequest(request) => rewrite_bind(&request, message.message_id, down),
     ProtocolOp::ExtendedReq(request) if request.request_name.as_ref() == STARTTLS_OID && request.request_value.is_none() => {
       Ok(RewrittenDown::StartTls { id: message.message_id })
     }
@@ -307,7 +308,7 @@ fn rewrite_down(frame: &[u8], down: &Down) -> Result<RewrittenDown, ()> {
 }
 
 /// Re-encode a simple bind whose password is the decoy.
-fn rewrite_bind(request: BindRequest, message_id: u32, down: &Down) -> Result<RewrittenDown, ()> {
+fn rewrite_bind(request: &BindRequest, message_id: u32, down: &Down) -> Result<RewrittenDown, ()> {
   let AuthenticationChoice::Simple(password) = &request.authentication else {
     return Ok(RewrittenDown::Same);
   };
@@ -324,7 +325,7 @@ fn rewrite_bind(request: BindRequest, message_id: u32, down: &Down) -> Result<Re
     dn,
     AuthenticationChoice::Simple(OctetString::from(down.real.as_bytes())),
   );
-  let encoded = rasn::ber::encode(&LdapMessage::new(message_id, ProtocolOp::BindRequest(swapped))).map_err(|_| ())?;
+  let encoded = rasn::ber::encode(&LdapMessage::new(message_id, ProtocolOp::BindRequest(swapped))).map_err(|_err| ())?;
   // A re-encode that still carries the decoy, or that dropped the real
   // password, is not a swap. Close rather than send the decoy upstream.
   if contains_bytes(&encoded, down.fake.as_bytes()) || !contains_bytes(&encoded, down.real.as_bytes()) {
@@ -343,7 +344,7 @@ fn rewrite_bind(request: BindRequest, message_id: u32, down: &Down) -> Result<Re
 fn redact_up(frame: &[u8], up: &mut Up) -> Result<Redacted, ()> {
   let secret = up.real.as_bytes();
   let leaked = contains_bytes(frame, secret);
-  let mut message: LdapMessage = rasn::ber::decode(frame).map_err(|_| ())?;
+  let mut message: LdapMessage = rasn::ber::decode(frame).map_err(|_err| ())?;
   let starttls_ok = starttls_result(&message, up.expect_id);
   if starttls_ok.is_some() {
     up.expect_id = None;
@@ -366,7 +367,7 @@ fn redact_up(frame: &[u8], up: &mut Up) -> Result<Redacted, ()> {
     return Err(());
   }
   diagnostic.0 = diagnostic.0.replace(&up.real, &up.fake);
-  let encoded = rasn::ber::encode(&message).map_err(|_| ())?;
+  let encoded = rasn::ber::encode(&message).map_err(|_err| ())?;
   if contains_bytes(&encoded, secret) {
     return Err(());
   }

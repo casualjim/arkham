@@ -83,11 +83,22 @@ impl LdapUri {
         "bad connection string `{entry}`: the bind dn is required — a string with no credential maps nothing"
       ));
     }
+    let dn = percent_decode(entry, "bind dn", url.username())?;
+    if dn.is_empty() {
+      return Err(format!(
+        "bad connection string `{entry}`: the bind dn is required — a string with no credential maps nothing"
+      ));
+    }
     let password = url
       .password()
       .filter(|password| !password.is_empty())
-      .map(|password| SecretString::new(password.to_string().into()))
       .ok_or_else(|| format!("bad connection string `{entry}`: the password is required — a string with no credential maps nothing"))?;
+    let password = SecretString::new(percent_decode(entry, "password", password)?.into());
+    if password.expose_secret().is_empty() {
+      return Err(format!(
+        "bad connection string `{entry}`: the password is required — a string with no credential maps nothing"
+      ));
+    }
     if !matches!(url.path(), "" | "/") {
       return Err(format!("bad connection string `{entry}`: an ldap string has no path"));
     }
@@ -96,7 +107,7 @@ impl LdapUri {
       scheme,
       host,
       port,
-      dn: url.username().to_string(),
+      dn,
       password,
       query: url.query_pairs().map(|(key, value)| (key.to_string(), value.to_string())).collect(),
     })
@@ -110,6 +121,60 @@ impl LdapUri {
       dn: self.dn,
       password: self.password,
     }
+  }
+}
+
+/// `username()` and `password()` keep the percent-encoding from the string.
+/// The directory sees the decoded bind DN and password.
+fn percent_decode(entry: &str, what: &str, raw: &str) -> Result<String, String> {
+  let bytes = raw.as_bytes();
+  let mut out = Vec::with_capacity(bytes.len());
+  let mut index = 0usize;
+  while index < bytes.len() {
+    let Some(byte) = bytes.get(index).copied() else {
+      return Err(format!("bad connection string `{entry}`: {what} is truncated"));
+    };
+    if byte != b'%' {
+      out.push(byte);
+      index = index
+        .checked_add(1)
+        .ok_or_else(|| format!("bad connection string `{entry}`: {what} is too long"))?;
+      continue;
+    }
+    let hi_at = index
+      .checked_add(1)
+      .ok_or_else(|| format!("bad connection string `{entry}`: {what} is too long"))?;
+    let lo_at = index
+      .checked_add(2)
+      .ok_or_else(|| format!("bad connection string `{entry}`: {what} is too long"))?;
+    let (Some(hi), Some(lo)) = (bytes.get(hi_at).copied(), bytes.get(lo_at).copied()) else {
+      return Err(format!("bad connection string `{entry}`: {what} has a truncated percent escape"));
+    };
+    let Some(value) = hex_byte(hi, lo) else {
+      return Err(format!("bad connection string `{entry}`: {what} has a bad percent escape"));
+    };
+    out.push(value);
+    index = lo_at
+      .checked_add(1)
+      .ok_or_else(|| format!("bad connection string `{entry}`: {what} is too long"))?;
+  }
+  String::from_utf8(out).map_err(|_utf8| format!("bad connection string `{entry}`: {what} is not utf-8"))
+}
+
+/// One decoded percent-escape byte.
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+  let hi = hex_nibble(hi)?;
+  let lo = hex_nibble(lo)?;
+  hi.checked_shl(4)?.checked_add(lo)
+}
+
+/// One hex digit.
+fn hex_nibble(byte: u8) -> Option<u8> {
+  match byte {
+    b'0'..=b'9' => byte.checked_sub(b'0'),
+    b'a'..=b'f' => byte.checked_sub(b'a')?.checked_add(10),
+    b'A'..=b'F' => byte.checked_sub(b'A')?.checked_add(10),
+    _ => None,
   }
 }
 

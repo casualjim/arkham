@@ -259,81 +259,102 @@ impl Transport for LdapTransport {
       mint: Some(state.mint_handle()),
     };
     let upstream_name = scope.upstream.host.as_str();
+    let pump = Pump {
+      scope,
+      ctx: &ctx,
+      budget,
+      mint: &state.mint,
+      upgrade_upstream: !scope.is_upstream_tls,
+    };
     if scope.is_downstream_tls {
       return self
-        .relay_settled(guest, guest_head, guest_tls, upstream, scope, &ctx, upstream_name)
+        .relay_settled(
+          OpenGuest {
+            stream: guest,
+            head: guest_head,
+            tls: guest_tls,
+          },
+          upstream,
+          &pump,
+          upstream_name,
+        )
         .await;
     }
     if scope.is_upstream_tls {
       let plain = self.connect_server(scope, upstream_name, upstream).await?;
-      self
-        .until_starttls(Prefixed::new(guest_head, guest), plain, scope, &ctx, budget, &state.mint, false)
-        .await
+      self.until_starttls(Prefixed::new(guest_head, guest), plain, &pump).await
     } else {
-      self
-        .until_starttls(Prefixed::new(guest_head, guest), upstream, scope, &ctx, budget, &state.mint, true)
-        .await
+      self.until_starttls(Prefixed::new(guest_head, guest), upstream, &pump).await
     }
   }
+}
+
+/// Guest bytes already read, plus whether that leg opened with TLS.
+struct OpenGuest<G> {
+  stream: G,
+  head: Vec<u8>,
+  tls: Option<(Vec<u8>, String)>,
+}
+
+/// Facts the cleartext pump and the `StartTLS` upgrade share.
+struct Pump<'a> {
+  scope: &'a LdapScope,
+  ctx: &'a PairCtx<'a>,
+  budget: Duration,
+  mint: &'a MintBucket,
+  /// `false` when the upstream leg is already TLS, so `StartTLS` is answered here.
+  upgrade_upstream: bool,
+}
+
+/// The four halves of a cleartext duplex, taken apart for the upgrade.
+struct Split<G, S> {
+  guest_r: ReadHalf<G>,
+  guest_w: WriteHalf<G>,
+  server_r: ReadHalf<S>,
+  server_w: WriteHalf<S>,
 }
 
 impl LdapTransport {
   /// Both legs already know their transport. LDAPS, or cleartext with no
   /// upgrade, lands here.
-  async fn relay_settled<G, S>(
-    &self,
-    guest: G,
-    guest_head: Vec<u8>,
-    guest_tls: Option<(Vec<u8>, String)>,
-    upstream: S,
-    scope: &LdapScope,
-    ctx: &PairCtx<'_>,
-    upstream_name: &str,
-  ) -> Result<(), Error>
+  async fn relay_settled<G, S>(&self, guest: OpenGuest<G>, upstream: S, pump: &Pump<'_>, upstream_name: &str) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
-    match (guest_tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(guest_head, guest), upstream, ctx).await,
+    let OpenGuest { stream, head, tls } = guest;
+    let scope = pump.scope;
+    match (tls, scope.is_upstream_tls) {
+      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx).await,
       (Some((hello_buf, identity)), false) => {
         let plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
+          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
-        relay(plain, upstream, ctx).await
+        relay(plain, upstream, pump.ctx).await
       }
       (None, true) => {
         let plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(guest_head, guest), plain, ctx).await
+        relay(Prefixed::new(head, stream), plain, pump.ctx).await
       }
       (Some((hello_buf, identity)), true) => {
         let guest_plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
+          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
         let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, ctx).await
+        relay(guest_plain, server_plain, pump.ctx).await
       }
     }
   }
 
   /// Plaintext LDAP until a `StartTLS` request has been answered, then TLS.
-  async fn until_starttls<G, S>(
-    &self,
-    guest: G,
-    server: S,
-    scope: &LdapScope,
-    ctx: &PairCtx<'_>,
-    budget: Duration,
-    mint: &MintBucket,
-    upgrade_upstream: bool,
-  ) -> Result<(), Error>
+  async fn until_starttls<G, S>(&self, guest: G, server: S, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
     let (mut guest_r, mut guest_w) = split(guest);
     let (mut server_r, mut server_w) = split(server);
-    let (mut down, mut up) = ldap_pair(ctx);
+    let (mut down, mut up) = ldap_pair(pump.ctx);
     let mut guest_buf = vec![0u8; 16 * 1024];
     let mut server_buf = vec![0u8; 16 * 1024];
     loop {
@@ -341,17 +362,17 @@ impl LdapTransport {
         result = guest_r.read(&mut guest_buf) => {
           let n = read_count(result).map_err(|source| Error::GuestRead { source })?;
           if n == 0 {
-            let _ = push_down(&mut down, &[], &mut server_w, upgrade_upstream).await?;
+            let _ = push_down(&mut down, &[], &mut server_w, pump.upgrade_upstream).await?;
             let _ = server_w.shutdown().await;
             return drain(&mut server_r, &mut guest_w, &mut up, &mut server_buf).await;
           }
-          match push_down(&mut down, &guest_buf[..n], &mut server_w, upgrade_upstream).await? {
+          match push_down(&mut down, &guest_buf[..n], &mut server_w, pump.upgrade_upstream).await? {
             Step::Continue => {}
             Step::Close => return Ok(()),
             Step::Upgrade(id) => {
-              return self.upgrade(
-                id, guest_r, guest_w, server_r, server_w, &mut down, &mut up, scope, ctx, budget, mint, upgrade_upstream,
-              ).await;
+              return self
+                .upgrade(id, Split { guest_r, guest_w, server_r, server_w }, &mut down, &mut up, pump)
+                .await;
             }
           }
         }
@@ -371,29 +392,21 @@ impl LdapTransport {
   }
 
   /// Finish `StartTLS` and hand the plaintext legs to the shared relay.
-  async fn upgrade<G, S>(
-    &self,
-    id: u32,
-    guest_r: ReadHalf<G>,
-    mut guest_w: WriteHalf<G>,
-    mut server_r: ReadHalf<S>,
-    server_w: WriteHalf<S>,
-    down: &mut Ldap,
-    up: &mut Ldap,
-    scope: &LdapScope,
-    ctx: &PairCtx<'_>,
-    budget: Duration,
-    mint: &MintBucket,
-    upgrade_upstream: bool,
-  ) -> Result<(), Error>
+  async fn upgrade<G, S>(&self, id: u32, split: Split<G, S>, down: &mut Ldap, up: &mut Ldap, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
+    let Split {
+      guest_r,
+      mut guest_w,
+      mut server_r,
+      server_w,
+    } = split;
     let prefix = down.take_prefix();
-    let success = if upgrade_upstream {
+    let success = if pump.upgrade_upstream {
       up.expect_starttls(id);
-      read_starttls_result(&mut server_r, &mut guest_w, up, budget).await?
+      read_starttls_result(&mut server_r, &mut guest_w, up, pump.budget).await?
     } else {
       let bytes = starttls_success(id).map_err(|source| Error::LdapEncode { source })?;
       guest_w
@@ -409,16 +422,16 @@ impl LdapTransport {
     }
     let mut guest = guest_r.unsplit(guest_w);
     let server = server_r.unsplit(server_w);
-    let authority = Some(scope.downstream.host.as_str());
-    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &prefix, budget, authority, mint).await? else {
+    let authority = Some(pump.scope.downstream.host.as_str());
+    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &prefix, pump.budget, authority, pump.mint).await? else {
       return Ok(());
     };
     let guest_plain = self
-      .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
+      .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls)
       .await?;
-    let (mut downstream, mut upstream) = ldap_pair(ctx);
-    if upgrade_upstream {
-      let server_plain = self.connect_server(scope, scope.upstream.host.as_str(), server).await?;
+    let (mut downstream, mut upstream) = ldap_pair(pump.ctx);
+    if pump.upgrade_upstream {
+      let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
       relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[]).await
     } else {
       relay_guarded(guest_plain, server, &mut downstream, &mut upstream, &[]).await
@@ -505,7 +518,7 @@ where
     }
     let read = tokio::time::timeout(left, server.read(&mut buf))
       .await
-      .map_err(|_| Error::UpstreamRead {
+      .map_err(|_elapsed| Error::UpstreamRead {
         source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
       })?;
     let n = read_count(read).map_err(|source| Error::UpstreamRead { source })?;
