@@ -10,7 +10,7 @@ mod postgres;
 mod redis;
 mod smtp;
 
-pub use ldap::{LdapLeg, LdapScope};
+pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
 pub use smtp::{SmtpLeg, SmtpScope, SmtpUriError};

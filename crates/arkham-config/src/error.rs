@@ -9,7 +9,7 @@ use toml::de::Error as TomlError;
 use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 
-use crate::grants::{Scheme, SmtpUriError};
+use crate::grants::{LdapUriError, Scheme, SmtpUriError};
 
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -155,12 +155,13 @@ pub enum Error {
     detail: String,
   },
   /// An LDAP connection string does not parse.
-  #[error("rule `{label}`: {detail}")]
+  #[error("rule `{label}`: {source}")]
   LdapScope {
     /// Rule label.
     label: String,
     /// Parse failure.
-    detail: String,
+    #[source]
+    source: LdapUriError,
   },
   /// A connection-string rule names a scheme no vertical owns.
   #[error("rule `{label}`: scheme `{scheme:?}` owns no connection-string grant")]
