@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use secrecy::{ExposeSecret as _, SecretString};
+use strum::EnumIter;
 use url::{Host, Url};
 
 use crate::config::{AppConfig, RuleCfg, fake_for};
@@ -74,7 +75,7 @@ impl FromStr for HostPat {
 }
 
 /// Grant scheme: the URL scheme names the protocol. No inference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub enum Scheme {
   /// Plain HTTP.
   Http,
@@ -91,6 +92,27 @@ pub enum Scheme {
   /// SSH. The proxy terminates the protocol on both legs; port defaults
   /// to 22 the way ssh itself defaults it.
   Ssh,
+}
+
+impl Scheme {
+  /// Lowercase URL scheme for this variant.
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Http => "http",
+      Self::Https => "https",
+      Self::Tcp => "tcp",
+      Self::Postgres => "postgres",
+      Self::Redis => "redis",
+      Self::Rediss => "rediss",
+      Self::Ssh => "ssh",
+    }
+  }
+
+  /// Every scheme the proxy serves, in enum order.
+  pub fn all() -> impl Iterator<Item = Self> {
+    <Self as strum::IntoEnumIterator>::iter()
+  }
 }
 
 /// One real secret and the decoy that stands in for it. Shared by every

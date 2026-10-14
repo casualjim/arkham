@@ -189,13 +189,38 @@ services:
     working_dir: /srv
     # openssh-client first: scenario 8 is a plain `ssh` binary holding only
     # the decoy identity, connecting through the transparent capture.
+    # apt needs root. When the host passes HOST_UID, bun then drops to that
+    # user so the bind-mounted coverage file is not owned by root.
     command:
-      [
-        "bash",
-        "-c",
-        "apt-get update -qq && apt-get install -qq -y openssh-client && exec bun /srv/run.ts",
-      ]
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        apt-get update -qq && apt-get install -qq -y openssh-client
+        if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
+          gid="$${HOST_GID:-$$HOST_UID}"
+          mkdir -p /out
+          chown "$$HOST_UID:$$gid" /out
+          # ssh ignores a private key it does not own, and it refuses a uid
+          # with no passwd entry. /certs is read-only, so the decoy is copied.
+          # $$ keeps these as shell variables; compose would otherwise interpolate them.
+          if ! getent group "$$gid" >/dev/null; then
+            echo "arkham:x:$$gid:" >> /etc/group
+          fi
+          if ! getent passwd "$$HOST_UID" >/dev/null; then
+            echo "arkham:x:$$HOST_UID:$$gid:arkham:/tmp:/bin/bash" >> /etc/passwd
+          fi
+          cp /certs/ssh/decoy /tmp/decoy
+          chown "$$HOST_UID:$$gid" /tmp/decoy
+          chmod 600 /tmp/decoy
+          export HOME=/tmp SSH_IDENTITY=/tmp/decoy
+          exec setpriv --reuid="$$HOST_UID" --regid="$$gid" --clear-groups bun /srv/run.ts
+        fi
+        exec bun /srv/run.ts
     environment:
+      ARKHAM_COVERED: /out/covered.json
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
       ARKHAM_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `arkham fake GH_TOKEN`, not a credential
       DATABASE_URL: postgres://arkham:arkham_fake_password_01@db:5432/demo?sslmode=require # nosemgrep: deterministic demo decoy, not a credential
       OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `arkham fake OIDC_CLIENT_SECRET`, not a credential
@@ -205,6 +230,7 @@ services:
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
+      - ./out:/out
     network_mode: service:arkham
     depends_on:
       arkham:

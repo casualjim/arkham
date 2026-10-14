@@ -40,6 +40,10 @@ The listener binds before any capture side effect, so a bad listen address fails
 
 Print the deterministic decoy for an env var name. `--pattern` overrides the registry-supplied shape for this invocation only. See [decoy patterns](decoy-patterns.md).
 
+## `arkham schemes`
+
+Print each URL scheme the proxy serves, one per line. The list is every `Scheme` variant.
+
 ## `arkham ca`
 
 Generate or load the CA, print its certificate PEM to stdout, and write `ca.crt` and `ca.key` beside the CA file. The printed PEM is the trust anchor to install into workload containers; the private key stays in the CA file and in `ca.key`.

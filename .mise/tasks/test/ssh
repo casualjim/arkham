@@ -29,6 +29,11 @@ fi
 # a service's cgroup path — `ARKHAM_BACKEND=ebpf mise run demo:bwrap` runs
 # the same scenarios over eBPF instead.
 backends=${ARKHAM_TEST_BACKENDS:-"tproxy tun"}
+# Compose interpolates these on every `up` and `down`. Export them for the
+# whole loop so a command that does not prefix them does not warn.
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+export HOST_UID HOST_GID
 
 # The debug binary comes from the `build:debug` dependency; compose mounts
 # it from here (the image is runtime-only, no build stage).
@@ -43,6 +48,9 @@ for backend in $backends; do
   # A leftover stack holds an old CA while the rerun rotates the volume, and
   # the first handshake fails on the mismatch; every round starts clean.
   $compose down --remove-orphans -v --timeout 3
+  # The bind-mounted file survives `down`. A leftover from the previous
+  # backend, or from an earlier run, must not satisfy this round.
+  rm -f integration/out/covered.json
   ARKHAM_BACKEND="$backend" $compose up -d --build
 
   state=running
@@ -57,6 +65,22 @@ for backend in $backends; do
     code=124
   fi
   docker logs "$client" || true
+  if [ "$code" = 0 ]; then
+    covered=integration/out/covered.json
+    if [ ! -f "$covered" ]; then
+      echo "missing $covered"
+      code=1
+    else
+      integration/docker/arkham schemes > /tmp/arkham-schemes.txt
+      while IFS= read -r scheme; do
+        [ -z "$scheme" ] && continue
+        if ! grep -Fq "\"${scheme}\"" "$covered"; then
+          echo "scheme ${scheme} has no passing e2e scenario"
+          code=1
+        fi
+      done < /tmp/arkham-schemes.txt
+    fi
+  fi
   # Capture every service, arkham especially, before teardown. The CI
   # failure step prints this file; compose down would otherwise erase it.
   if [ "$code" != 0 ]; then

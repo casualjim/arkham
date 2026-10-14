@@ -14,7 +14,7 @@ use arkham_compose::rules_command;
 use arkham_config::ExposeSecret;
 use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
 use arkham_config::config::{AppConfig, ProxyCfg, cwd_project_rules_dir, load, reference_samples, validate_pattern};
-use arkham_config::grants::{EndpointScope, decoy_for_rule};
+use arkham_config::grants::{EndpointScope, Scheme, decoy_for_rule};
 use arkham_config::import::{flow_from_oidc, flows_from_openapi, to_toml_fragment};
 use arkham_fnox::{FnoxSource, resolve};
 use arkham_pki::ca::load_or_generate;
@@ -143,6 +143,25 @@ impl CliCommand for FakeArgs {
     }
     println!("{decoy}");
     Ok(())
+  }
+}
+
+/// Arguments for [`Command::Schemes`](crate::Command::Schemes).
+#[derive(Args, Debug, Clone, Copy)]
+pub struct SchemesArgs;
+
+impl CliCommand for SchemesArgs {
+  type Error = Report;
+  /// Prints each supported URL scheme, one per line.
+  ///
+  /// # Errors
+  ///
+  /// This command does not fail.
+  fn run(self, _cli: &Cli, _arkham_version: &str) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    for scheme in Scheme::all() {
+      println!("{}", scheme.as_str());
+    }
+    std::future::ready(Ok(()))
   }
 }
 
