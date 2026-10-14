@@ -11,7 +11,7 @@ mod smtp;
 
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
-pub use smtp::{SmtpLeg, SmtpScope};
+pub use smtp::{SmtpLeg, SmtpScope, SmtpUriError};
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -95,7 +95,8 @@ pub enum Scheme {
   /// to 22 the way ssh itself defaults it.
   Ssh,
   /// Cleartext SMTP. `STARTTLS` upgrades the session when the peer asks,
-  /// or when the real string says `starttls=required`. Port defaults to 25.
+  /// or when the real string says `starttls=required`. Port defaults to 587,
+  /// the submission port.
   Smtp,
   /// Implicit TLS SMTP from the first byte. Port defaults to 465.
   Smtps,
@@ -263,7 +264,7 @@ impl FromStr for EndpointScope {
       (None, Scheme::Postgres) => 5432,
       (None, Scheme::Redis | Scheme::Rediss) => 6379,
       (None, Scheme::Ssh) => 22,
-      (None, Scheme::Smtp) => 25,
+      (None, Scheme::Smtp) => 587,
       (None, Scheme::Smtps) => 465,
     };
     reject_endpoint_query(entry, &url)?;
@@ -1007,12 +1008,18 @@ mod tests {
     assert_eq!(encoded.downstream.user, "agent@demo.test");
     assert_eq!(encoded.downstream.password.expose_secret(), "p@ss");
     assert_eq!(encoded.upstream.password.expose_secret(), "real");
-    let cfg = cfg_with_db(
+    // A `%` that is not two hex digits stays literal. Invalid UTF-8 fails.
+    let literal = smtp_scope(
       "smtp://agent%zz:fake@mail.internal:587", // betterleaks:allow
       "smtp://agent:real@mail.internal:587",    // betterleaks:allow
     );
+    assert_eq!(literal.downstream.user, "agent%zz");
+    let cfg = cfg_with_db(
+      "smtp://agent%FF:fake@mail.internal:587", // betterleaks:allow
+      "smtp://agent:real@mail.internal:587",    // betterleaks:allow
+    );
     let err = resolve(&cfg).unwrap_err().to_string();
-    assert!(err.contains("percent-encoding"), "{err}");
+    assert!(err.contains("UTF-8"), "{err}");
   }
 
   #[test]
@@ -1021,12 +1028,61 @@ mod tests {
       "smtp://agent:fake@mail.internal",                     // betterleaks:allow
       "smtps://agent:real@mail.internal?sslrootcert=system", // betterleaks:allow
     );
-    assert_eq!(scope.downstream.port, 25);
+    assert_eq!(scope.downstream.port, 587);
     assert_eq!(scope.upstream.port, 465);
     assert!(!scope.is_downstream_tls);
     assert!(scope.is_upstream_tls);
     assert!(!scope.starttls_required);
     assert_eq!(scope.root_cert, Some(RootCert::System));
+  }
+
+  #[test]
+  fn smtp_resend_ports_keep_the_scheme_transport() {
+    // 25, 465, 587, 2465, and 2587 are the ports Resend publishes. 2465 is
+    // implicit TLS and 2587 is STARTTLS only because the string says so:
+    // an explicit port is never rewritten, and it does not pick the scheme.
+    let relay = smtp_scope(
+      "smtp://agent:fake@mail.internal:25", // betterleaks:allow
+      "smtp://agent:real@mail.internal:25", // betterleaks:allow
+    );
+    assert_eq!(relay.downstream.port, 25);
+    assert_eq!(relay.upstream.port, 25);
+    assert!(!relay.is_downstream_tls);
+    assert!(!relay.is_upstream_tls);
+    assert!(!relay.starttls_required);
+    let submission = smtp_scope(
+      "smtp://agent:fake@mail.internal:587",                   // betterleaks:allow
+      "smtp://agent:real@mail.internal:587?starttls=required", // betterleaks:allow
+    );
+    assert_eq!(submission.upstream.port, 587);
+    assert!(submission.starttls_required);
+    assert!(!submission.is_upstream_tls);
+    let implicit = smtp_scope(
+      "smtps://agent:fake@mail.internal:465", // betterleaks:allow
+      "smtps://agent:real@mail.internal:465", // betterleaks:allow
+    );
+    assert_eq!(implicit.downstream.port, 465);
+    assert!(implicit.is_downstream_tls);
+    assert!(implicit.is_upstream_tls);
+    assert!(!implicit.starttls_required);
+    let alt_implicit = smtp_scope(
+      "smtps://agent:fake@mail.internal:2465", // betterleaks:allow
+      "smtps://agent:real@mail.internal:2465", // betterleaks:allow
+    );
+    assert_eq!(alt_implicit.downstream.port, 2465);
+    assert_eq!(alt_implicit.upstream.port, 2465);
+    assert!(alt_implicit.is_downstream_tls);
+    assert!(alt_implicit.is_upstream_tls);
+    assert!(!alt_implicit.starttls_required);
+    let alt_starttls = smtp_scope(
+      "smtp://agent:fake@mail.internal:2587",                   // betterleaks:allow
+      "smtp://agent:real@mail.internal:2587?starttls=required", // betterleaks:allow
+    );
+    assert_eq!(alt_starttls.downstream.port, 2587);
+    assert_eq!(alt_starttls.upstream.port, 2587);
+    assert!(alt_starttls.starttls_required);
+    assert!(!alt_starttls.is_downstream_tls);
+    assert!(!alt_starttls.is_upstream_tls);
   }
 
   #[test]

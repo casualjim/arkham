@@ -8,6 +8,7 @@
 //! makes trust material legal on that scheme.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
@@ -59,6 +60,119 @@ pub struct SmtpScope {
   pub guest_tls: GuestTlsMode,
 }
 
+/// Why one `smtp://` or `smtps://` string was rejected.
+#[derive(Debug, thiserror::Error)]
+pub enum SmtpUriError {
+  /// The string is not `smtp://` or `smtps://`.
+  #[error("bad connection string `{entry}`: expected smtp:// or smtps://")]
+  Scheme {
+    /// The rejected string.
+    entry: String,
+  },
+  /// `url` could not parse the string.
+  #[error("bad connection string `{entry}`: {source}")]
+  Url {
+    /// The rejected string.
+    entry: String,
+    /// Parser failure.
+    #[source]
+    source: url::ParseError,
+  },
+  /// The string has no host.
+  #[error("bad connection string `{entry}`: empty host")]
+  EmptyHost {
+    /// The rejected string.
+    entry: String,
+  },
+  /// The userinfo component is not UTF-8 after percent-decoding.
+  #[error("bad connection string `{entry}`: the {label} is not valid UTF-8")]
+  UserinfoUtf8 {
+    /// The rejected string.
+    entry: String,
+    /// `user` or `password`.
+    label: &'static str,
+    /// Decoder failure.
+    #[source]
+    source: std::str::Utf8Error,
+  },
+  /// AUTH has no identity.
+  #[error("bad connection string `{entry}`: the user is required — a string with no AUTH identity maps nothing")]
+  UserRequired {
+    /// The rejected string.
+    entry: String,
+  },
+  /// AUTH has no secret.
+  #[error("bad connection string `{entry}`: the password is required — a string with no credential maps nothing")]
+  PasswordRequired {
+    /// The rejected string.
+    entry: String,
+  },
+  /// An SMTP string carries a path.
+  #[error("bad connection string `{entry}`: an SMTP string has no path")]
+  Path {
+    /// The rejected string.
+    entry: String,
+  },
+  /// `starttls` was set on `smtps://`.
+  #[error("bad connection string `{entry}`: smtps:// is already TLS; `starttls` belongs on smtp://")]
+  StarttlsOnTls {
+    /// The rejected string.
+    entry: String,
+  },
+  /// `starttls` was not `required`.
+  #[error("bad connection string `{entry}`: starttls is `required` or absent, not `{value}`")]
+  StarttlsValue {
+    /// The rejected string.
+    entry: String,
+    /// The rejected value.
+    value: String,
+  },
+  /// A query tried to restate the transport the scheme already states.
+  #[error("bad connection string `{entry}`: smtp strings state their transport in the scheme, never in `{key}`")]
+  TransportQuery {
+    /// The rejected string.
+    entry: String,
+    /// `sslmode`, `ssl`, or `sslnegotiation`.
+    key: String,
+  },
+  /// A path query was empty.
+  #[error("bad connection string `{entry}`: {key} needs a path")]
+  EmptyMaterial {
+    /// The rejected string.
+    entry: String,
+    /// `sslrootcert`, `sslcert`, or `sslkey`.
+    key: &'static str,
+  },
+  /// The query key is not one this scheme accepts.
+  #[error("bad connection string `{entry}`: unknown query `{key}`")]
+  UnknownQuery {
+    /// The rejected string.
+    entry: String,
+    /// The rejected key.
+    key: String,
+  },
+  /// Trust material on a cleartext `smtp://` string.
+  #[error("bad connection string `{entry}`: cleartext `smtp://` carries no TLS state; trust belongs on `smtps://` or `starttls=required`")]
+  TrustOnCleartext {
+    /// The rejected string.
+    entry: String,
+  },
+  /// Client identity on a cleartext `smtp://` string.
+  #[error(
+    "bad connection string `{entry}`: cleartext `smtp://` carries no TLS state; identity belongs on `smtps://` or `starttls=required`"
+  )]
+  IdentityOnCleartext {
+    /// The rejected string.
+    entry: String,
+  },
+  /// `sslcert` and `sslkey` were not paired.
+  #[error("bad connection string `{entry}`: sslcert and sslkey come together")]
+  CertKeyPair {
+    /// The rejected string.
+    entry: String,
+  },
+}
+
 /// One parsed `smtp://` or `smtps://` string.
 #[derive(Debug)]
 struct SmtpUri {
@@ -71,61 +185,78 @@ struct SmtpUri {
   query: Vec<(String, String)>,
 }
 
-impl SmtpUri {
+impl FromStr for SmtpUri {
+  type Err = SmtpUriError;
+
   /// Parse one SMTP connection string. The user and the password are both
-  /// required: a string with no AUTH identity maps nothing.
-  fn parse(entry: &str) -> Result<Self, String> {
+  /// required: a string with no AUTH identity maps nothing. An omitted port
+  /// is 587 for `smtp://` and 465 for `smtps://`.
+  fn from_str(entry: &str) -> Result<Self, Self::Err> {
     let scheme = if entry.starts_with("smtps://") {
       Scheme::Smtps
     } else if entry.starts_with("smtp://") {
       Scheme::Smtp
     } else {
-      return Err(format!("bad connection string `{entry}`: expected smtp:// or smtps://"));
+      return Err(SmtpUriError::Scheme { entry: entry.to_string() });
     };
-    let url = Url::parse(entry).map_err(|err| format!("bad connection string `{entry}`: {err}"))?;
+    let url = Url::parse(entry).map_err(|source| SmtpUriError::Url {
+      entry: entry.to_string(),
+      source,
+    })?;
     let host = url
       .host()
       .map(|host| host.to_string())
-      .ok_or_else(|| format!("bad connection string `{entry}`: empty host"))?;
+      .ok_or_else(|| SmtpUriError::EmptyHost { entry: entry.to_string() })?;
     // `Url` leaves userinfo percent-encoded. An SMTP user is an address,
-    // so `@` is written `%40` and has to be decoded before AUTH.
-    let user = userinfo_decode(entry, "user", url.username())?;
+    // so `@` is written `%40` and has to be decoded before AUTH. A `%`
+    // that is not two hex digits stays literal; only invalid UTF-8 fails.
+    let user = percent_encoding::percent_decode_str(url.username())
+      .decode_utf8()
+      .map_err(|source| SmtpUriError::UserinfoUtf8 {
+        entry: entry.to_string(),
+        label: "user",
+        source,
+      })?
+      .into_owned();
     if user.is_empty() {
-      return Err(format!(
-        "bad connection string `{entry}`: the user is required — a string with no AUTH identity maps nothing"
-      ));
+      return Err(SmtpUriError::UserRequired { entry: entry.to_string() });
     }
     let password = match url.password().filter(|password| !password.is_empty()) {
-      Some(password) => SecretString::new(userinfo_decode(entry, "password", password)?.into()),
-      None => {
-        return Err(format!(
-          "bad connection string `{entry}`: the password is required — a string with no credential maps nothing"
-        ));
+      Some(password) => {
+        let decoded = percent_encoding::percent_decode_str(password)
+          .decode_utf8()
+          .map_err(|source| SmtpUriError::UserinfoUtf8 {
+            entry: entry.to_string(),
+            label: "password",
+            source,
+          })?
+          .into_owned();
+        SecretString::new(decoded.into())
       }
+      None => return Err(SmtpUriError::PasswordRequired { entry: entry.to_string() }),
     };
     if url.path() != "" && url.path() != "/" {
-      return Err(format!("bad connection string `{entry}`: an SMTP string has no path"));
+      return Err(SmtpUriError::Path { entry: entry.to_string() });
     }
     let mut starttls_required = false;
     let mut query = Vec::new();
     for (key, value) in url.query_pairs() {
       if key == "starttls" {
         if scheme == Scheme::Smtps {
-          return Err(format!(
-            "bad connection string `{entry}`: smtps:// is already TLS; `starttls` belongs on smtp://"
-          ));
+          return Err(SmtpUriError::StarttlsOnTls { entry: entry.to_string() });
         }
         if value != "required" {
-          return Err(format!(
-            "bad connection string `{entry}`: starttls is `required` or absent, not `{value}`"
-          ));
+          return Err(SmtpUriError::StarttlsValue {
+            entry: entry.to_string(),
+            value: value.into_owned(),
+          });
         }
         starttls_required = true;
         continue;
       }
-      query.push((key.to_string(), value.to_string()));
+      query.push((key.into_owned(), value.into_owned()));
     }
-    let default_port = if scheme == Scheme::Smtps { 465 } else { 25 };
+    let default_port = if scheme == Scheme::Smtps { 465 } else { 587 };
     Ok(Self {
       scheme,
       host,
@@ -136,7 +267,9 @@ impl SmtpUri {
       query,
     })
   }
+}
 
+impl SmtpUri {
   /// The leg a rule builds from this string.
   fn leg(self) -> SmtpLeg {
     SmtpLeg {
@@ -156,60 +289,24 @@ struct SmtpTls {
   client_key: Option<PathBuf>,
 }
 
-/// Percent-decode one userinfo component. `+` stays a plus: userinfo is
-/// not a query string.
-fn userinfo_decode(entry: &str, label: &str, raw: &str) -> Result<String, String> {
-  let bytes = raw.as_bytes();
-  let mut out = Vec::with_capacity(bytes.len());
-  let mut index = 0;
-  while let Some(byte) = bytes.get(index).copied() {
-    if byte != b'%' {
-      out.push(byte);
-      index = index.saturating_add(1);
-      continue;
-    }
-    let hi = bytes.get(index.saturating_add(1)).copied();
-    let lo = bytes.get(index.saturating_add(2)).copied();
-    let Some(value) = hi.zip(lo).and_then(|(hi, lo)| hex_byte(hi, lo)) else {
-      return Err(format!(
-        "bad connection string `{entry}`: the {label} is not valid percent-encoding"
-      ));
-    };
-    out.push(value);
-    index = index.saturating_add(3);
-  }
-  String::from_utf8(out).map_err(|_err| format!("bad connection string `{entry}`: the {label} is not valid UTF-8"))
-}
-
-fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
-  let hi = hex_nibble(hi)?;
-  let lo = hex_nibble(lo)?;
-  hi.checked_mul(16)?.checked_add(lo)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-  match byte {
-    b'0'..=b'9' => byte.checked_sub(b'0'),
-    b'a'..=b'f' => byte.checked_sub(b'a').and_then(|n| n.checked_add(10)),
-    b'A'..=b'F' => byte.checked_sub(b'A').and_then(|n| n.checked_add(10)),
-    _ => None,
-  }
-}
-
-fn smtp_tls(entry: &str, tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, String> {
+fn smtp_tls(entry: &str, tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
   let mut root_cert = None;
   let mut client_cert = None;
   let mut client_key = None;
   for (key, value) in &uri.query {
     let tls_material = match key.as_str() {
       "sslmode" | "ssl" | "sslnegotiation" => {
-        return Err(format!(
-          "bad connection string `{entry}`: smtp strings state their transport in the scheme, never in `{key}`"
-        ));
+        return Err(SmtpUriError::TransportQuery {
+          entry: entry.to_string(),
+          key: key.clone(),
+        });
       }
       "sslrootcert" => {
         if value.is_empty() {
-          return Err(format!("bad connection string `{entry}`: sslrootcert needs a path"));
+          return Err(SmtpUriError::EmptyMaterial {
+            entry: entry.to_string(),
+            key: "sslrootcert",
+          });
         }
         Some(if value == "system" {
           RootCert::System
@@ -219,36 +316,43 @@ fn smtp_tls(entry: &str, tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, String
       }
       "sslcert" => {
         if value.is_empty() {
-          return Err(format!("bad connection string `{entry}`: sslcert needs a path"));
+          return Err(SmtpUriError::EmptyMaterial {
+            entry: entry.to_string(),
+            key: "sslcert",
+          });
         }
         client_cert = Some(PathBuf::from(value));
         None
       }
       "sslkey" => {
         if value.is_empty() {
-          return Err(format!("bad connection string `{entry}`: sslkey needs a path"));
+          return Err(SmtpUriError::EmptyMaterial {
+            entry: entry.to_string(),
+            key: "sslkey",
+          });
         }
         client_key = Some(PathBuf::from(value));
         None
       }
-      _ => return Err(format!("bad connection string `{entry}`: unknown query `{key}`")),
+      _ => {
+        return Err(SmtpUriError::UnknownQuery {
+          entry: entry.to_string(),
+          key: key.clone(),
+        });
+      }
     };
     if let Some(root) = tls_material {
       if !tls_leg {
-        return Err(format!(
-          "bad connection string `{entry}`: cleartext `smtp://` carries no TLS state; trust belongs on `smtps://` or `starttls=required`"
-        ));
+        return Err(SmtpUriError::TrustOnCleartext { entry: entry.to_string() });
       }
       root_cert = Some(root);
     }
   }
   if !tls_leg && (client_cert.is_some() || client_key.is_some()) {
-    return Err(format!(
-      "bad connection string `{entry}`: cleartext `smtp://` carries no TLS state; identity belongs on `smtps://` or `starttls=required`"
-    ));
+    return Err(SmtpUriError::IdentityOnCleartext { entry: entry.to_string() });
   }
   if client_cert.is_some() != client_key.is_some() {
-    return Err(format!("bad connection string `{entry}`: sslcert and sslkey come together"));
+    return Err(SmtpUriError::CertKeyPair { entry: entry.to_string() });
   }
   Ok(SmtpTls {
     root_cert,
@@ -265,9 +369,9 @@ impl SmtpScope {
   ///
   /// Either string is not an `smtp://` or `smtps://` connection string, or
   /// its query breaks the law above.
-  pub fn from_strings(fake: &str, real: &str) -> Result<Self, String> {
-    let downstream = SmtpUri::parse(fake)?;
-    let upstream = SmtpUri::parse(real)?;
+  pub fn from_strings(fake: &str, real: &str) -> Result<Self, SmtpUriError> {
+    let downstream = fake.parse::<SmtpUri>()?;
+    let upstream = real.parse::<SmtpUri>()?;
     let upstream_tls = upstream.scheme == Scheme::Smtps || upstream.starttls_required;
     let SmtpTls {
       root_cert,
@@ -305,9 +409,9 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     .as_ref()
     .map(|value| value.expose_secret().to_string())
     .unwrap_or_default();
-  let mut scope = SmtpScope::from_strings(&fake, real).map_err(|err| Error::SmtpScope {
+  let mut scope = SmtpScope::from_strings(&fake, real).map_err(|source| Error::SmtpScope {
     label: label.to_string(),
-    detail: err,
+    source,
   })?;
   for (key, tls) in &rule.tls {
     if key != &rule.env {

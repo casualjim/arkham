@@ -9,7 +9,7 @@ use toml::de::Error as TomlError;
 use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 
-use crate::grants::Scheme;
+use crate::grants::{Scheme, SmtpUriError};
 
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -459,12 +459,13 @@ pub enum Error {
     label: String,
   },
   /// An SMTP connection string does not parse.
-  #[error("rule `{label}`: {detail}")]
+  #[error("rule `{label}`: {source}")]
   SmtpScope {
     /// Rule label.
     label: String,
     /// Parse failure.
-    detail: String,
+    #[source]
+    source: SmtpUriError,
   },
   /// An SMTP rule states its upstream identity outside the connection string.
   #[error("rule `{label}`: smtp states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
