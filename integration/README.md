@@ -53,8 +53,7 @@ connection to :5432 resolves to the entry, whatever address DNS resolved.
 Both connection strings name the host the way real deployments do —
 the `db` hostname, never an IP. The client keeps full TLS hostname
 verification on: it dials by that name, and arkham mints the guest leaf
-for it. The bwrap demo has
-no postgres and no `DATABASE_URL`, so scenario 6 is skipped there.
+for it. Scenario 6 is gated on `DATABASE_URL`, so `run.ts` still runs when that service is absent.
 Scenario 7 exercises runtime token minting
 (`crates/arkham-proxy/src/mint.rs`): the client secret is a static
 substitution (`arkham fake OIDC_CLIENT_SECRET`, pinned in
@@ -64,8 +63,7 @@ Scenarios 9 and 10 are the official `redis:7-alpine` image and Bun's
 `RedisClient`. The proxy is the only code we wrote on that path. A
 `tls-ca-cert-file` makes Redis require a client certificate; this demo
 authenticates with passwords and the upstream client has no certificate,
-so the server is started with `tls-auth-clients no`. The bwrap demo has
-no Redis and no `REDIS_URL`, so those scenarios are skipped there.
+so the server is started with `tls-auth-clients no`. Scenarios 9 and 10 are gated on `REDIS_URL` and `REDIS_TLS_URL`, so `run.ts` still runs when the Redis service is absent. `integration/bwrap/run.sh` does not run `run.ts`.
 
 ## Run
 

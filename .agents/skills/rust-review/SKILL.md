@@ -76,7 +76,7 @@ Hard violations: a second error enum or module-local `Result` alias, `eyre` in a
 
 Substitution lives only in `arkham-proxy` behind `serve_candidate_stream`; grant gating lives only in `arkham-config`; leaf issue and rotation live only in `arkham-pki`; guest failures close to `Verdict::Close`. BPF map structs stay `repr(C)` byte-explicit behind the single byte-order helpers; every host-wide command keeps `--exclude arkham-ebpf-programs`; no workspace-hack crate.
 
-Flag: a swap outside `wire/*`, a forward path that bypasses redaction, implicit padding in a map struct, a host command missing the ebpf-programs exclusion, a new hack crate.
+Flag: a swap outside `transports/*`, a forward path that bypasses redaction, implicit padding in a map struct, a host command missing the ebpf-programs exclusion, a new hack crate.
 
 ### 8. Linting and docs
 

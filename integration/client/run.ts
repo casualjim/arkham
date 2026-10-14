@@ -170,8 +170,8 @@ await retry("", "grantless tls splices untouched", async () => {
   return (await exchange(tls, `AUTH ${FAKE}\n`)) === `ERR ${FAKE}\n`;
 });
 
-// 6. Database rule against real PostgreSQL (the compose demo only — bwrap
-//    has no postgres, so no DATABASE_URL means the scenario is skipped).
+// 6. Database rule against real PostgreSQL. Gated on DATABASE_URL so this
+//    script still runs when that service is absent.
 //    The client consumes exactly what the guest holds: its DATABASE_URL,
 //    the rule's stated FAKE connection string. Arkham captures the dial,
 //    matches the rule on the fake string's port, and swaps the fake
@@ -255,7 +255,7 @@ if (PG_URL) {
     return result.includes(Buffer.from("ok"));
   });
 } else {
-  stage("pg scenario skipped: no DATABASE_URL (bwrap)");
+  stage("pg scenario skipped: no DATABASE_URL");
 }
 
 // 7. OAuth2 client_credentials through the token issuer: the fake client
