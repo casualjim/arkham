@@ -61,34 +61,27 @@ pub struct SmtpScope {
 }
 
 /// Why one `smtp://` or `smtps://` string was rejected.
+///
+/// The text names the field or the problem. It never includes the connection
+/// string: that string carries the user and the password.
 #[derive(Debug, thiserror::Error)]
 pub enum SmtpUriError {
   /// The string is not `smtp://` or `smtps://`.
-  #[error("bad connection string `{entry}`: expected smtp:// or smtps://")]
-  Scheme {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: expected smtp:// or smtps://")]
+  Scheme,
   /// `url` could not parse the string.
-  #[error("bad connection string `{entry}`: {source}")]
+  #[error("bad connection string: {source}")]
   Url {
-    /// The rejected string.
-    entry: String,
     /// Parser failure.
     #[source]
     source: url::ParseError,
   },
   /// The string has no host.
-  #[error("bad connection string `{entry}`: empty host")]
-  EmptyHost {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: empty host")]
+  EmptyHost,
   /// The userinfo component is not UTF-8 after percent-decoding.
-  #[error("bad connection string `{entry}`: the {label} is not valid UTF-8")]
+  #[error("bad connection string: the {label} is not valid UTF-8")]
   UserinfoUtf8 {
-    /// The rejected string.
-    entry: String,
     /// `user` or `password`.
     label: &'static str,
     /// Decoder failure.
@@ -96,81 +89,50 @@ pub enum SmtpUriError {
     source: std::str::Utf8Error,
   },
   /// AUTH has no identity.
-  #[error("bad connection string `{entry}`: the user is required — a string with no AUTH identity maps nothing")]
-  UserRequired {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: the user is required — a string with no AUTH identity maps nothing")]
+  UserRequired,
   /// AUTH has no secret.
-  #[error("bad connection string `{entry}`: the password is required — a string with no credential maps nothing")]
-  PasswordRequired {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: the password is required — a string with no credential maps nothing")]
+  PasswordRequired,
   /// An SMTP string carries a path.
-  #[error("bad connection string `{entry}`: an SMTP string has no path")]
-  Path {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: an SMTP string has no path")]
+  Path,
   /// `starttls` was set on `smtps://`.
-  #[error("bad connection string `{entry}`: smtps:// is already TLS; `starttls` belongs on smtp://")]
-  StarttlsOnTls {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: smtps:// is already TLS; `starttls` belongs on smtp://")]
+  StarttlsOnTls,
   /// `starttls` was not `required`.
-  #[error("bad connection string `{entry}`: starttls is `required` or absent, not `{value}`")]
+  #[error("bad connection string: starttls is `required` or absent, not `{value}`")]
   StarttlsValue {
-    /// The rejected string.
-    entry: String,
     /// The rejected value.
     value: String,
   },
   /// A query tried to restate the transport the scheme already states.
-  #[error("bad connection string `{entry}`: smtp strings state their transport in the scheme, never in `{key}`")]
+  #[error("bad connection string: smtp strings state their transport in the scheme, never in `{key}`")]
   TransportQuery {
-    /// The rejected string.
-    entry: String,
     /// `sslmode`, `ssl`, or `sslnegotiation`.
     key: String,
   },
   /// A path query was empty.
-  #[error("bad connection string `{entry}`: {key} needs a path")]
+  #[error("bad connection string: {key} needs a path")]
   EmptyMaterial {
-    /// The rejected string.
-    entry: String,
     /// `sslrootcert`, `sslcert`, or `sslkey`.
     key: &'static str,
   },
   /// The query key is not one this scheme accepts.
-  #[error("bad connection string `{entry}`: unknown query `{key}`")]
+  #[error("bad connection string: unknown query `{key}`")]
   UnknownQuery {
-    /// The rejected string.
-    entry: String,
     /// The rejected key.
     key: String,
   },
   /// Trust material on a cleartext `smtp://` string.
-  #[error("bad connection string `{entry}`: cleartext `smtp://` carries no TLS state; trust belongs on `smtps://` or `starttls=required`")]
-  TrustOnCleartext {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: cleartext `smtp://` carries no TLS state; trust belongs on `smtps://` or `starttls=required`")]
+  TrustOnCleartext,
   /// Client identity on a cleartext `smtp://` string.
-  #[error(
-    "bad connection string `{entry}`: cleartext `smtp://` carries no TLS state; identity belongs on `smtps://` or `starttls=required`"
-  )]
-  IdentityOnCleartext {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: cleartext `smtp://` carries no TLS state; identity belongs on `smtps://` or `starttls=required`")]
+  IdentityOnCleartext,
   /// `sslcert` and `sslkey` were not paired.
-  #[error("bad connection string `{entry}`: sslcert and sslkey come together")]
-  CertKeyPair {
-    /// The rejected string.
-    entry: String,
-  },
+  #[error("bad connection string: sslcert and sslkey come together")]
+  CertKeyPair,
 }
 
 /// One parsed `smtp://` or `smtps://` string.
@@ -197,59 +159,42 @@ impl FromStr for SmtpUri {
     } else if entry.starts_with("smtp://") {
       Scheme::Smtp
     } else {
-      return Err(SmtpUriError::Scheme { entry: entry.to_string() });
+      return Err(SmtpUriError::Scheme);
     };
-    let url = Url::parse(entry).map_err(|source| SmtpUriError::Url {
-      entry: entry.to_string(),
-      source,
-    })?;
-    let host = url
-      .host()
-      .map(|host| host.to_string())
-      .ok_or_else(|| SmtpUriError::EmptyHost { entry: entry.to_string() })?;
+    let url = Url::parse(entry).map_err(|source| SmtpUriError::Url { source })?;
+    let host = url.host().map(|host| host.to_string()).ok_or(SmtpUriError::EmptyHost)?;
     // `Url` leaves userinfo percent-encoded. An SMTP user is an address,
     // so `@` is written `%40` and has to be decoded before AUTH. A `%`
     // that is not two hex digits stays literal; only invalid UTF-8 fails.
     let user = percent_encoding::percent_decode_str(url.username())
       .decode_utf8()
-      .map_err(|source| SmtpUriError::UserinfoUtf8 {
-        entry: entry.to_string(),
-        label: "user",
-        source,
-      })?
+      .map_err(|source| SmtpUriError::UserinfoUtf8 { label: "user", source })?
       .into_owned();
     if user.is_empty() {
-      return Err(SmtpUriError::UserRequired { entry: entry.to_string() });
+      return Err(SmtpUriError::UserRequired);
     }
     let password = match url.password().filter(|password| !password.is_empty()) {
       Some(password) => {
         let decoded = percent_encoding::percent_decode_str(password)
           .decode_utf8()
-          .map_err(|source| SmtpUriError::UserinfoUtf8 {
-            entry: entry.to_string(),
-            label: "password",
-            source,
-          })?
+          .map_err(|source| SmtpUriError::UserinfoUtf8 { label: "password", source })?
           .into_owned();
         SecretString::new(decoded.into())
       }
-      None => return Err(SmtpUriError::PasswordRequired { entry: entry.to_string() }),
+      None => return Err(SmtpUriError::PasswordRequired),
     };
     if url.path() != "" && url.path() != "/" {
-      return Err(SmtpUriError::Path { entry: entry.to_string() });
+      return Err(SmtpUriError::Path);
     }
     let mut starttls_required = false;
     let mut query = Vec::new();
     for (key, value) in url.query_pairs() {
       if key == "starttls" {
         if scheme == Scheme::Smtps {
-          return Err(SmtpUriError::StarttlsOnTls { entry: entry.to_string() });
+          return Err(SmtpUriError::StarttlsOnTls);
         }
         if value != "required" {
-          return Err(SmtpUriError::StarttlsValue {
-            entry: entry.to_string(),
-            value: value.into_owned(),
-          });
+          return Err(SmtpUriError::StarttlsValue { value: value.into_owned() });
         }
         starttls_required = true;
         continue;
@@ -289,24 +234,18 @@ struct SmtpTls {
   client_key: Option<PathBuf>,
 }
 
-fn smtp_tls(entry: &str, tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
+fn smtp_tls(tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
   let mut root_cert = None;
   let mut client_cert = None;
   let mut client_key = None;
   for (key, value) in &uri.query {
     let tls_material = match key.as_str() {
       "sslmode" | "ssl" | "sslnegotiation" => {
-        return Err(SmtpUriError::TransportQuery {
-          entry: entry.to_string(),
-          key: key.clone(),
-        });
+        return Err(SmtpUriError::TransportQuery { key: key.clone() });
       }
       "sslrootcert" => {
         if value.is_empty() {
-          return Err(SmtpUriError::EmptyMaterial {
-            entry: entry.to_string(),
-            key: "sslrootcert",
-          });
+          return Err(SmtpUriError::EmptyMaterial { key: "sslrootcert" });
         }
         Some(if value == "system" {
           RootCert::System
@@ -316,43 +255,32 @@ fn smtp_tls(entry: &str, tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUr
       }
       "sslcert" => {
         if value.is_empty() {
-          return Err(SmtpUriError::EmptyMaterial {
-            entry: entry.to_string(),
-            key: "sslcert",
-          });
+          return Err(SmtpUriError::EmptyMaterial { key: "sslcert" });
         }
         client_cert = Some(PathBuf::from(value));
         None
       }
       "sslkey" => {
         if value.is_empty() {
-          return Err(SmtpUriError::EmptyMaterial {
-            entry: entry.to_string(),
-            key: "sslkey",
-          });
+          return Err(SmtpUriError::EmptyMaterial { key: "sslkey" });
         }
         client_key = Some(PathBuf::from(value));
         None
       }
-      _ => {
-        return Err(SmtpUriError::UnknownQuery {
-          entry: entry.to_string(),
-          key: key.clone(),
-        });
-      }
+      _ => return Err(SmtpUriError::UnknownQuery { key: key.clone() }),
     };
     if let Some(root) = tls_material {
       if !tls_leg {
-        return Err(SmtpUriError::TrustOnCleartext { entry: entry.to_string() });
+        return Err(SmtpUriError::TrustOnCleartext);
       }
       root_cert = Some(root);
     }
   }
   if !tls_leg && (client_cert.is_some() || client_key.is_some()) {
-    return Err(SmtpUriError::IdentityOnCleartext { entry: entry.to_string() });
+    return Err(SmtpUriError::IdentityOnCleartext);
   }
   if client_cert.is_some() != client_key.is_some() {
-    return Err(SmtpUriError::CertKeyPair { entry: entry.to_string() });
+    return Err(SmtpUriError::CertKeyPair);
   }
   Ok(SmtpTls {
     root_cert,
@@ -377,7 +305,7 @@ impl SmtpScope {
       root_cert,
       client_cert,
       client_key,
-    } = smtp_tls(real, upstream_tls, &upstream)?;
+    } = smtp_tls(upstream_tls, &upstream)?;
     Ok(Self {
       is_downstream_tls: downstream.scheme == Scheme::Smtps,
       downstream: downstream.leg(),
@@ -446,4 +374,60 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     credential,
     scope: Box::new(scope),
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{SmtpScope, SmtpUri};
+
+  const USER: &str = "agent%40box.test";
+  const USER_TEXT: &str = "agent@box.test";
+  const PASS: &str = "real-smtp-pass"; // betterleaks:allow
+
+  #[test]
+  fn smtp_uri_error_names_the_problem_and_hides_userinfo() {
+    let parsed = [
+      (format!("smtp://{USER}:{PASS}@mail.internal:587/inbox"), "no path"),
+      (format!("smtp://{USER}:{PASS}@mail.internal:587?starttls=maybe"), "starttls"),
+      (format!("smtps://{USER}:{PASS}@mail.internal:465?starttls=required"), "already TLS"),
+      (format!("http://{USER}:{PASS}@mail.internal"), "expected smtp://"),
+      (format!("smtp://{USER}@mail.internal:587"), "the password is required"),
+      (format!("smtp://:{PASS}@mail.internal:587"), "the user is required"),
+      (format!("smtp://{USER}:%FF@mail.internal:587"), "the password is not valid UTF-8"), // betterleaks:allow
+    ];
+    for (entry, problem) in parsed {
+      let err = entry.parse::<SmtpUri>().expect_err("rejected string");
+      assert_hides(&entry, &err.to_string(), problem);
+    }
+    let fake = format!("smtp://{USER}:{PASS}@mail.internal:587");
+    let queried = [
+      (
+        format!("smtp://{USER}:{PASS}@mail.internal:25?sslrootcert=/ca.pem"),
+        "trust belongs",
+      ),
+      (
+        format!("smtp://{USER}:{PASS}@mail.internal:25?sslcert=/c.pem&sslkey=/c.key"),
+        "identity belongs",
+      ),
+      (format!("smtp://{USER}:{PASS}@mail.internal:587?sslmode=require"), "sslmode"),
+      (format!("smtps://{USER}:{PASS}@mail.internal:465?sslcert="), "sslcert needs a path"),
+    ];
+    for (real, problem) in queried {
+      let err = SmtpScope::from_strings(&fake, &real).expect_err("rejected string");
+      assert_hides(&real, &err.to_string(), problem);
+      assert_hides(&fake, &err.to_string(), problem);
+      let wrapped = crate::Error::SmtpScope {
+        label: "SMTP_URL".into(),
+        source: SmtpScope::from_strings(&fake, &real).expect_err("rejected string"),
+      };
+      assert_hides(&real, &wrapped.to_string(), problem);
+    }
+  }
+
+  fn assert_hides(entry: &str, text: &str, problem: &str) {
+    assert!(text.contains(problem), "{text}");
+    for secret in [USER, USER_TEXT, PASS, entry] {
+      assert!(!text.contains(secret), "{text} contains {secret}");
+    }
+  }
 }
