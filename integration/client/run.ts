@@ -520,7 +520,7 @@ if (SMTP_URL) {
   await retry("smtp", "smtp STARTTLS AUTH PLAIN and LOGIN swap the password", async () => {
     const out = await runSmtp("smtp", SMTP_URL);
     stage(out.trim());
-    const direct = await readFile("/tmp/smtp-direct.txt", "utf8").catch(() => "");
+    const direct = await readFile("/out/smtp-direct.txt", "utf8").catch(() => "");
     return direct.includes("decoy refused 587") && direct.includes("decoy refused 465") && out.includes("before-starttls refused") && out.includes("plain ok") && out.includes("login ok") && out.includes("login mechanism ok") && out.includes("wrong refused") && out.includes("smtp ok") && !out.includes("arkham_real_smtp_pass");
   });
 } else {
@@ -531,7 +531,7 @@ if (SMTPS_URL) {
   await retry("smtps", "smtps implicit TLS AUTH PLAIN swaps the password", async () => {
     const out = await runSmtp("smtps", SMTPS_URL);
     stage(out.trim());
-    const direct = await readFile("/tmp/smtp-direct.txt", "utf8").catch(() => "");
+    const direct = await readFile("/out/smtp-direct.txt", "utf8").catch(() => "");
     return direct.includes("decoy refused 465") && out.includes("plain ok") && out.includes("wrong refused") && out.includes("smtps ok") && !out.includes("arkham_real_smtp_pass");
   });
 } else {

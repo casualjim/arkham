@@ -7,7 +7,6 @@ SMTPS_URL. A reply that contains the real password fails the process.
 
 import os
 import smtplib
-import socket
 import ssl
 import sys
 from urllib.parse import unquote, urlparse
@@ -49,45 +48,11 @@ def credentials(url: str) -> tuple[str, str]:
     return unquote(parsed.username), unquote(parsed.password)
 
 
-# Capture skips sockets that already carry the backend's bypass mark.
-# tproxy's egress mark is 0x89; tun's fib bypass mark is 0x88.
-BYPASS_MARK = {"tproxy": 0x89, "tun": 0x88}
-
-
-def connect_marked(host: str, port: int, timeout: float) -> socket.socket:
-    backend = os.environ.get("ARKHAM_BACKEND", "tproxy")
-    mark = BYPASS_MARK.get(backend)
-    if mark is None:
-        fail(f"direct dial has no bypass mark for backend {backend}")
-    last = "no address"
-    for family, _kind, _proto, _canon, sockaddr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
-        sock = socket.socket(family, socket.SOCK_STREAM)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
-            sock.settimeout(timeout)
-            sock.connect(sockaddr)
-            return sock
-        except OSError as err:
-            last = str(err)
-            sock.close()
-    fail(f"direct dial to {host}:{port} failed: {last}")
-    raise AssertionError("unreachable")
-
-
-class MarkedSMTP(smtplib.SMTP):
-    def _get_socket(self, host: str, port: int, timeout: float) -> socket.socket:
-        return connect_marked(host, port, timeout)
-
-
-class MarkedSMTP_SSL(smtplib.SMTP_SSL):
-    def _get_socket(self, host: str, port: int, timeout: float) -> socket.socket:
-        raw = connect_marked(host, port, timeout)
-        return self.context.wrap_socket(raw, server_hostname=self._host)
-
-
 def prove_direct(url: str) -> None:
     user, password = credentials(url)
-    submission = MarkedSMTP("mail", 587, timeout=15)
+    # This process is not in the captured namespace. A plain dial is the
+    # mail server itself; a captured dial would swap the decoy and succeed.
+    submission = smtplib.SMTP("mail", 587, timeout=15)
     try:
         submission.ehlo()
         submission.starttls(context=context())
@@ -104,7 +69,7 @@ def prove_direct(url: str) -> None:
         except smtplib.SMTPException:
             submission.close()
 
-    implicit = MarkedSMTP_SSL("mail", 465, context=context(), timeout=15)
+    implicit = smtplib.SMTP_SSL("mail", 465, context=context(), timeout=15)
     try:
         implicit.ehlo()
         try:

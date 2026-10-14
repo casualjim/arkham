@@ -602,4 +602,18 @@ mod tests {
     assert_eq!(bdat_octets(b"BDAT LAST\r\n"), None);
     assert_eq!(bdat_octets(b"DATA\r\n"), None);
   }
+
+  /// The acceptance line is the whole reply. The next bytes are a
+  /// handshake record; consuming them as another SMTP line fails it.
+  #[tokio::test]
+  async fn acceptance_line_leaves_the_handshake_bytes() {
+    let banner = b"220-wait\r\n220 2.0.0 Ready to start TLS\r\n";
+    let mut payload = banner.to_vec();
+    payload.extend_from_slice(&[0x16, 0x03, 0x01]);
+    let mut cursor = std::io::Cursor::new(payload);
+    let reply = super::read_response(&mut cursor).await.unwrap().unwrap();
+    assert_eq!(reply, banner);
+    let at = usize::try_from(cursor.position()).unwrap();
+    assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
+  }
 }

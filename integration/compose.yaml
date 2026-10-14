@@ -233,6 +233,48 @@ services:
       certs:
         condition: service_completed_successfully
 
+  # Decoy AUTH straight at the mail server, from a network namespace the
+  # capture rules do not cover. Not the client: that container is the
+  # confined agent and must not hold NET_ADMIN. An empty SMTP_URL skips
+  # the dial so the client still reaches run.ts.
+  smtp-direct:
+    image: python:3-slim
+    working_dir: /srv
+    # The image entrypoint is python3. Replace it so the shell is the process.
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        rm -f /out/smtp-direct.txt
+        if [ -z "$${SMTP_URL:-}" ]; then
+          echo "smtp direct skipped: no SMTP_URL"
+          exit 0
+        fi
+        ok=0
+        for _ in 1 2 3 4 5; do
+          if python3 /srv/smtp.py direct | tee /out/smtp-direct.txt; then
+            ok=1
+            break
+          fi
+          sleep 2
+        done
+        test "$$ok" = 1
+    environment:
+      SMTP_URL: smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587 # nosemgrep: deterministic demo decoy, not a credential
+    volumes:
+      - ./client:/srv:ro
+      - certs:/certs:ro
+      - ./out:/out
+    networks:
+      server:
+        ipv4_address: 10.202.0.70
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      mail:
+        condition: service_healthy
+    restart: "no"
+
   client:
     image: oven/bun:1
     working_dir: /srv
@@ -246,18 +288,6 @@ services:
       - |
         set -euo pipefail
         apt-get update -qq && apt-get install -qq -y openssh-client python3
-        # Decoy AUTH straight at the mail server. The mark is the capture
-        # bypass (tproxy egress 0x89, tun fib 0x88), so this dial is not
-        # rewritten. A success here is the server refusing the decoy.
-        ok=0
-        for _ in 1 2 3 4 5; do
-          if python3 /srv/smtp.py direct | tee /tmp/smtp-direct.txt; then
-            ok=1
-            break
-          fi
-          sleep 2
-        done
-        test "$$ok" = 1
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -290,15 +320,14 @@ services:
       SMTP_URL: smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587 # nosemgrep: deterministic demo decoy, not a credential
       SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
-      ARKHAM_BACKEND: ${ARKHAM_BACKEND:-tproxy}
-    cap_add:
-      - NET_ADMIN
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
       - ./out:/out
     network_mode: service:arkham
     depends_on:
+      smtp-direct:
+        condition: service_completed_successfully
       arkham:
         condition: service_started
       api:

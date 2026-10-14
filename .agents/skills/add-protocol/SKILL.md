@@ -43,8 +43,6 @@ Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy` (`
 
 ## Done
 
-An in-process test shows authentication before the upgrade carries the decoy and authentication after the upgrade carries the real secret. The upgrade stops at the acceptance line; bytes after it are the handshake, and reading them as framing fails that handshake.
-
 From the repo root. The last arguments are the new schemes, one word each (`redis rediss` when both variants exist). `pipefail` is required: `| tee` would otherwise hide `test:ssh`'s status, and `&&` then stops the chain.
 
 ```bash
@@ -55,3 +53,5 @@ mise run test:rust \
 ```
 
 `mise run test:rust` runs the unit and property tests. `covered.sh` fails when `test:ssh` skipped (no docker daemon still exits 0), when the log contains `FAILED (exit`, when a backend that started has no `passed` line, or when `integration/out/covered.json` lacks a scheme.
+
+Confirm `smtp_auth_before_starttls_stays_the_decoy_and_swaps_after`: authentication before the upgrade carries the decoy, and authentication after the upgrade carries the real secret. Confirm `acceptance_line_leaves_the_handshake_bytes`: the acceptance reader returns only the acceptance line, and the next unread byte is a handshake record.
