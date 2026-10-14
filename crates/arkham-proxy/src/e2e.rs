@@ -2646,7 +2646,7 @@ mod tests {
       loop {
         let line = read_reply(&mut conn).await;
         if line.to_ascii_uppercase().starts_with("EHLO") || line.to_ascii_uppercase().starts_with("HELO") {
-          write_cmd(&mut conn, "250-mail.demo.test\r\n250 STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n").await;
+          write_cmd(&mut conn, "250-mail.demo.test\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n").await;
           continue;
         }
         if line.to_ascii_uppercase().starts_with("AUTH ") {
@@ -2674,7 +2674,7 @@ mod tests {
       let bundle = bundle_dir.path().join("ca.pem");
       std::fs::write(&bundle, ca.cert_pem()).unwrap();
       let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-      let fx = mitm_fixture(|port| {
+      let fx = mitm_fixture_no_alpn(|port| {
         vec![smtp_grant(
           &format!("smtp://agent%40demo.test:{FAKE}@localhost:{port}"),
           &format!(
@@ -2714,11 +2714,10 @@ mod tests {
       let ready = read_reply(&mut stream).await;
       assert!(ready.starts_with("220"), "{ready}");
 
-      let mut roots = rustls::RootCertStore::empty();
-      roots.add(ca.cert_der().clone()).unwrap();
-      let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+      // The guest trusts the proxy CA. The stub's CA is a different one, named
+      // by sslrootcert, and is what the proxy checks on the upstream leg.
       let name = ServerName::try_from("localhost".to_string()).unwrap();
-      let mut tls = TlsConnector::from(Arc::new(config)).connect(name, stream).await.unwrap();
+      let mut tls = fx.connector.connect(name, stream).await.unwrap();
       write_cmd(&mut tls, "EHLO client\r\n").await;
       let ehlo = read_reply(&mut tls).await;
       assert!(ehlo.contains("250"), "{ehlo}");

@@ -87,16 +87,22 @@ impl SmtpUri {
       .host()
       .map(|host| host.to_string())
       .ok_or_else(|| format!("bad connection string `{entry}`: empty host"))?;
-    if url.username().is_empty() {
+    // `Url` leaves userinfo percent-encoded. An SMTP user is an address,
+    // so `@` is written `%40` and has to be decoded before AUTH.
+    let user = userinfo_decode(entry, "user", url.username())?;
+    if user.is_empty() {
       return Err(format!(
         "bad connection string `{entry}`: the user is required — a string with no AUTH identity maps nothing"
       ));
     }
-    let password = url
-      .password()
-      .filter(|password| !password.is_empty())
-      .map(|password| SecretString::new(password.to_string().into()))
-      .ok_or_else(|| format!("bad connection string `{entry}`: the password is required — a string with no credential maps nothing"))?;
+    let password = match url.password().filter(|password| !password.is_empty()) {
+      Some(password) => SecretString::new(userinfo_decode(entry, "password", password)?.into()),
+      None => {
+        return Err(format!(
+          "bad connection string `{entry}`: the password is required — a string with no credential maps nothing"
+        ));
+      }
+    };
     if url.path() != "" && url.path() != "/" {
       return Err(format!("bad connection string `{entry}`: an SMTP string has no path"));
     }
@@ -124,7 +130,7 @@ impl SmtpUri {
       scheme,
       host,
       port: url.port().unwrap_or(default_port),
-      user: url.username().to_string(),
+      user,
       password,
       starttls_required,
       query,
@@ -148,6 +154,46 @@ struct SmtpTls {
   root_cert: Option<RootCert>,
   client_cert: Option<PathBuf>,
   client_key: Option<PathBuf>,
+}
+
+/// Percent-decode one userinfo component. `+` stays a plus: userinfo is
+/// not a query string.
+fn userinfo_decode(entry: &str, label: &str, raw: &str) -> Result<String, String> {
+  let bytes = raw.as_bytes();
+  let mut out = Vec::with_capacity(bytes.len());
+  let mut index = 0;
+  while let Some(byte) = bytes.get(index).copied() {
+    if byte != b'%' {
+      out.push(byte);
+      index = index.saturating_add(1);
+      continue;
+    }
+    let hi = bytes.get(index.saturating_add(1)).copied();
+    let lo = bytes.get(index.saturating_add(2)).copied();
+    let Some(value) = hi.zip(lo).and_then(|(hi, lo)| hex_byte(hi, lo)) else {
+      return Err(format!(
+        "bad connection string `{entry}`: the {label} is not valid percent-encoding"
+      ));
+    };
+    out.push(value);
+    index = index.saturating_add(3);
+  }
+  String::from_utf8(out).map_err(|_err| format!("bad connection string `{entry}`: the {label} is not valid UTF-8"))
+}
+
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+  let hi = hex_nibble(hi)?;
+  let lo = hex_nibble(lo)?;
+  hi.checked_mul(16)?.checked_add(lo)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+  match byte {
+    b'0'..=b'9' => byte.checked_sub(b'0'),
+    b'a'..=b'f' => byte.checked_sub(b'a').and_then(|n| n.checked_add(10)),
+    b'A'..=b'F' => byte.checked_sub(b'A').and_then(|n| n.checked_add(10)),
+    _ => None,
+  }
 }
 
 fn smtp_tls(entry: &str, tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, String> {

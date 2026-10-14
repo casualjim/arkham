@@ -1000,6 +1000,19 @@ mod tests {
     assert_eq!(scope.downstream.user, "agent@demo.test");
     assert!(!scope.is_downstream_tls);
     assert!(!scope.is_upstream_tls);
+    let encoded = smtp_scope(
+      "smtp://agent%40demo.test:p%40ss@mail.internal:587", // betterleaks:allow
+      "smtp://agent%40demo.test:re%61l@mail.internal:587", // betterleaks:allow
+    );
+    assert_eq!(encoded.downstream.user, "agent@demo.test");
+    assert_eq!(encoded.downstream.password.expose_secret(), "p@ss");
+    assert_eq!(encoded.upstream.password.expose_secret(), "real");
+    let cfg = cfg_with_db(
+      "smtp://agent%zz:fake@mail.internal:587", // betterleaks:allow
+      "smtp://agent:real@mail.internal:587",    // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("percent-encoding"), "{err}");
   }
 
   #[test]
