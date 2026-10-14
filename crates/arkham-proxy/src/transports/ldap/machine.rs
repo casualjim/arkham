@@ -264,6 +264,13 @@ impl Ldap {
   pub(crate) fn take_starttls_result(&mut self) -> Option<bool> {
     self.starttls_ok.take()
   }
+
+  /// The cursor is still inside a `StartTLS` message (controls after the OID).
+  /// The opening reader keeps going until [`Self::take_starttls`] fires, and
+  /// does not hand those bytes to the relay early.
+  pub(crate) fn is_starttls_tail(&self) -> bool {
+    matches!(self.phase, Phase::Tail { .. })
+  }
 }
 
 /// A success extended response for `id`, used when the upstream leg is
@@ -796,6 +803,10 @@ fn try_ext(buf: &[u8], header: usize) -> Result<ExtParse, ()> {
     TlWait::Ready(tl) => tl,
   };
   if name.tag != CONTEXT_0 {
+    return Ok(ExtParse::Skip);
+  }
+  // Any other length cannot be the StartTLS OID, so the name body is not peeked.
+  if name.content_len != STARTTLS_OID.len() {
     return Ok(ExtParse::Skip);
   }
   let name_end = name_at.checked_add(name.total().ok_or(())?).ok_or(())?;
@@ -1382,6 +1393,22 @@ mod tests {
       panic!("bind");
     };
     assert_eq!(request.name.0, "cn=svc,dc=example,dc=com");
+  }
+
+  #[tokio::test]
+  async fn extended_request_with_a_long_name_is_not_held() {
+    // The request name announces 64 KiB. That body is not the StartTLS OID,
+    // so it is counted down instead of peeked. Four following bytes emit now.
+    let mut msg = vec![
+      0x30, 0x84, 0x00, 0x01, 0x00, 0x0f, // outer content length 65551
+      0x02, 0x01, 0x01, // message id 1
+      0x77, 0x84, 0x00, 0x01, 0x00, 0x06, // extended request, content 65542
+      0x80, 0x84, 0x00, 0x01, 0x00, 0x00, // name length 65536
+    ];
+    msg.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false);
+    let out = emit(&mut machine, &msg).await;
+    assert_eq!(out, msg);
   }
 
   #[tokio::test]

@@ -1,4 +1,10 @@
-//! LDAP vertical: transport halves, `StartTLS` upgrade, and the BER machine.
+//! LDAP vertical: transport halves, a lockstep `StartTLS` opening, and the BER machine.
+//!
+//! `ldaps://` settles TLS, then both sockets go to [`relay_guarded`].
+//! `ldap://` reads only enough of the first message to recognize `StartTLS`.
+//! That one exchange runs lockstep. A bind, a search, and every later byte
+//! go through [`relay_guarded`] with no second session pump and no
+//! hold-until-complete buffer.
 
 pub(crate) mod machine;
 
@@ -9,7 +15,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf, split};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -118,8 +124,9 @@ impl TlsHalves for LdapTransport {
 impl Transport for LdapTransport {
   type Scope = LdapScope;
 
-  /// The `ldap://` / `ldaps://` arm. LDAPS settles both legs first. Cleartext
-  /// relays until `StartTLS`, then does the same.
+  /// The `ldap://` / `ldaps://` arm. LDAPS settles both legs, then relays.
+  /// Cleartext classifies the first message: `StartTLS` is lockstep, and
+  /// anything else is [`relay_guarded`] from the bytes already read.
   async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, LdapScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -183,9 +190,9 @@ impl Transport for LdapTransport {
     }
     if scope.is_upstream_tls {
       let plain = self.connect_server(scope, upstream_name, upstream).await?;
-      self.until_starttls(Prefixed::new(guest_head, guest), plain, &pump).await
+      self.opening(Prefixed::new(guest_head, guest), plain, &pump).await
     } else {
-      self.until_starttls(Prefixed::new(guest_head, guest), upstream, &pump).await
+      self.opening(Prefixed::new(guest_head, guest), upstream, &pump).await
     }
   }
 }
@@ -197,7 +204,7 @@ struct OpenGuest<G> {
   tls: Option<(Vec<u8>, String)>,
 }
 
-/// Facts the cleartext pump and the `StartTLS` upgrade share.
+/// Facts the cleartext opening and the `StartTLS` upgrade share.
 struct Pump<'a> {
   scope: &'a LdapScope,
   ctx: &'a PairCtx<'a>,
@@ -205,14 +212,6 @@ struct Pump<'a> {
   mint: &'a MintBucket,
   /// `false` when the upstream leg is already TLS, so `StartTLS` is answered here.
   upgrade_upstream: bool,
-}
-
-/// The four halves of a cleartext duplex, taken apart for the upgrade.
-struct Split<G, S> {
-  guest_r: ReadHalf<G>,
-  guest_w: WriteHalf<G>,
-  server_r: ReadHalf<S>,
-  server_w: WriteHalf<S>,
 }
 
 impl LdapTransport {
@@ -248,85 +247,56 @@ impl LdapTransport {
     }
   }
 
-  /// Plaintext LDAP until a `StartTLS` request has been answered, then TLS.
-  /// The pre-upgrade pair swaps only when the upstream socket is already TLS.
-  async fn until_starttls<G, S>(&self, guest: G, server: S, pump: &Pump<'_>) -> Result<(), Error>
+  /// Classify the first cleartext message. `StartTLS` stays here; every
+  /// other opening is the shared relay, including a session that never
+  /// upgrades. Swap is on only when the upstream writer is already TLS.
+  async fn opening<G, S>(&self, mut guest: G, server: S, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
-    let (mut guest_r, mut guest_w) = split(guest);
-    let (mut server_r, mut server_w) = split(server);
-    let (mut down, mut up) = ldap_pair(pump.ctx, !pump.upgrade_upstream);
-    let mut guest_buf = vec![0u8; 16 * 1024];
-    let mut server_buf = vec![0u8; 16 * 1024];
-    loop {
-      tokio::select! {
-        result = guest_r.read(&mut guest_buf) => {
-          let n = read_count(result).map_err(|source| Error::GuestRead { source })?;
-          if n == 0 {
-            let _ = push_down(&mut down, &[], &mut server_w, pump.upgrade_upstream).await?;
-            let _ = server_w.shutdown().await;
-            return drain(&mut server_r, &mut guest_w, &mut up, &mut server_buf).await;
-          }
-          match push_down(&mut down, &guest_buf[..n], &mut server_w, pump.upgrade_upstream).await? {
-            Step::Continue => {}
-            Step::Close => return Ok(()),
-            Step::Upgrade(id) => {
-              return self
-                .upgrade(id, Split { guest_r, guest_w, server_r, server_w }, &mut down, &mut up, pump)
-                .await;
-            }
-          }
-        }
-        result = server_r.read(&mut server_buf) => {
-          let n = read_count(result).map_err(|source| Error::UpstreamRead { source })?;
-          if n == 0 {
-            let _ = push_up(&mut up, &[], &mut guest_w).await?;
-            let _ = guest_w.shutdown().await;
-            return Ok(());
-          }
-          if push_up(&mut up, &server_buf[..n], &mut guest_w).await? == Step::Close {
-            return Ok(());
-          }
-        }
+    let swap = !pump.upgrade_upstream;
+    match read_first(&mut guest, pump).await? {
+      First::Eof | First::Close => Ok(()),
+      First::Relay(prefix) => {
+        let (mut downstream, mut upstream) = ldap_pair(pump.ctx, swap);
+        relay_guarded(guest, server, &mut downstream, &mut upstream, &prefix).await
       }
+      First::StartTls { id, request, handshake } => self.starttls(id, &request, &handshake, guest, server, pump).await,
     }
   }
 
-  /// Finish `StartTLS` and hand the plaintext legs to the shared relay.
-  async fn upgrade<G, S>(&self, id: u32, split: Split<G, S>, down: &mut Ldap, up: &mut Ldap, pump: &Pump<'_>) -> Result<(), Error>
+  /// Forward one `StartTLS` exchange, or answer it locally when the upstream
+  /// leg is already TLS, then hand both plaintext legs to [`relay_guarded`].
+  async fn starttls<G, S>(
+    &self,
+    id: u32,
+    request: &[u8],
+    handshake: &[u8],
+    mut guest: G,
+    mut server: S,
+    pump: &Pump<'_>,
+  ) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
-    let Split {
-      guest_r,
-      mut guest_w,
-      mut server_r,
-      server_w,
-    } = split;
-    let prefix = down.take_prefix();
     let success = if pump.upgrade_upstream {
-      up.expect_starttls(id);
-      read_starttls_result(&mut server_r, &mut guest_w, up, pump.budget).await?
+      write_server(&mut server, request).await?;
+      let mut upstream = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Upstream, false);
+      upstream.expect_starttls(id);
+      read_starttls_result(&mut server, &mut guest, &mut upstream, pump.budget).await?
     } else {
       let bytes = starttls_success(id).map_err(|source| Error::LdapEncode { source })?;
-      guest_w
-        .write_all(&bytes)
-        .await
-        .map_err(|source| Error::ResponseChunkToGuest { source })?;
-      guest_w.flush().await.map_err(|source| Error::GuestFlush { source })?;
+      write_guest(&mut guest, &bytes).await?;
       true
     };
     if !success {
       tracing::debug!("ldap starttls refused; closing");
       return Ok(());
     }
-    let mut guest = guest_r.unsplit(guest_w);
-    let server = server_r.unsplit(server_w);
     let authority = Some(pump.scope.downstream.host.as_str());
-    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &prefix, pump.budget, authority, pump.mint).await? else {
+    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, handshake, pump.budget, authority, pump.mint).await? else {
       return Ok(());
     };
     let guest_plain = self
@@ -342,12 +312,16 @@ impl LdapTransport {
   }
 }
 
-/// What one framed chunk asked the pump to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
-  Continue,
+/// What the first cleartext message was.
+enum First {
+  /// The guest closed before a message.
+  Eof,
+  /// The cursor closed on malformed BER.
   Close,
-  Upgrade(u32),
+  /// Not `StartTLS`. `bytes` is the prefix already taken off the guest.
+  Relay(Vec<u8>),
+  /// One `StartTLS` request, plus handshake bytes already read past it.
+  StartTls { id: u32, request: Vec<u8>, handshake: Vec<u8> },
 }
 
 /// `UnexpectedEof` from rustls is a normal FIN.
@@ -358,60 +332,62 @@ fn read_count(result: Result<usize, IoError>) -> Result<usize, IoError> {
   }
 }
 
-/// Feed guest bytes downstream and carry the rewrite upstream.
-async fn push_down<W>(down: &mut Ldap, chunk: &[u8], server: &mut W, upgrade_upstream: bool) -> Result<Step, Error>
+/// Read the guest one byte at a time until the first message is `StartTLS`
+/// or it is clearly something else. Stopping at that point leaves the
+/// handshake, or the rest of a bind, unread in the socket.
+async fn read_first<R>(guest: &mut R, pump: &Pump<'_>) -> Result<First, Error>
 where
-  W: AsyncWrite + Unpin,
+  R: AsyncRead + Unpin,
 {
-  let (rewritten, hits) = down.feed(chunk).await;
-  log_hits(&hits);
-  let id = down.take_starttls();
-  match rewritten {
-    Rewritten::Close => Ok(Step::Close),
-    Rewritten::Hold => Ok(Step::Continue),
-    Rewritten::Emit(bytes) => {
-      if id.is_some() && !upgrade_upstream {
-        return Ok(id.map_or(Step::Continue, Step::Upgrade));
-      }
-      server
-        .write_all(&bytes)
-        .await
-        .map_err(|source| Error::RequestChunkToUpstream { source })?;
-      server.flush().await.map_err(|source| Error::RequestHeadFlush { source })?;
-      Ok(id.map_or(Step::Continue, Step::Upgrade))
+  let mut probe = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Downstream, false);
+  let mut got = Vec::new();
+  let mut byte = [0u8; 1];
+  loop {
+    let n = read_count(guest.read(&mut byte).await).map_err(|source| Error::GuestRead { source })?;
+    if n == 0 {
+      return Ok(if got.is_empty() { First::Eof } else { First::Relay(got) });
     }
-  }
-}
-
-/// Feed upstream bytes and carry the rewrite to the guest.
-async fn push_up<W>(up: &mut Ldap, chunk: &[u8], guest: &mut W) -> Result<Step, Error>
-where
-  W: AsyncWrite + Unpin,
-{
-  let (rewritten, hits) = up.feed(chunk).await;
-  log_hits(&hits);
-  match rewritten {
-    Rewritten::Close => Ok(Step::Close),
-    Rewritten::Hold => Ok(Step::Continue),
-    Rewritten::Emit(bytes) => {
-      guest
-        .write_all(&bytes)
-        .await
-        .map_err(|source| Error::ResponseChunkToGuest { source })?;
-      guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
-      Ok(Step::Continue)
+    let Some(next) = byte.first().copied() else {
+      return Ok(First::Close);
+    };
+    got.push(next);
+    let (rewritten, hits) = probe.feed(std::slice::from_ref(&next)).await;
+    log_hits(&hits);
+    if let Some(id) = probe.take_starttls() {
+      let handshake = probe.take_prefix();
+      let Some(start) = got.len().checked_sub(handshake.len()) else {
+        return Ok(First::Close);
+      };
+      if got.get(start..) != Some(handshake.as_slice()) {
+        return Ok(First::Close);
+      }
+      got.truncate(start);
+      return Ok(First::StartTls {
+        id,
+        request: got,
+        handshake,
+      });
+    }
+    if probe.is_starttls_tail() {
+      continue;
+    }
+    match rewritten {
+      Rewritten::Close => return Ok(First::Close),
+      Rewritten::Hold => {}
+      Rewritten::Emit(_) => return Ok(First::Relay(got)),
     }
   }
 }
 
 /// Read the server until its `StartTLS` extended response has been forwarded.
+/// Lockstep: the guest is not read, so the following handshake stays put.
 async fn read_starttls_result<R, W>(server: &mut R, guest: &mut W, up: &mut Ldap, budget: Duration) -> Result<bool, Error>
 where
   R: AsyncRead + Unpin,
   W: AsyncWrite + Unpin,
 {
   let deadline = tokio::time::Instant::now() + budget;
-  let mut buf = vec![0u8; 16 * 1024];
+  let mut buf = [0u8; 256];
   loop {
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
     if left.is_zero() {
@@ -428,28 +404,62 @@ where
     if n == 0 {
       return Ok(false);
     }
-    if push_up(up, &buf[..n], guest).await? == Step::Close {
+    let Some(chunk) = buf.get(..n) else {
+      return Ok(false);
+    };
+    if !forward_up(up, chunk, guest).await? {
       return Ok(false);
     }
     if let Some(ok) = up.take_starttls_result() {
+      let (flushed, hits) = up.feed(&[]).await;
+      log_hits(&hits);
+      if let Rewritten::Emit(bytes) = flushed {
+        write_guest(guest, &bytes).await?;
+      }
       return Ok(ok);
     }
   }
 }
 
-/// Drain upstream after the guest FIN, until the server closes.
-async fn drain<R, W>(server: &mut R, guest: &mut W, up: &mut Ldap, buf: &mut [u8]) -> Result<(), Error>
+/// Feed one upstream chunk and write what the cursor emits.
+async fn forward_up<W>(up: &mut Ldap, chunk: &[u8], guest: &mut W) -> Result<bool, Error>
 where
-  R: AsyncRead + Unpin,
   W: AsyncWrite + Unpin,
 {
-  loop {
-    let n = read_count(server.read(buf).await).map_err(|source| Error::UpstreamRead { source })?;
-    if n == 0 || push_up(up, &buf[..n], guest).await? == Step::Close {
-      let _ = guest.shutdown().await;
-      return Ok(());
+  let (rewritten, hits) = up.feed(chunk).await;
+  log_hits(&hits);
+  match rewritten {
+    Rewritten::Close => Ok(false),
+    Rewritten::Hold => Ok(true),
+    Rewritten::Emit(bytes) => {
+      write_guest(guest, &bytes).await?;
+      Ok(true)
     }
   }
+}
+
+async fn write_guest<W>(guest: &mut W, bytes: &[u8]) -> Result<(), Error>
+where
+  W: AsyncWrite + Unpin,
+{
+  guest
+    .write_all(bytes)
+    .await
+    .map_err(|source| Error::ResponseChunkToGuest { source })?;
+  guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
+  Ok(())
+}
+
+async fn write_server<W>(server: &mut W, bytes: &[u8]) -> Result<(), Error>
+where
+  W: AsyncWrite + Unpin,
+{
+  server
+    .write_all(bytes)
+    .await
+    .map_err(|source| Error::RequestChunkToUpstream { source })?;
+  server.flush().await.map_err(|source| Error::RequestHeadFlush { source })?;
+  Ok(())
 }
 
 /// Pump one settled pair. `swap` is set only when `server` is already TLS.
