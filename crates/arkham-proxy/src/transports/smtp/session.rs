@@ -1,10 +1,11 @@
 //! Cleartext SMTP opening, then the shared relay.
 //!
 //! The greeting, `EHLO` / `HELO`, an `AUTH` that still precedes `STARTTLS`,
-//! and `STARTTLS` plus its acceptance run lockstep. The acceptance reader
-//! stops on the final reply line, so the following handshake bytes stay
-//! unread. After the upgrade, or when the guest sends anything else, both
-//! sockets go to [`relay_guarded`]. Implicit TLS skips the opening. A
+//! and `STARTTLS` plus its acceptance run lockstep. Each server reply is
+//! fed through the upstream machine before the guest sees it. The acceptance
+//! reader stops on the final reply line, so the following handshake bytes
+//! stay unread. After the upgrade, or when the guest sends anything else,
+//! both sockets go to [`relay_guarded`]. Implicit TLS skips the opening. A
 //! session that never upgrades relays with swapping off, and the decoy
 //! passes through.
 
@@ -217,6 +218,7 @@ where
     else {
       return Ok(());
     };
+    let greeting = redact_opening_reply(self.up, &greeting).await;
     write_guest(&mut self.guest, &greeting).await?;
     loop {
       let Some(line) = guest_line(&mut self.guest).await.map_err(|source| Error::GuestRead { source })? else {
@@ -237,6 +239,7 @@ where
         else {
           return Ok(());
         };
+        let reply = redact_opening_reply(self.up, &reply).await;
         write_guest(&mut self.guest, &reply).await?;
         continue;
       }
@@ -255,6 +258,7 @@ where
       else {
         return Ok(());
       };
+      let reply = redact_opening_reply(self.up, &reply).await;
       write_guest(&mut self.guest, &reply).await?;
       if is_220(&reply) {
         let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
@@ -332,6 +336,25 @@ async fn handshake<T>(budget: Duration, handshake: impl Future<Output = Result<T
   match tokio::time::timeout(budget, handshake).await {
     Ok(result) => result,
     Err(_elapsed) => Err(Error::SmtpHandshakeTimeout),
+  }
+}
+
+/// Redact one complete server reply. The opening is lockstep, so the suffix
+/// the upstream machine holds back is flushed before the guest is written.
+async fn redact_opening_reply(up: &mut Smtp, reply: &[u8]) -> Vec<u8> {
+  let (rewritten, hits) = up.feed(reply).await;
+  log_hits(&hits);
+  let mut out = emitted(rewritten);
+  let (flushed, more) = up.feed(&[]).await;
+  log_hits(&more);
+  out.extend(emitted(flushed));
+  out
+}
+
+fn emitted(rewritten: Rewritten<'_>) -> Vec<u8> {
+  match rewritten {
+    Rewritten::Emit(bytes) => bytes.into_owned(),
+    Rewritten::Hold | Rewritten::Close => Vec::new(),
   }
 }
 
@@ -494,6 +517,58 @@ pub(super) fn tls_server(stream: ClientTlsStream<TcpStream>) -> ServerLeg {
 
 #[cfg(test)]
 mod tests {
+  use arkham_config::grants::{Credential, GuestTlsMode, SmtpLeg, SmtpScope};
+  use secrecy::SecretString;
+
+  use super::{Direction, Smtp};
+
+  const FAKE_PASS: &str = "fake-smtp-pass"; // betterleaks:allow
+  const REAL_PASS: &str = "real-smtp-pass"; // betterleaks:allow
+
+  fn upstream() -> Smtp {
+    let scope = SmtpScope {
+      downstream: SmtpLeg {
+        host: "mail".into(),
+        port: 587,
+        user: "agent@demo.test".into(),
+        password: SecretString::from(FAKE_PASS),
+      },
+      is_downstream_tls: false,
+      upstream: SmtpLeg {
+        host: "mail".into(),
+        port: 587,
+        user: "agent@demo.test".into(),
+        password: SecretString::from(REAL_PASS),
+      },
+      is_upstream_tls: true,
+      starttls_required: false,
+      root_cert: None,
+      client_cert: None,
+      client_key: None,
+      guest_tls: GuestTlsMode::default(),
+    };
+    let grant = arkham_config::grants::Grant::Smtp {
+      credential: Credential {
+        label: "smtp".into(),
+        fake: FAKE_PASS.into(),
+        value: SecretString::from(REAL_PASS),
+      },
+      scope: Box::new(scope),
+    };
+    Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream)
+  }
+
+  /// The opening writes the machine's output, so a reply that echoes the
+  /// real password reaches the guest as the decoy.
+  #[tokio::test]
+  async fn opening_reply_redacts_the_real_password() {
+    let mut up = upstream();
+    let reply = format!("535 5.7.8 authentication failed for {REAL_PASS}\r\n");
+    let out = super::redact_opening_reply(&mut up, reply.as_bytes()).await;
+    assert_eq!(out, format!("535 5.7.8 authentication failed for {FAKE_PASS}\r\n").into_bytes());
+    assert!(!out.windows(REAL_PASS.len()).any(|window| window == REAL_PASS.as_bytes()));
+  }
+
   /// The acceptance line is the whole reply. The next bytes are a
   /// handshake record; consuming them as another SMTP line fails it.
   #[tokio::test]
