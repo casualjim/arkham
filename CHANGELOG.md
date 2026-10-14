@@ -3,6 +3,11 @@
 ### 🐛 Bug Fixes
 
 - *(test)* Wait longer for the k3d apiserver and clear capture leftovers (#48)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.16 [ci skip]
+- Release
 ## [0.3.15] - 2026-10-13
 
 ### 🐛 Bug Fixes
