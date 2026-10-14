@@ -349,7 +349,7 @@ fn rewrite_bind(request: &BindRequest, message: &LdapMessage, down: &Down) -> Re
     AuthenticationChoice::Simple(OctetString::from(down.real.as_bytes())),
   );
   let mut encoded_message = LdapMessage::new(message.message_id, ProtocolOp::BindRequest(swapped));
-  encoded_message.controls = message.controls.clone();
+  encoded_message.controls.clone_from(&message.controls);
   let encoded = rasn::ber::encode(&encoded_message).map_err(|_err| ())?;
   // The password field of the re-encoded bind must be the real password.
   // Comparing the whole encoding would reject a decoy that is a substring
