@@ -1329,14 +1329,22 @@ mod tests {
 
   #[tokio::test]
   async fn upstream_announced_length_streams() {
+    // Content length is 16 MiB + 1. Those bytes are not collected. A short
+    // body is forwarded with the header; the unread tail is a countdown.
     let header = [0x30, 0x84, 0x01, 0x00, 0x00, 0x01];
-    let mut machine = up();
-    let (first, _) = machine.feed(&header).await;
-    assert!(matches!(first, Rewritten::Hold));
     let body = [0x00, 0x01, 0x02, 0x03];
-    let out = emit(&mut machine, &body).await;
     let mut expect = header.to_vec();
     expect.extend_from_slice(&body);
+    let mut machine = up();
+    let out = emit(&mut machine, &expect).await;
+    assert_eq!(out, expect);
+
+    // The header alone has no message id yet, so it stays in the peek.
+    // The next chunk is still not held until the announced length arrives.
+    let mut split = up();
+    let (first, _) = split.feed(&header).await;
+    assert!(matches!(first, Rewritten::Hold));
+    let out = emit(&mut split, &body).await;
     assert_eq!(out, expect);
   }
 
