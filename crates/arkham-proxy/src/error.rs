@@ -349,7 +349,7 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
-  /// A NATS INFO read or TLS handshake exceeded the configured budget.
+  /// A NATS TLS handshake exceeded the configured budget.
   #[error("nats handshake timed out")]
   NatsHandshakeTimeout,
   /// An SMTP TLS handshake exceeded the configured budget.

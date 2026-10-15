@@ -325,7 +325,7 @@ where
 }
 
 /// The guest's first bytes after INFO: the ingress replay, or one read.
-/// `None` when the guest closes. A slow guest is not cut off.
+/// `None` when the guest closes.
 async fn guest_head<G>(guest: &mut G, initial: &[u8]) -> Result<Option<Vec<u8>>, Error>
 where
   G: AsyncRead + Unpin,
@@ -342,7 +342,6 @@ where
   Ok(Some(buf))
 }
 
-/// `UnexpectedEof` from rustls is a normal FIN.
 fn read_count(result: Result<usize, IoError>) -> Result<usize, IoError> {
   match result {
     Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(0),
