@@ -41,6 +41,10 @@ Topology:
 | 10 | Same client to `redis:6380` over TLS. Bun sends no SNI | `[rules.redis_tls]`: fake `rediss://` URL; real URL carries `sslrootcert` | same swap. The guest leaf is minted for the scope host. Redis is started with `tls-auth-clients no` |
 | 11 | Python `smtplib` to `mail:587`: AUTH before STARTTLS is refused; AUTH PLAIN and `SMTP.login` after STARTTLS succeed; a wrong password fails; a one-shot on the server network dials the decoy at `mail` and is refused | `[rules.smtp]`: fake `smtp://` URL; real URL says `starttls=required` and carries `sslrootcert` | docker-mailserver accepts the swapped password and the client never sees it; the decoy is refused when the dial is outside the captured namespace |
 | 12 | Same client to `mail:465` with implicit TLS | `[rules.smtps]`: fake `smtps://` URL; real URL carries `sslrootcert` | same swap on a session that is TLS from the first byte |
+| 13 | `ldapts` simple bind to `ldap:3389` before StartTLS | `[rules.ldap_plain]`: fake `ldap://` URL | 389ds refuses the bind (`confidentialityRequired`, code 13) because `nsslapd-require-secure-binds` is on. The error text does not contain the real password. Code 13 is the same for the decoy and the real password; the in-process test checks that the cleartext bytes are still the decoy |
+| 14 | Same client: StartTLS, then a simple bind with the decoy password | `[rules.ldap_plain]` | the directory accepts the bind. Arkham swapped the decoy for the real password after the upgrade |
+| 15 | `ldapts` simple bind to `ldap:3636` over LDAPS with the decoy password | `[rules.ldap_tls]`: fake `ldaps://` URL; real URL carries `sslrootcert` | same swap on a leg that is TLS from the first byte |
+| 16 | StartTLS and LDAPS binds with a password that is not the decoy | the same two rules | the directory returns `invalidCredentials` (code 49). The password was not swapped, and the error text does not contain the real password |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -69,6 +73,21 @@ so the server is started with `tls-auth-clients no`. Scenarios 9 and 10 are gate
 Scenarios 11 and 12 are `mailserver/docker-mailserver` 16.0.1 (pinned by digest) and Python's `smtplib`. The proxy is the only code we wrote on that path. `SMTP_ONLY` stays unset because Dovecot answers SASL. `setup email add` runs before supervisord so the account is in Dovecot's user database at first start. The server presents a demo-CA leaf and does not ask for a client certificate; the demo authenticates with passwords. Scenarios 11 and 12 are gated on `SMTP_URL` and `SMTPS_URL`.
 
 AUTH before STARTTLS being refused in scenario 11 is Postfix's own `530`. That refusal does not show which password was on the wire. The proof that the real password stays off the cleartext upstream is the in-process test `smtp_auth_before_starttls_stays_the_decoy_and_swaps_after`. The decoy-only failure against the real server is `smtp-direct`: a one-shot on the server network, outside the captured namespace, that runs `SMTP.login` of the decoy against `mail:587` and `mail:465`. It does not run when `SMTP_URL` is empty. The client container never holds `NET_ADMIN`. The wrong-password check in the scenario is a different password sent through the proxy, not that dial.
+Scenarios 13–16 use `quay.io/389ds/dirsrv` (the manifest list was last
+pushed June 2025; the pin is a multi-arch digest, not a Docker Hub tag)
+and `ldapts` 9.2.0. The directory listens on 3389 and 3636. After it is
+up, `dsconf` sets `nsslapd-require-secure-binds: on`. Before the
+service waits, `ldapsearch` inside the container binds with the decoy
+password over LDAPS and again over StartTLS. Both must exit 49. Those
+binds do not pass through the proxy. The flag requires TLS
+for a simple bind. It does not require a client certificate, and this
+demo does not present one: the proxy's upstream leg has no client
+identity, the same way the Redis demo sets `tls-auth-clients no`. The
+trust anchor is the demo CA from `gen-certs.sh`, imported into the
+directory at bootstrap and named by `sslrootcert` on both real strings.
+`ldap://` carries that anchor because StartTLS verifies the upstream
+certificate after the upgrade. Scenarios 13–16 are gated on `LDAP_URL`
+and `LDAP_TLS_URL`.
 
 ## Run
 

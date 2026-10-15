@@ -20,7 +20,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 | `listen` | `127.0.0.1:8080` | `ARKHAM_LISTEN` | Address the explicit proxy listens on. |
 | `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/arkham/ca.pem` | `ARKHAM_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `arkham ca` also writes `ca.crt` and `ca.key` beside it. |
 | `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
-| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, and the upstream `SSLRequest` answer all share this budget. |
+| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, the LDAP StartTLS reply, and the upstream `SSLRequest` answer all share this budget. |
 
 ## `[rules.<label>]`
 
@@ -117,6 +117,28 @@ value = "smtps://agent%40demo.test:decoy@mail.internal:465"
 ```
 
 The real submission value in fnox carries the upgrade and the trust anchor, for example `smtp://agent%40demo.test:real@mail.internal:587?starttls=required&sslrootcert=/path/ca.pem`.
+
+### LDAP rules
+
+A rule whose `value` states an `ldap://` or `ldaps://` connection string is an LDAP rule. The rule states the FAKE string in `value`. The REAL string resolves from the secret source under `env`/`fnox_key`. No `allow` entries: the connection string is the grant, matched on the fake string's port. The bind DN is the URL user and the simple-bind password is the URL password; both are required, and the string has no path.
+
+`ldap://` is cleartext and may upgrade with StartTLS. `ldaps://` is TLS from the first byte. The scheme states the transport. A `sslmode` or `sslnegotiation` query is rejected. The default port is `389` for `ldap://` and `636` for `ldaps://`. Both schemes may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together. `ldaps://` uses that material on connect. `ldap://` uses it after StartTLS, because the cleartext leg becomes TLS. Arkham reads the query off the real string and does not send it to the directory. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`.
+
+The wire machine swaps the fake simple-bind password for the real one and reframes the BER message, so the two passwords need not be the same length. When the bind DN equals the fake string's DN and the real string names a different DN, the DN swaps too. A bind whose password is not the decoy is forwarded byte-identical. SASL binds are forwarded unchanged.
+
+```toml
+[rules.directory]
+env = "LDAP_URL"
+value = "ldap://cn%3DDirectory%20Manager:decoy@ldap.internal:389"
+```
+
+```toml
+[rules.directory_tls]
+env = "LDAP_TLS_URL"
+value = "ldaps://cn%3DDirectory%20Manager:decoy@ldap.internal:636"
+```
+
+The real value in fnox carries the trust anchor on either scheme, for example `ldap://cn%3DDirectory%20Manager:real@ldap.internal:389?sslrootcert=/path/ca.pem`.
 
 ## `[rules.<label>.tls."<entry>"]`
 

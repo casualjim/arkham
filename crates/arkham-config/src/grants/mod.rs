@@ -1,14 +1,16 @@
 //! Grant model: a credential is one real secret, and a grant says what kind
 //! of endpoints that secret may be presented at. A rule is one kind, inferred
 //! from the URL schemes of its `allow` entries. The protocol verticals
-//! (`postgres`, `redis`, `smtp`) own their scope types and their connection-string
+//! (`postgres`, `redis`, `smtp`, `ldap`) own their scope types and their connection-string
 //! laws; this module owns the enum, the matching dispatch, and the
 //! collection of rules into grants.
 
+mod ldap;
 mod postgres;
 mod redis;
 mod smtp;
 
+pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
 pub use smtp::{SmtpLeg, SmtpScope, SmtpUriError};
@@ -91,6 +93,11 @@ pub enum Scheme {
   Redis,
   /// TLS Redis. Each connection string states its own leg's transport.
   Rediss,
+  /// Cleartext LDAP. Each connection string states how its leg opens.
+  /// A cleartext leg may upgrade with `StartTLS`.
+  Ldap,
+  /// TLS LDAP (LDAPS). Each connection string states how its leg opens.
+  Ldaps,
   /// SSH. The proxy terminates the protocol on both legs; port defaults
   /// to 22 the way ssh itself defaults it.
   Ssh,
@@ -113,6 +120,8 @@ impl Scheme {
       Self::Postgres => "postgres",
       Self::Redis => "redis",
       Self::Rediss => "rediss",
+      Self::Ldap => "ldap",
+      Self::Ldaps => "ldaps",
       Self::Ssh => "ssh",
       Self::Smtp => "smtp",
       Self::Smtps => "smtps",
@@ -226,7 +235,7 @@ impl FromStr for EndpointScope {
       "https" => Scheme::Https,
       "tcp" => Scheme::Tcp,
       "ssh" => Scheme::Ssh,
-      "postgres" | "redis" | "rediss" | "smtp" | "smtps" => {
+      "postgres" | "redis" | "rediss" | "smtp" | "smtps" | "ldap" | "ldaps" => {
         return Err(format!(
           "bad allow entry `{entry}`: database rules state no allow entries — the connection string is the grant"
         ));
@@ -263,6 +272,8 @@ impl FromStr for EndpointScope {
       (None, Scheme::Tcp) => return Err("tcp grant requires an explicit port".to_string()),
       (None, Scheme::Postgres) => 5432,
       (None, Scheme::Redis | Scheme::Rediss) => 6379,
+      (None, Scheme::Ldap) => 389,
+      (None, Scheme::Ldaps) => 636,
       (None, Scheme::Ssh) => 22,
       (None, Scheme::Smtp) => 587,
       (None, Scheme::Smtps) => 465,
@@ -397,6 +408,14 @@ pub enum Grant {
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<SmtpScope>,
   },
+  /// One LDAP connection-string mapping: fake string to real, 1:1. Each
+  /// string states how its leg opens. A cleartext leg may `StartTLS`.
+  Ldap {
+    /// The wire needles: the fake password and the real password.
+    credential: Credential,
+    /// The one scope this rule maps, carrying both legs' facts.
+    scope: Box<LdapScope>,
+  },
   /// One SSH identity mapping: the guest presents the decoy key, arkham
   /// presents the real key upstream. No wire substitution, so no credential.
   Ssh {
@@ -414,7 +433,8 @@ impl Grant {
       Grant::Token { credential, .. }
       | Grant::Postgres { credential, .. }
       | Grant::Redis { credential, .. }
-      | Grant::Smtp { credential, .. } => Some(credential),
+      | Grant::Smtp { credential, .. }
+      | Grant::Ldap { credential, .. } => Some(credential),
       Grant::Ssh { .. } => None,
     }
   }
@@ -427,6 +447,7 @@ impl Grant {
       Grant::Postgres { scope, .. } => PostgresScope::matches(scope, scheme, host, port),
       Grant::Redis { scope, .. } => RedisScope::matches(scope, scheme, host, port),
       Grant::Smtp { scope, .. } => SmtpScope::matches(scope, scheme, host, port),
+      Grant::Ldap { scope, .. } => LdapScope::matches(scope, scheme, host, port),
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }
@@ -472,6 +493,17 @@ impl Grant {
   #[must_use]
   pub fn smtp(&self, host: Option<&str>, port: u16) -> Option<&SmtpScope> {
     let Grant::Smtp { scope, .. } = self else {
+      return None;
+    };
+    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+  }
+
+  /// The LDAP scope whose downstream (guest-side) port and host cover a
+  /// destination, `host` optional as above: transparent capture knows the
+  /// port before it knows the host.
+  #[must_use]
+  pub fn ldap(&self, host: Option<&str>, port: u16) -> Option<&LdapScope> {
+    let Grant::Ldap { scope, .. } = self else {
       return None;
     };
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
@@ -587,6 +619,7 @@ impl GrantCollector {
       Scheme::Postgres => postgres::grant(label, rule, real.expose_secret()),
       Scheme::Redis | Scheme::Rediss => redis::grant(label, rule, real.expose_secret()),
       Scheme::Smtp | Scheme::Smtps => smtp::grant(label, rule, real.expose_secret()),
+      Scheme::Ldap | Scheme::Ldaps => ldap::grant(label, rule, real.expose_secret()),
       _ => {
         return Err(Error::ConnectionStringScheme {
           label: label.to_string(),
@@ -922,6 +955,78 @@ mod tests {
   fn redis_schemes_are_not_endpoint_grants() {
     "redis://db.internal:6379".parse::<EndpointScope>().unwrap_err();
     "rediss://db.internal:6380".parse::<EndpointScope>().unwrap_err();
+  }
+
+  #[test]
+  fn ldap_grant_answers_for_ldap_schemes() {
+    let grant = redis_grant_like(
+      "ldap://cn%3DDirectory%20Manager:fake@ldap.internal:389", // betterleaks:allow
+      "ldap://cn%3DDirectory%20Manager:real@ldap.internal:389", // betterleaks:allow
+    );
+    assert!(grant.matches(Scheme::Ldap, "ldap.internal", 389));
+    assert!(grant.matches(Scheme::Ldaps, "ldap.internal", 389));
+    assert!(!grant.matches(Scheme::Ldap, "ldap.internal", 636));
+    assert!(grant.ldap(None, 389).is_some());
+    assert!(grant.ldap(Some("other.internal"), 389).is_none());
+    assert!(grant.redis(Some("ldap.internal"), 389).is_none());
+    let credential = grant.credential().expect("an ldap grant swaps a credential");
+    assert_eq!(credential.fake, "fake");
+    let scope = grant.ldap(Some("ldap.internal"), 389).expect("scope");
+    assert_eq!(scope.downstream.dn, "cn=Directory Manager");
+    assert!(!scope.is_downstream_tls);
+  }
+
+  /// Resolve through the same collector path as redis, for an ldap value.
+  fn redis_grant_like(fake: &str, real: &str) -> Grant {
+    let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
+    resolved.grants.into_iter().next().unwrap()
+  }
+
+  #[test]
+  fn ldap_default_ports_follow_the_scheme() {
+    let grant = redis_grant_like(
+      "ldap://cn%3Ddir:fake@ldap.internal",  // betterleaks:allow
+      "ldaps://cn%3Ddir:real@ldap.internal", // betterleaks:allow
+    );
+    let scope = grant.ldap(None, 389).expect("downstream port 389");
+    assert_eq!(scope.downstream.port, 389);
+    assert_eq!(scope.upstream.port, 636);
+    assert!(scope.is_upstream_tls);
+    assert!(!scope.is_downstream_tls);
+  }
+
+  #[test]
+  fn ldap_strings_need_a_bind_dn_and_password() {
+    let cfg = cfg_with_db("ldap://ldap.internal:389", "ldap://cn%3Ddir:real@ldap.internal:389"); // betterleaks:allow
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("bind dn"), "{err}");
+    let cfg = cfg_with_db("ldap://cn%3Ddir@ldap.internal:389", "ldap://cn%3Ddir:real@ldap.internal:389"); // betterleaks:allow
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("password is required"), "{err}");
+  }
+
+  #[test]
+  fn ldap_strings_reject_sslmode_and_keep_trust_on_the_real_string() {
+    let cfg = cfg_with_db(
+      "ldap://cn%3Ddir:fake@ldap.internal:389",                 // betterleaks:allow
+      "ldap://cn%3Ddir:real@ldap.internal:389?sslmode=require", // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("sslmode"), "{err}");
+    let grant = redis_grant_like(
+      "ldap://cn%3Ddir:fake@ldap.internal:389", // betterleaks:allow
+      "ldap://cn%3Ddir:real@ldap.internal:389?sslrootcert=system&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
+    );
+    let scope = grant.ldap(None, 389).expect("scope");
+    assert_eq!(scope.root_cert, Some(RootCert::System));
+    assert_eq!(scope.client_cert, Some(PathBuf::from("/c.pem")));
+    assert_eq!(scope.client_key, Some(PathBuf::from("/c.key")));
+  }
+
+  #[test]
+  fn ldap_schemes_are_not_endpoint_grants() {
+    "ldap://ldap.internal:389".parse::<EndpointScope>().unwrap_err();
+    "ldaps://ldap.internal:636".parse::<EndpointScope>().unwrap_err();
   }
 
   #[test]

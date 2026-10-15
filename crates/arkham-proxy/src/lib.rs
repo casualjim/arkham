@@ -45,6 +45,7 @@ mod relay;
 
 use identity::CandidateParams;
 use transports::http::{HttpTransport, HttpsTransport};
+use transports::ldap::LdapTransport;
 use transports::postgres::PostgresTransport;
 use transports::redis::RedisTransport;
 use transports::smtp::SmtpTransport;
@@ -76,6 +77,7 @@ pub struct ProxyState {
   postgres: Arc<PostgresTransport>,
   redis: Arc<RedisTransport>,
   smtp: Arc<SmtpTransport>,
+  ldap: Arc<LdapTransport>,
   mint: MintBucket,
   /// Runtime token-mint store, shared across connections.
   mint_store: Arc<crate::mint::MintStore>,
@@ -168,6 +170,7 @@ impl ProxyState {
     let postgres = Arc::new(PostgresTransport::new(ca)?);
     let redis = Arc::new(RedisTransport::new(ca)?);
     let smtp = Arc::new(SmtpTransport::new(ca)?);
+    let ldap = Arc::new(LdapTransport::new(ca)?);
     Ok(Self {
       config: Arc::new(resolved),
       relay,
@@ -180,6 +183,7 @@ impl ProxyState {
       postgres,
       redis,
       smtp,
+      ldap,
       mint: MintBucket::new(),
       mint_store: Arc::new(MintStore::default()),
       fwmark: None,
