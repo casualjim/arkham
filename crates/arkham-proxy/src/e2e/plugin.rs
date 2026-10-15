@@ -28,7 +28,7 @@ async fn plugin_e2e_close_verdict_drops_connection() {
     Http::new(&[], Scheme::Http, "x", 80, Direction::Downstream, Some(Box::new(CloseHook)), None),
     Http::new(&[], Scheme::Http, "x", 80, Direction::Upstream, None, None),
   );
-  let (relay_out, ()) = tokio::join!(relay_guarded(guest_end, server_end, &mut request, &mut response, b""), async {
+  let (relay_out, ()) = tokio::join!(relay_guarded(guest_end, server_end, &mut request, &mut response, b"", b""), async {
     client_end.write_all(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
   });
   relay_out.unwrap();

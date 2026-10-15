@@ -3,8 +3,8 @@
 //! The greeting, `EHLO` / `HELO`, `HELP` / `VRFY` / `EXPN`, an `AUTH` that
 //! still precedes `STARTTLS`, and `STARTTLS` plus its acceptance run
 //! lockstep. Reply bytes are redacted as they arrive. The hold-back flushes
-//! on newline or EOF, and the reader stops on the final line, so the
-//! following handshake bytes stay unread. A non-`220` answer to `STARTTLS`
+//! on newline or EOF. A read that passes the final newline returns those
+//! bytes to the next server reader. A non-`220` answer to `STARTTLS`
 //! returns to that loop. After the upgrade, or when the guest sends anything
 //! else, both sockets go to [`relay_guarded`]. Implicit TLS skips the
 //! opening. A session that never upgrades relays with swapping off, and the
@@ -40,8 +40,56 @@ pub(crate) enum GuestLeg<G> {
 pub(super) enum ServerLeg {
   /// Bytes still in the clear.
   Plain(TcpStream),
-  /// TLS to the real server.
+  /// TLS to the real server from the first byte.
   Tls(Box<ClientTlsStream<TcpStream>>),
+  /// TLS after `STARTTLS`. Bytes past the acceptance line are read first.
+  Upgraded(Box<ClientTlsStream<HeadThen<TcpStream>>>),
+}
+
+/// Bytes already taken from a socket, then the socket. The head is dropped
+/// once the next reader has consumed it.
+/// Socket reads that start with bytes already taken from that socket.
+pub(super) struct HeadThen<S> {
+  head: Vec<u8>,
+  at: usize,
+  inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HeadThen<S> {
+  fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    if self.at < self.head.len() {
+      let Some(remaining) = self.head.get(self.at..) else {
+        return Poll::Ready(Err(std::io::Error::other("acceptance head")));
+      };
+      let n = remaining.len().min(buf.remaining());
+      let Some(chunk) = remaining.get(..n) else {
+        return Poll::Ready(Err(std::io::Error::other("acceptance head")));
+      };
+      buf.put_slice(chunk);
+      self.at = self.at.saturating_add(n);
+      if self.at >= self.head.len() {
+        self.head.clear();
+        self.head.shrink_to(0);
+        self.at = 0;
+      }
+      return Poll::Ready(Ok(()));
+    }
+    Pin::new(&mut self.inner).poll_read(cx, buf)
+  }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HeadThen<S> {
+  fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    Pin::new(&mut self.inner).poll_write(cx, buf)
+  }
+
+  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_flush(cx)
+  }
+
+  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_shutdown(cx)
+  }
 }
 
 impl<G> GuestLeg<G>
@@ -102,6 +150,7 @@ impl AsyncRead for ServerLeg {
     match self.get_mut() {
       Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
       Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+      Self::Upgraded(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
     }
   }
 }
@@ -111,6 +160,7 @@ impl AsyncWrite for ServerLeg {
     match self.get_mut() {
       Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
       Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+      Self::Upgraded(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
     }
   }
 
@@ -118,6 +168,7 @@ impl AsyncWrite for ServerLeg {
     match self.get_mut() {
       Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
       Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+      Self::Upgraded(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
     }
   }
 
@@ -125,6 +176,7 @@ impl AsyncWrite for ServerLeg {
     match self.get_mut() {
       Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
       Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+      Self::Upgraded(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
     }
   }
 }
@@ -178,7 +230,7 @@ where
   let mut up = Smtp::new(grants, host, port, Direction::Upstream);
   Smtp::share_data_gate(&down, &mut up);
   if !guest.is_plain() {
-    return relay_guarded(guest, server, &mut down, &mut up, &[]).await;
+    return relay_guarded(guest, server, &mut down, &mut up, &[], &[]).await;
   }
   Opening {
     transport,
@@ -214,22 +266,28 @@ where
   /// the relay should own. `AUTH` stays here so a refusal before the upgrade
   /// can still be followed by `STARTTLS` on the same sockets.
   async fn run(mut self) -> Result<(), Error> {
-    if acceptance_reply(&mut self.server, self.up, &mut self.guest).await?.is_none() {
+    let mut lead = Vec::new();
+    let greeting = acceptance_reply(&mut self.server, self.up, &mut self.guest, &lead).await?;
+    if greeting.code.is_none() {
       return Ok(());
     }
+    lead = greeting.rest;
     loop {
       let Some(line) = guest_line(&mut self.guest).await.map_err(|source| Error::GuestRead { source })? else {
         return Ok(());
       };
       if is_starttls(&line) {
-        match self.forward_starttls(&line).await? {
-          StarttlsStep::Continue => continue,
+        match self.forward_starttls(&line, &lead).await? {
+          StarttlsStep::Continue(rest) => {
+            lead = rest;
+            continue;
+          }
           StarttlsStep::Closed => return Ok(()),
-          StarttlsStep::Upgrade => {
+          StarttlsStep::Upgrade(rest) => {
             let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
-            let server = upgrade_server(self.transport, self.scope, self.server, self.budget).await?;
+            let server = upgrade_server(self.transport, self.scope, self.server, self.budget, rest).await?;
             self.down.set_protected(true);
-            return relay_guarded(guest, server, self.down, self.up, &[]).await;
+            return relay_guarded(guest, server, self.down, self.up, &[], &[]).await;
           }
           StarttlsStep::Local => {
             self.down.queue_starttls_ready();
@@ -238,23 +296,25 @@ where
             }
             let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
             self.down.set_protected(true);
-            return relay_guarded(guest, self.server, self.down, self.up, &[]).await;
+            return relay_guarded(guest, self.server, self.down, self.up, &[], &lead).await;
           }
-          StarttlsStep::Relay => return relay_guarded(self.guest, self.server, self.down, self.up, &[]).await,
+          StarttlsStep::Relay(rest) => return relay_guarded(self.guest, self.server, self.down, self.up, &[], &rest).await,
         }
       }
       if self.down.awaiting_auth_payload() || is_opening_command(&line) {
         match forward_down(self.down, &mut self.server, &line).await? {
           Forwarded::Stop => return Ok(()),
-          Forwarded::Held => return relay_guarded(self.guest, self.server, self.down, self.up, &[]).await,
+          Forwarded::Held => return relay_guarded(self.guest, self.server, self.down, self.up, &[], &lead).await,
           Forwarded::Sent => {}
         }
-        if acceptance_reply(&mut self.server, self.up, &mut self.guest).await?.is_none() {
+        let reply = acceptance_reply(&mut self.server, self.up, &mut self.guest, &lead).await?;
+        if reply.code.is_none() {
           return Ok(());
         }
+        lead = reply.rest;
         continue;
       }
-      return relay_guarded(self.guest, self.server, self.down, self.up, &line).await;
+      return relay_guarded(self.guest, self.server, self.down, self.up, &line, &lead).await;
     }
   }
 
@@ -262,41 +322,43 @@ where
   /// reply leaves the opening loop in place so a later `STARTTLS` can
   /// upgrade. A `220`, or an upstream leg that is already TLS, ends the
   /// opening.
-  async fn forward_starttls(&mut self, line: &[u8]) -> Result<StarttlsStep, Error> {
+  async fn forward_starttls(&mut self, line: &[u8], lead: &[u8]) -> Result<StarttlsStep, Error> {
     if self.server.is_plain() {
       match forward_down(self.down, &mut self.server, line).await? {
         Forwarded::Stop => return Ok(StarttlsStep::Closed),
-        Forwarded::Held => return Ok(StarttlsStep::Relay),
+        Forwarded::Held => return Ok(StarttlsStep::Relay(lead.to_vec())),
         Forwarded::Sent => {}
       }
-      let Some(code) = acceptance_reply(&mut self.server, self.up, &mut self.guest).await? else {
+      let reply = acceptance_reply(&mut self.server, self.up, &mut self.guest, lead).await?;
+      let Some(code) = reply.code else {
         return Ok(StarttlsStep::Closed);
       };
       if is_220(code) {
-        Ok(StarttlsStep::Upgrade)
+        Ok(StarttlsStep::Upgrade(reply.rest))
       } else {
-        Ok(StarttlsStep::Continue)
+        Ok(StarttlsStep::Continue(reply.rest))
       }
     } else if self.guest.is_plain() {
       Ok(StarttlsStep::Local)
     } else {
-      Ok(StarttlsStep::Relay)
+      Ok(StarttlsStep::Relay(lead.to_vec()))
     }
   }
 }
 
-/// What `STARTTLS` did to the opening loop.
+/// What `STARTTLS` did to the opening loop. A carried suffix is the bytes
+/// past the final newline, handed to the next server reader.
 enum StarttlsStep {
   /// The server refused. The next guest command is still an opening command.
-  Continue,
+  Continue(Vec<u8>),
   /// The peer closed before the upgrade.
   Closed,
   /// Cleartext upstream accepted. Upgrade both legs, then relay.
-  Upgrade,
+  Upgrade(Vec<u8>),
   /// Upstream is already TLS. Answer locally and upgrade the guest.
   Local,
   /// Hand the sockets to the relay without an upgrade.
-  Relay,
+  Relay(Vec<u8>),
 }
 
 /// What one downstream feed did with a complete opening line.
@@ -342,14 +404,25 @@ where
   Ok(GuestLeg::Tls(Box::new(tls)))
 }
 
-async fn upgrade_server(transport: &SmtpTransport, scope: &SmtpScope, server: ServerLeg, budget: Duration) -> Result<ServerLeg, Error> {
+async fn upgrade_server(
+  transport: &SmtpTransport,
+  scope: &SmtpScope,
+  server: ServerLeg,
+  budget: Duration,
+  rest: Vec<u8>,
+) -> Result<ServerLeg, Error> {
   let plain = match server {
     ServerLeg::Plain(stream) => stream,
-    ServerLeg::Tls(_) => return Err(Error::SmtpLegAlreadyTls),
+    ServerLeg::Tls(_) | ServerLeg::Upgraded(_) => return Err(Error::SmtpLegAlreadyTls),
   };
   let name = scope.upstream.host.as_str();
-  let tls = handshake(budget, transport.connect_server(scope, name, plain)).await?;
-  Ok(ServerLeg::Tls(Box::new(tls)))
+  let io = HeadThen {
+    head: rest,
+    at: 0,
+    inner: plain,
+  };
+  let tls = handshake(budget, transport.connect_server(scope, name, io)).await?;
+  Ok(ServerLeg::Upgraded(Box::new(tls)))
 }
 
 async fn handshake<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
@@ -417,79 +490,80 @@ where
   }
 }
 
-/// Stack buffer for one reply chunk. A chunk ends at a newline, at this
-/// size, or when the reader has nothing more ready. A longer line
-/// continues in the next chunk. Nothing from a previous chunk is kept here.
+/// Stack buffer for one reply read. A longer line continues in the next
+/// read. Nothing from a previous read is kept here.
 const REPLY_READ: usize = 8192;
+
+/// One opening reply. `rest` is the bytes of this read that follow the
+/// final newline. The caller gives them to the next server reader.
+pub(crate) struct Acceptance {
+  /// Final line status. `None` when the peer closed before a final line.
+  pub(crate) code: Option<[u8; 3]>,
+  /// Suffix after the final newline. Empty when the read ended on it.
+  pub(crate) rest: Vec<u8>,
+}
 
 /// One SMTP reply, including a multiline (`250-` … `250 `) continuation.
 /// Each read is fed to the upstream machine. What it emits is collected
 /// into one buffer for that read and written before the next read.
-/// `feed(&[])` runs only on newline or EOF, so a
-/// password split across reads stays inside the needle hold-back, and the
-/// guest is flushed there too. The first four bytes decide whether the
-/// line is final; the line itself is not kept. The returned code is that
-/// final line's status, for the `220` check. Bytes after the final line,
-/// including a handshake record, stay in `reader`.
-pub(crate) async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<[u8; 3]>, Error>
+/// `feed(&[])` runs on newline or EOF, so a password split across reads
+/// stays inside the needle hold-back, and the guest is flushed there too.
+/// The first four bytes decide whether the line is final. The line itself
+/// is not kept. Bytes after the final newline are `Acceptance::rest`.
+///
+/// `lead` is a suffix returned by the previous call. It is scanned before
+/// the next read and is not appended to later reads.
+///
+/// # Errors
+///
+/// Returns an error when the guest write fails or a read fails.
+pub(crate) async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>, lead: &[u8]) -> Result<Acceptance, Error>
 where
   R: AsyncRead + Unpin,
   G: AsyncRead + AsyncWrite + Unpin,
 {
   let mut head = ReplyHead::default();
-  let mut saw = false;
+  let mut saw = !lead.is_empty();
   let mut buf = [0u8; REPLY_READ];
   // One chunk's emit. Cleared after the write, so the next read starts empty.
   // `Raw` is what keeps a needle prefix across reads.
   let mut emit = Vec::with_capacity(REPLY_READ);
+  if !lead.is_empty()
+    && let Some(rest) = finish_chunk(up, guest, &mut head, &mut emit, lead).await?
+  {
+    return Ok(Acceptance {
+      code: Some(head.code),
+      rest,
+    });
+  }
   loop {
-    match read_reply_chunk(reader, &mut buf).await? {
-      ReplyChunk::Eof(0) if !saw => return Ok(None),
-      ReplyChunk::Eof(n) => {
-        if n > 0 {
-          let bytes = chunk_bytes(&buf, n)?;
-          observe_reply(&mut head, bytes, false);
-          append_fed(up, &mut emit, bytes).await?;
-        }
-        append_fed(up, &mut emit, &[]).await?;
-        write_emit(guest, &mut emit).await?;
-        flush_guest(guest).await?;
-        if head.is_final() {
-          return Ok(Some(head.code));
-        }
-        return Ok(None);
+    let n = match reader.read(&mut buf).await {
+      Ok(n) => n,
+      Err(err) if err.kind() == ErrorKind::UnexpectedEof => 0,
+      Err(source) => return Err(Error::UpstreamRead { source }),
+    };
+    if n == 0 {
+      if !saw {
+        return Ok(Acceptance {
+          code: None,
+          rest: Vec::new(),
+        });
       }
-      ReplyChunk::Data { n, newline } => {
-        saw = true;
-        let bytes = chunk_bytes(&buf, n)?;
-        observe_reply(&mut head, bytes, newline);
-        append_fed(up, &mut emit, bytes).await?;
-        if newline {
-          append_fed(up, &mut emit, &[]).await?;
-        }
-        write_emit(guest, &mut emit).await?;
-        if !newline {
-          continue;
-        }
-        flush_guest(guest).await?;
-        // A bare `\n` never reaches `observe`, so `at` stays 0. That line
-        // is still final: continuing would consume the following handshake.
-        if head.at == 0 || head.is_final() {
-          return Ok(Some(head.code));
-        }
-        head = ReplyHead::default();
-      }
+      append_fed(up, &mut emit, &[]).await?;
+      write_emit(guest, &mut emit).await?;
+      flush_guest(guest).await?;
+      let code = head.is_final().then_some(head.code);
+      return Ok(Acceptance { code, rest: Vec::new() });
+    }
+    saw = true;
+    let bytes = chunk_bytes(&buf, n)?;
+    if let Some(rest) = finish_chunk(up, guest, &mut head, &mut emit, bytes).await? {
+      return Ok(Acceptance {
+        code: Some(head.code),
+        rest,
+      });
     }
   }
-}
-
-/// What one stack read produced. `n` is the filled prefix of the caller's buffer.
-enum ReplyChunk {
-  /// The peer closed after `n` bytes of this chunk.
-  Eof(usize),
-  /// `n` bytes are ready. `newline` means the last byte is `\n` and the
-  /// read stopped there, so the following bytes stay in the reader.
-  Data { n: usize, newline: bool },
 }
 
 fn chunk_bytes(buf: &[u8], n: usize) -> Result<&[u8], Error> {
@@ -498,63 +572,61 @@ fn chunk_bytes(buf: &[u8], n: usize) -> Result<&[u8], Error> {
   })
 }
 
-/// Read until the stack buffer is full, a newline arrives, or the peer
-/// closes. A later `Pending` with bytes already in hand ends the chunk
-/// so those bytes can be written before the task parks. The read stops
-/// on the newline, one byte at a time, so a handshake after it is not pulled.
-async fn read_reply_chunk<R>(reader: &mut R, buf: &mut [u8]) -> Result<ReplyChunk, Error>
+/// Feed `bytes` through the final newline, write what that produced, and
+/// return the suffix after that newline. `None` means the chunk has no
+/// final newline yet.
+async fn finish_chunk<G>(
+  up: &mut Smtp,
+  guest: &mut GuestLeg<G>,
+  head: &mut ReplyHead,
+  emit: &mut Vec<u8>,
+  bytes: &[u8],
+) -> Result<Option<Vec<u8>>, Error>
 where
-  R: AsyncRead + Unpin,
+  G: AsyncRead + AsyncWrite + Unpin,
 {
-  let mut filled = 0usize;
-  std::future::poll_fn(|cx| {
-    while filled < buf.len() {
-      let mut byte = [0u8; 1];
-      let mut read_buf = ReadBuf::new(&mut byte);
-      match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-        Poll::Pending => {
-          if filled == 0 {
-            return Poll::Pending;
-          }
-          return Poll::Ready(Ok(ReplyChunk::Data { n: filled, newline: false }));
-        }
-        Poll::Ready(Err(err)) if err.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(ReplyChunk::Eof(filled))),
-        Poll::Ready(Err(source)) => return Poll::Ready(Err(Error::UpstreamRead { source })),
-        Poll::Ready(Ok(())) => {
-          if read_buf.filled().is_empty() {
-            return Poll::Ready(Ok(ReplyChunk::Eof(filled)));
-          }
-          let Some(next) = byte.first().copied() else {
-            return Poll::Ready(Err(Error::UpstreamRead {
-              source: std::io::Error::other("empty read"),
-            }));
-          };
-          let Some(slot) = buf.get_mut(filled) else {
-            return Poll::Ready(Err(Error::UpstreamRead {
-              source: std::io::Error::other("reply read past the chunk"),
-            }));
-          };
-          *slot = next;
-          filled = filled.saturating_add(1);
-          if next == b'\n' {
-            return Poll::Ready(Ok(ReplyChunk::Data { n: filled, newline: true }));
-          }
-        }
-      }
+  let mut start = 0usize;
+  let mut i = 0usize;
+  let mut saw_newline = false;
+  while i < bytes.len() {
+    let Some(&byte) = bytes.get(i) else {
+      return Err(Error::UpstreamRead {
+        source: std::io::Error::other("reply read past the chunk"),
+      });
+    };
+    i = i.saturating_add(1);
+    if byte != b'\n' {
+      head.observe(byte);
+      continue;
     }
-    Poll::Ready(Ok(ReplyChunk::Data { n: filled, newline: false }))
-  })
-  .await
-}
-
-fn observe_reply(head: &mut ReplyHead, bytes: &[u8], newline: bool) {
-  let end = if newline { bytes.len().saturating_sub(1) } else { bytes.len() };
-  let Some(body) = bytes.get(..end) else {
-    return;
-  };
-  for &byte in body {
-    head.observe(byte);
+    saw_newline = true;
+    let Some(line) = bytes.get(start..i) else {
+      return Err(Error::UpstreamRead {
+        source: std::io::Error::other("reply read past the chunk"),
+      });
+    };
+    append_fed(up, emit, line).await?;
+    append_fed(up, emit, &[]).await?;
+    // A bare `\n` leaves `at` at 0. That line is still final.
+    let final_line = head.at == 0 || head.is_final();
+    if final_line {
+      write_emit(guest, emit).await?;
+      flush_guest(guest).await?;
+      return Ok(Some(bytes.get(i..).unwrap_or(&[]).to_vec()));
+    }
+    *head = ReplyHead::default();
+    start = i;
   }
+  if let Some(tail) = bytes.get(start..)
+    && !tail.is_empty()
+  {
+    append_fed(up, emit, tail).await?;
+  }
+  write_emit(guest, emit).await?;
+  if saw_newline {
+    flush_guest(guest).await?;
+  }
+  Ok(None)
 }
 
 /// Status and separator of the reply line being read. Four bytes decide
@@ -886,16 +958,17 @@ mod tests {
     let mut cursor = std::io::Cursor::new(payload);
     let mut guest = super::plain_guest(std::io::Cursor::new(Vec::new()));
     let mut up = upstream();
-    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    let done = super::acceptance_reply(&mut cursor, &mut up, &mut guest, &[]).await.unwrap();
+    let reply = done.code.unwrap();
     assert_eq!(reply, *b"220");
     assert!(super::is_220(reply));
+    assert_eq!(done.rest, [0x16, 0x03, 0x01]);
     let super::GuestLeg::Plain(writer) = guest else {
       unreachable!("the guest leg is the cursor");
     };
     assert_eq!(writer.into_inner(), banner);
     let at = usize::try_from(cursor.position()).unwrap();
     assert_eq!(at, payload_len, "the chunk includes the bytes after the final line");
-    assert_eq!(cursor.get_ref().get(banner.len()..), Some(&[0x16, 0x03, 0x01][..]));
   }
 
   /// A bare newline is a final line. The handshake that follows it stays
@@ -907,11 +980,14 @@ mod tests {
     let mut cursor = std::io::Cursor::new(payload);
     let mut guest = super::plain_guest(WriteLog::default());
     let mut up = upstream();
-    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    let done = super::acceptance_reply(&mut cursor, &mut up, &mut guest, &[]).await.unwrap();
+    let reply = done.code.unwrap();
     assert!(!super::is_220(reply));
-    let at = usize::try_from(cursor.position()).unwrap();
-    assert_eq!(at, 1);
-    assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
+    assert_eq!(done.rest, [0x16, 0x03, 0x01]);
+    let super::GuestLeg::Plain(log) = guest else {
+      unreachable!("the guest leg is the write log");
+    };
+    assert_eq!(log.buf, b"\n");
   }
 
   /// Bytes already read reach the guest while the line is still open.
@@ -927,7 +1003,7 @@ mod tests {
     let flushes = Arc::clone(&log.flushes);
     let mut guest = super::plain_guest(log);
     let mut up = upstream();
-    let mut task = std::pin::pin!(super::acceptance_reply(&mut reader, &mut up, &mut guest));
+    let mut task = std::pin::pin!(super::acceptance_reply(&mut reader, &mut up, &mut guest, &[]));
     let waker = std::task::Waker::noop();
     let mut cx = Context::from_waker(waker);
     assert!(
@@ -946,22 +1022,27 @@ mod tests {
     assert_eq!(*flushes.lock().unwrap_or_else(PoisonError::into_inner), 0);
   }
 
-  /// The hold-back released at EOF belongs to that same read. A second
-  /// write is another queue message for bytes already in hand.
+  /// The data and the following EOF are two reads, so the hold-back flush
+  /// is the EOF read's write. The guest still receives every byte.
   #[tokio::test]
-  async fn eof_holdback_is_one_write_with_the_chunk() {
+  async fn eof_holdback_is_the_eof_reads_write() {
     let line = format!("535 {REAL_PASS}");
     let cut = line.len() - 4;
     let bytes = line.as_bytes().get(..cut).unwrap().to_vec();
     let mut cursor = std::io::Cursor::new(bytes.clone());
     let mut guest = super::plain_guest(WriteLog::default());
     let mut up = upstream();
-    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest, &[])
+      .await
+      .unwrap()
+      .code
+      .unwrap();
     assert_eq!(reply, *b"535");
     let super::GuestLeg::Plain(log) = guest else {
       unreachable!("the guest leg is the write log");
     };
-    assert_eq!(log.writes.len(), 1, "{:?}", log.writes);
+    assert_eq!(log.writes.len(), 2, "{:?}", log.writes);
+    assert_eq!(log.writes.iter().sum::<usize>(), bytes.len());
     assert_eq!(log.buf, bytes);
   }
 
@@ -980,7 +1061,10 @@ mod tests {
     };
     let mut guest = super::plain_guest(WriteLog::default());
     let mut up = upstream();
-    let reply = drive(super::acceptance_reply(&mut reader, &mut up, &mut guest)).unwrap().unwrap();
+    let reply = drive(super::acceptance_reply(&mut reader, &mut up, &mut guest, &[]))
+      .unwrap()
+      .code
+      .unwrap();
     assert_eq!(reply, *b"535");
     let super::GuestLeg::Plain(log) = guest else {
       unreachable!("the guest leg is the write log");
@@ -1003,7 +1087,10 @@ mod tests {
     };
     let mut guest = super::plain_guest(WriteLog::default());
     let mut up = upstream();
-    let reply = drive(super::acceptance_reply(&mut reader, &mut up, &mut guest)).unwrap().unwrap();
+    let reply = drive(super::acceptance_reply(&mut reader, &mut up, &mut guest, &[]))
+      .unwrap()
+      .code
+      .unwrap();
     assert_eq!(reply, *b"535");
     let super::GuestLeg::Plain(log) = guest else {
       unreachable!("the guest leg is the write log");
@@ -1023,7 +1110,11 @@ mod tests {
     let mut cursor = std::io::Cursor::new(banner.to_vec());
     let mut guest = super::plain_guest(WriteLog::default());
     let mut up = upstream();
-    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest, &[])
+      .await
+      .unwrap()
+      .code
+      .unwrap();
     assert_eq!(reply, *b"220");
     let super::GuestLeg::Plain(log) = guest else {
       unreachable!("the guest leg is the write log");
@@ -1040,16 +1131,17 @@ mod tests {
     let mut cursor = std::io::Cursor::new(payload);
     let mut guest = super::plain_guest(WriteLog::default());
     let mut up = upstream();
-    let code = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    let done = super::acceptance_reply(&mut cursor, &mut up, &mut guest, &[]).await.unwrap();
+    let code = done.code.unwrap();
     assert_eq!(code, *b"qqq");
+    assert_eq!(done.rest, [0x16, 0x03, 0x01]);
     let super::GuestLeg::Plain(log) = guest else {
       unreachable!("the guest leg is the write log");
     };
     assert_eq!(log.writes, vec![super::REPLY_READ, 50 + 2]);
     assert!(log.writes.iter().all(|len| *len <= super::REPLY_READ));
     let at = usize::try_from(cursor.position()).unwrap();
-    assert_eq!(at, reply_len);
-    assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
+    assert_eq!(at, reply_len.saturating_add(3));
   }
 
   /// A reply that echoes a real password longer than the decoy is written
@@ -1144,8 +1236,10 @@ mod tests {
     let mut cursor = std::io::Cursor::new(payload);
     let mut guest = super::plain_guest(std::io::Cursor::new(Vec::new()));
     let mut up = Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream);
-    let code = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    let done = super::acceptance_reply(&mut cursor, &mut up, &mut guest, &[]).await.unwrap();
+    let code = done.code.unwrap();
     assert_eq!(code, *b"535");
+    assert_eq!(done.rest, [0x16, 0x03, 0x01]);
     let super::GuestLeg::Plain(writer) = guest else {
       unreachable!("the guest leg is the cursor");
     };
@@ -1154,7 +1248,6 @@ mod tests {
     assert!(text.contains(FAKE_PASS), "{text}");
     assert!(!text.contains(LONG_REAL), "{text}");
     let at = usize::try_from(cursor.position()).unwrap();
-    assert_eq!(at, reply_len);
-    assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
+    assert_eq!(at, reply_len.saturating_add(3));
   }
 }

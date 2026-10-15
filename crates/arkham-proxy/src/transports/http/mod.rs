@@ -176,10 +176,10 @@ impl Transport for HttpTransport {
     };
     if named {
       let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
-      relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, &head).await
+      relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, &head, &[]).await
     } else {
       let (mut downstream_machine, mut upstream_machine) = raw_tcp_pair(&ctx);
-      relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, &head).await
+      relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, &head, &[]).await
     }
   }
 }
@@ -236,21 +236,42 @@ where
     match negotiated {
       Some(proto) if proto.as_bytes() == ApplicationProtocol::HTTP_2.as_bytes() => {
         let (mut downstream_machine, mut upstream_machine) = https_h2_pair(&ctx);
-        relay_guarded(&mut guest_tls, &mut server_tls, &mut downstream_machine, &mut upstream_machine, &[])
-          .await
-          .map_err(|err| into_box_error(&err))
+        relay_guarded(
+          &mut guest_tls,
+          &mut server_tls,
+          &mut downstream_machine,
+          &mut upstream_machine,
+          &[],
+          &[],
+        )
+        .await
+        .map_err(|err| into_box_error(&err))
       }
       Some(proto) if proto.as_bytes() == ApplicationProtocol::HTTP_11.as_bytes() => {
         let (mut downstream_machine, mut upstream_machine) = https_pair(&ctx);
-        relay_guarded(&mut guest_tls, &mut server_tls, &mut downstream_machine, &mut upstream_machine, &[])
-          .await
-          .map_err(|err| into_box_error(&err))
+        relay_guarded(
+          &mut guest_tls,
+          &mut server_tls,
+          &mut downstream_machine,
+          &mut upstream_machine,
+          &[],
+          &[],
+        )
+        .await
+        .map_err(|err| into_box_error(&err))
       }
       _ => {
         let (mut downstream_machine, mut upstream_machine) = raw_tls_pair(&ctx);
-        relay_guarded(&mut guest_tls, &mut server_tls, &mut downstream_machine, &mut upstream_machine, &[])
-          .await
-          .map_err(|err| into_box_error(&err))
+        relay_guarded(
+          &mut guest_tls,
+          &mut server_tls,
+          &mut downstream_machine,
+          &mut upstream_machine,
+          &[],
+          &[],
+        )
+        .await
+        .map_err(|err| into_box_error(&err))
       }
     }
   }

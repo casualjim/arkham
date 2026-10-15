@@ -404,7 +404,7 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
     mint: Some(state.mint_handle()),
   };
   let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
-  relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head).await
+  relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head, &[]).await
 }
 
 /// Read until the end of the HTTP head (`\r\n\r\n`) or `MAX_HEAD` bytes.

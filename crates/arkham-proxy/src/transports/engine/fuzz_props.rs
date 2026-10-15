@@ -814,19 +814,22 @@ fn smtp_greeting(continuations: u8, at: usize, pass: &str) -> (Vec<u8>, usize) {
 struct SmtpOpening {
   code: Option<[u8; 3]>,
   guest: Vec<u8>,
-  at: usize,
+  rest: Vec<u8>,
 }
 
-fn smtp_read_opening(up: &mut Smtp, reader: &mut Cursor<Vec<u8>>) -> Result<SmtpOpening, crate::Error> {
+fn smtp_read_opening(up: &mut Smtp, reader: &mut Cursor<Vec<u8>>, lead: &[u8]) -> Result<SmtpOpening, crate::Error> {
   block_on(async {
     let mut guest = plain_guest(Cursor::new(Vec::new()));
-    let code = acceptance_reply(reader, up, &mut guest).await?;
-    let at = usize::try_from(reader.position()).unwrap_or(usize::MAX);
+    let done = acceptance_reply(reader, up, &mut guest, lead).await?;
     let guest = match guest {
       GuestLeg::Plain(cursor) => cursor.into_inner(),
       GuestLeg::Tls(_) => Vec::new(),
     };
-    Ok(SmtpOpening { code, guest, at })
+    Ok(SmtpOpening {
+      code: done.code,
+      guest,
+      rest: done.rest,
+    })
   })
 }
 
@@ -890,7 +893,7 @@ proptest! {
   #![proptest_config(ProptestConfig::with_cases(256))]
 
   /// A reply cut at any offset, including the old 16 KiB boundary, is still
-  /// one opening reply. The next status line stays unread until the next read.
+  /// one opening reply. Bytes after its final newline are the next read.
   #[test]
   fn prop_reply_cut_keeps_the_opening_in_sync(
     fake_chars in proptest::collection::vec(prop::char::range('a', 'z'), 6..10),
@@ -930,14 +933,14 @@ proptest! {
     let mut stream = greet.clone();
     stream.extend_from_slice(b"250 ok\r\n");
     let mut cursor = Cursor::new(stream);
-    let first = smtp_read_opening(&mut up, &mut cursor).expect("greeting");
+    let first = smtp_read_opening(&mut up, &mut cursor, &[]).expect("greeting");
     prop_assert_eq!(first.code, Some(*b"220"), "the final line decides the opening");
-    prop_assert_eq!(first.at, greet.len(), "the cut consumed the next reply or stopped early");
+    prop_assert!(!first.guest.windows(6).any(|window| window == b"250 ok"), "the next reply was written with the greeting");
     prop_assert!(!first.guest.windows(real.len()).any(|window| window == real.as_bytes()), "guest saw the real password");
     prop_assert!(first.guest.windows(fake.len()).any(|window| window == fake.as_bytes()), "guest missed the decoy");
-    let second = smtp_read_opening(&mut up, &mut cursor).expect("next reply");
+    let second = smtp_read_opening(&mut up, &mut cursor, &first.rest).expect("next reply");
     prop_assert_eq!(second.code, Some(*b"250"), "the following reply was no longer in sync");
-    prop_assert_eq!(second.at, cursor.get_ref().len(), "the following reply was not consumed whole");
+    prop_assert!(second.guest.windows(6).any(|window| window == b"250 ok"), "the following reply was dropped");
 
     let mut closed = false;
     let (_, _, data_closed) = run_split_parts(&mut down, b"DATA\r\n", &[]);

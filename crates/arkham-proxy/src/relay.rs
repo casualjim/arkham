@@ -32,7 +32,14 @@ enum ToResponse {
 /// flushes the downstream direction, then upstream shutdown while still
 /// draining upstream→guest; upstream close flushes the upstream direction
 /// and ends the relay.
-pub(crate) async fn relay_guarded<G, S, M>(guest: G, server: S, downstream: &mut M, upstream: &mut M, first: &[u8]) -> Result<(), Error>
+pub(crate) async fn relay_guarded<G, S, M>(
+  guest: G,
+  server: S,
+  downstream: &mut M,
+  upstream: &mut M,
+  first: &[u8],
+  upstream_first: &[u8],
+) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
@@ -44,7 +51,14 @@ where
   let (responses_done_tx, responses_done_rx) = oneshot::channel();
   let (requests, responses) = tokio::join!(
     pump_requests(guest_read, server_write, downstream, to_responses_tx, responses_done_rx, first),
-    pump_responses(server_read, guest_write, upstream, to_responses_rx, responses_done_tx),
+    pump_responses(
+      server_read,
+      guest_write,
+      upstream,
+      to_responses_rx,
+      responses_done_tx,
+      upstream_first
+    ),
   );
   requests.or(responses)
 }
@@ -172,12 +186,19 @@ async fn pump_responses<R, W, M>(
   upstream: &mut M,
   mut requests: mpsc::UnboundedReceiver<ToResponse>,
   responses_done: oneshot::Sender<()>,
+  upstream_first: &[u8],
 ) -> Result<(), Error>
 where
   R: AsyncRead + Unpin,
   W: AsyncWrite + Unpin,
   M: Wire,
 {
+  if !upstream_first.is_empty() && !write_upstream_chunk(&mut guest, upstream, upstream_first).await? {
+    let _ = responses_done.send(());
+    guest.flush().await.map_err(|source| Error::FinalGuestFlush { source })?;
+    let _ = guest.shutdown().await;
+    return Ok(());
+  }
   let mut buf = vec![0u8; 32 * 1024];
   let mut requests_open = true;
   let outcome = loop {
@@ -245,6 +266,31 @@ where
       Ok(())
     }
     Err(err) => Err(err),
+  }
+}
+
+/// Feed bytes already taken from the server and write what the upstream
+/// machine emits. `false` means that machine closed the relay.
+async fn write_upstream_chunk<W, M>(guest: &mut W, upstream: &mut M, bytes: &[u8]) -> Result<bool, Error>
+where
+  W: AsyncWrite + Unpin,
+  M: Wire,
+{
+  let (rewritten, hits) = upstream.feed(bytes).await;
+  log_hits(&hits);
+  match rewritten {
+    Rewritten::Close => Ok(false),
+    Rewritten::Hold => Ok(true),
+    Rewritten::Emit(out) => {
+      if !out.is_empty() {
+        guest
+          .write_all(&out)
+          .await
+          .map_err(|source| Error::ResponseChunkToGuest { source })?;
+        guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
+      }
+      Ok(true)
+    }
   }
 }
 

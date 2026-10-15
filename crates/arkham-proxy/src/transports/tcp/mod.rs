@@ -45,7 +45,7 @@ impl Transport for TcpTransport {
       mint: Some(state.mint_handle()),
     };
     let (mut downstream_machine, mut upstream_machine) = raw_tcp_pair(&ctx);
-    relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, initial).await
+    relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, initial, &[]).await
   }
 }
 
