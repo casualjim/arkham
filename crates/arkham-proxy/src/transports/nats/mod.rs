@@ -295,7 +295,7 @@ async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>
 /// return the bytes read past its LF. On a `tls://` server leg they belong
 /// to the server's TLS, not to NATS. `None` when the server closes first or
 /// `up` closes the leg.
-async fn server_info<S, G>(server: &mut S, up: &mut Nats, guest: &mut G) -> Result<Option<Vec<u8>>, Error>
+pub(crate) async fn server_info<S, G>(server: &mut S, up: &mut Nats, guest: &mut G) -> Result<Option<Vec<u8>>, Error>
 where
   S: AsyncRead + Unpin,
   G: AsyncWrite + Unpin,
