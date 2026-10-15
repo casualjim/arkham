@@ -54,6 +54,14 @@ printf "subjectAltName=IP:10.202.0.80,DNS:ldap\nextendedKeyUsage=serverAuth\nkey
 openssl x509 -req -in "$dir/ldap.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
   -CAcreateserial -out "$dir/ldap.crt" -days 2 -extfile "$dir/ldap.ext"
 
+# NATS TLS: nats-server presents this leaf after its cleartext INFO line.
+# SAN carries the hostname the connection strings dial and the static address.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/nats.key"
+openssl req -new -key "$dir/nats.key" -out "$dir/nats.csr" -subj "/CN=nats"
+printf "subjectAltName=IP:10.202.0.90,DNS:nats\n" >"$dir/nats.ext"
+openssl x509 -req -in "$dir/nats.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+  -CAcreateserial -out "$dir/nats.crt" -days 2 -extfile "$dir/nats.ext"
+
 cat "$dir/ca.crt" "$dir/ca.key" >"$dir/ca.pem"
 chmod 600 "$dir/ca.key" "$dir/ca.pem"
 

@@ -10,6 +10,7 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile, writeFile } from "node:fs/promises";
 import { RedisClient } from "bun";
 import { Client } from "ldapts";
+import { connect as natsConnect, StringCodec, type NatsConnection } from "nats";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
@@ -22,6 +23,8 @@ const SMTPS_URL = process.env.SMTPS_URL ?? "";
 const LDAP_URL = process.env.LDAP_URL ?? "";
 const LDAP_TLS_URL = process.env.LDAP_TLS_URL ?? "";
 const LDAP_REAL = "arkham_real_ldap_pass_01";
+const NATS_URL = process.env.NATS_URL ?? "";
+const NATS_REAL = "arkham_real_nats_pass";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -666,6 +669,66 @@ if (LDAP_TLS_URL) {
   });
 } else {
   stage("ldaps scenarios skipped: no LDAP_TLS_URL");
+}
+
+function natsParts(raw: string) {
+  const url = new URL(raw);
+  return {
+    user: decodeURIComponent(url.username),
+    pass: decodeURIComponent(url.password),
+    server: `${url.hostname}:${url.port}`,
+  };
+}
+
+function openNats(raw: string, pass: string): Promise<NatsConnection> {
+  const parts = natsParts(raw);
+  return race("nats connect", natsConnect({
+    servers: parts.server,
+    user: parts.user,
+    pass,
+    tls: { ca: ca.toString() },
+    timeout: 4000,
+    reconnect: false,
+  }));
+}
+
+if (NATS_URL) {
+  const parts = natsParts(NATS_URL);
+  const sc = StringCodec();
+  // The server's only account holds the real password, so a session that
+  // authenticates with the decoy proves the swap. The payload carries the
+  // decoy and must arrive unchanged: payloads are never rewritten.
+  await retry("nats", "nats tls CONNECT swaps the decoy password; publish and receive", async () => {
+    const nc = await openNats(NATS_URL, parts.pass);
+    try {
+      const subject = "arkham.demo";
+      const body = `payload keeps ${parts.pass}`;
+      const sub = nc.subscribe(subject, { max: 1 });
+      nc.publish(subject, sc.encode(body));
+      const got = await race("nats message", (async () => {
+        for await (const msg of sub) return sc.decode(msg.data);
+        return "";
+      })());
+      stage(`nats received: ${got}`);
+      return got === body;
+    } finally {
+      await nc.close();
+    }
+  });
+
+  await retry("nats", "nats non-decoy password is not swapped", async () => {
+    try {
+      const nc = await openNats(NATS_URL, "not-the-nats-decoy");
+      await nc.close();
+      return false;
+    } catch (err) {
+      const text = String(err);
+      stage(`nats unswapped CONNECT error: ${text}`);
+      return text.includes("Authorization Violation") && !text.includes(NATS_REAL);
+    }
+  });
+} else {
+  stage("nats scenarios skipped: no NATS_URL");
 }
 
 const coveredPath = process.env.ARKHAM_COVERED ?? "";

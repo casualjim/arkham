@@ -33,6 +33,7 @@ services:
       ARKHAM_SMTPS_REAL: ${ARKHAM_SMTPS_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_LDAP_REAL: ${ARKHAM_LDAP_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_LDAP_TLS_REAL: ${ARKHAM_LDAP_TLS_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_NATS_REAL: ${ARKHAM_NATS_REAL:?copy integration/.env.example to integration/.env}
     volumes:
       - ./gen-certs.sh:/srv/gen-certs.sh:ro
       - ./gen-secrets.sh:/srv/gen-secrets.sh:ro
@@ -321,6 +322,48 @@ services:
       certs:
         condition: service_completed_successfully
 
+  # Official NATS server. TLS is required on 4222: the server writes one
+  # cleartext INFO line, then expects a handshake. Its only account is the
+  # real password. The tls block sets no `verify`, so the server does not
+  # ask for a client certificate; the proxy's upstream leg has none.
+  # `no_advertise` keeps cluster client URLs out of INFO, so the client
+  # never learns an address it did not dial.
+  nats:
+    image: nats:2.15.1-alpine
+    command:
+      - sh
+      - -c
+      - |
+        cat > /tmp/nats.conf <<'EOF'
+        port: 4222
+        http_port: 8222
+        tls {
+          cert_file: /certs/nats.crt
+          key_file: /certs/nats.key
+        }
+        authorization {
+          user: agent
+          password: arkham_real_nats_pass
+        }
+        cluster {
+          no_advertise: true
+        }
+        EOF
+        exec nats-server -c /tmp/nats.conf
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - certs:/certs:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.90
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
   # Decoy AUTH straight at the mail server, from a network namespace the
   # capture rules do not cover. Not the client: that container is the
   # confined agent and must not hold NET_ADMIN. An empty SMTP_URL skips
@@ -419,6 +462,7 @@ services:
       SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       LDAP_URL: ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3389 # nosemgrep: deterministic demo decoy, not a credential
       LDAP_TLS_URL: ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636 # nosemgrep: deterministic demo decoy, not a credential
+      NATS_URL: nats://agent:arkham_fake_nats_pass@nats:4222 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
@@ -441,6 +485,8 @@ services:
       mail:
         condition: service_healthy
       ldap:
+        condition: service_healthy
+      nats:
         condition: service_healthy
 
 networks:
