@@ -20,7 +20,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 | `listen` | `127.0.0.1:8080` | `ARKHAM_LISTEN` | Address the explicit proxy listens on. |
 | `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/arkham/ca.pem` | `ARKHAM_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `arkham ca` also writes `ca.crt` and `ca.key` beside it. |
 | `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
-| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, the LDAP StartTLS reply, and the upstream `SSLRequest` answer all share this budget. |
+| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, the LDAP StartTLS reply, the NATS server's INFO line, and the upstream `SSLRequest` answer all share this budget. |
 
 ## `[rules.<label>]`
 
@@ -143,6 +143,22 @@ value = "ldaps://cn%3DDirectory%20Manager:decoy@ldap.internal:636"
 ```
 
 The real value in fnox carries the trust anchor on either scheme, for example `ldap://cn%3DDirectory%20Manager:real@ldap.internal:389?sslrootcert=/path/ca.pem`.
+
+### NATS rules
+
+A rule whose `value` states a `nats://` or `tls://` connection string is a NATS rule. The rule states the FAKE string in `value`. The REAL string resolves from the secret source under `env`/`fnox_key`. No `allow` entries: the connection string is the grant, matched on the fake string's port. The default port is `4222`. `user:pass` userinfo maps CONNECT `user` and `pass`; a lone userinfo value is a token and maps CONNECT `auth_token`. Both strings must use the same kind. Userinfo is required, and the string has no path.
+
+The fake string takes no query; its spelling does not matter, because the guest picks its own TLS after the server's INFO line. The real string states how arkham reaches the server. `nats://` is cleartext: the leg never upgrades, CONNECT forwards the decoy, and loading the rule logs a warning. `tls://` reads the server's cleartext INFO line, upgrades the upstream leg, and only then swaps CONNECT. With `handshake_first=true`, both legs do TLS before any protocol byte. A real `tls://` string may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together. Arkham reads the query off the real string and does not send it to the server. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`. That table rejects `root_cert`, `client_cert`, and `client_key`, because upstream trust and identity belong on the real string.
+
+The wire machine swaps CONNECT only when every mapped field holds the decoy, and re-encodes that CONNECT as compact JSON. A CONNECT with any other value is forwarded byte-identical. `nkey`, `jwt`, and `sig` pass unchanged. PUB and HPUB payloads stream untouched. Server lines such as INFO and `-ERR` redact the real value back to the decoy. MSG and HMSG payloads are never rewritten: a payload that carries the real value closes the connection.
+
+```toml
+[rules.bus]
+env = "NATS_URL"
+value = "nats://app:decoy@nats.internal:4222"
+```
+
+The real value in fnox is `tls://` and carries the trust anchor, for example `tls://app:real@nats.internal:4222?sslrootcert=/path/ca.pem`.
 
 ## `[rules.<label>.tls."<entry>"]`
 
