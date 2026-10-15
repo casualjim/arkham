@@ -19,13 +19,13 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use arkham_config::grants::{Grant, NatsAuth, NatsPair, Scheme};
+use arkham_config::grants::{Grant, NatsAuth, NatsPair};
 use secrecy::ExposeSecret as _;
 use serde_json::{Map, Value};
 use strum::{EnumIter, EnumString, IntoEnumIterator as _, IntoStaticStr};
 
 use crate::transports::engine::{
-  CredentialPair, Direction, Hit, Location, Raw, Rewritten, Wire, eligible_pairs, find_new_match, max_tail_size, needle_prefix_suffix_len,
+  CredentialPair, Hit, Location, Raw, Rewritten, Wire, find_new_match, max_tail_size, needle_prefix_suffix_len,
 };
 
 /// Longest CONNECT line a TLS downstream leg buffers before forwarding the
@@ -369,12 +369,12 @@ impl Nats {
     })
   }
 
-  /// Server-to-guest leg. Lines redact the real value. Payloads close on it.
+  /// Server-to-guest leg. Lines redact every real auth field. Payloads close on it.
   pub(crate) fn upstream(grants: &[Grant], host: &str, port: u16) -> Self {
-    let pairs = eligible_pairs(grants, Scheme::Nats, host, port, Direction::Upstream);
+    let pairs = upstream_pairs(grants, host, port);
     Self::Up(Up {
       framer: Framer::new(Side::Server),
-      lines: Raw::length_changing(grants, Scheme::Nats, host, port, Direction::Upstream),
+      lines: Raw::from_pairs(pairs.clone()),
       guard: Guard {
         bound: max_tail_size(&pairs),
         pairs,
@@ -426,6 +426,33 @@ impl Policy {
       },
     ))
   }
+}
+
+/// Real values to hide from the guest: every mapped auth field whose fake
+/// and real differ. An unchanged username is not a needle, so a payload
+/// that names it stays open.
+fn upstream_pairs(grants: &[Grant], host: &str, port: u16) -> Vec<CredentialPair> {
+  let mut pairs = Vec::new();
+  for grant in grants {
+    let Some(scope) = grant.nats(Some(host), port) else {
+      continue;
+    };
+    let Some(credential) = grant.credential() else {
+      continue;
+    };
+    for (_, field) in auth_fields(&scope.auth) {
+      let real = field.real.expose_secret();
+      if field.fake == real || field.fake.is_empty() || real.is_empty() {
+        continue;
+      }
+      pairs.push(CredentialPair {
+        needle: real.as_bytes().to_vec(),
+        replacement: field.fake.as_bytes().to_vec(),
+        label: credential.label.clone(),
+      });
+    }
+  }
+  pairs
 }
 
 /// The CONNECT fields one auth kind owns.
@@ -800,6 +827,24 @@ pub(crate) mod tests {
     let mut machine = up(&grants);
     let hmsg = format!("HMSG orders 1 12 {}\r\nNATS/1.0\r\n\r\n{REAL_PASS}\r\n", 12 + REAL_PASS.len());
     assert_eq!(feed(&mut machine, hmsg.as_bytes()).await, (Out::Close, 0));
+  }
+
+  #[tokio::test]
+  async fn real_username_is_redacted_on_lines_and_closes_a_payload() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222", // betterleaks:allow
+      "tls://real-nats-user:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let mut machine = up(&grants);
+    let err = "-ERR 'user real-nats-user'\r\n";
+    assert_eq!(feed(&mut machine, err.as_bytes()).await, (emit("-ERR 'user agent'\r\n"), 1));
+    let mut machine = up(&grants);
+    let body = "real-nats-user";
+    let msg = format!("MSG orders 1 {}\r\n{body}\r\n", body.len());
+    assert_eq!(feed(&mut machine, msg.as_bytes()).await, (Out::Close, 0));
+    let mut machine = up(&user_pass());
+    let same = format!("MSG orders 1 {}\r\nagent\r\n", "agent".len());
+    assert_eq!(feed(&mut machine, same.as_bytes()).await, (emit(&same), 0));
   }
 
   #[tokio::test]
