@@ -16,7 +16,7 @@ use validator::{Validate, ValidationError};
 
 use crate::cli::Cli;
 use crate::error::Error;
-use crate::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
+use crate::grants::{EndpointScope, GuestTlsMode, HostPat, NatsUriScheme, Scheme};
 use crate::plugins::{PluginCfg, PluginDirection};
 use crate::registry::{FlowKind, OAuthFlow, validate_flow};
 use code_workspace::{Workspace, resolve_root};
@@ -419,6 +419,8 @@ impl RuleCfg {
       Some(Scheme::Ldaps)
     } else if value.starts_with("ldap://") {
       Some(Scheme::Ldap)
+    } else if NatsUriScheme::of(value).is_some() {
+      Some(Scheme::Nats)
     } else {
       None
     }

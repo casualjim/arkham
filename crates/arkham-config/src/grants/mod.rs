@@ -1,16 +1,21 @@
 //! Grant model: a credential is one real secret, and a grant says what kind
 //! of endpoints that secret may be presented at. A rule is one kind, inferred
 //! from the URL schemes of its `allow` entries. The protocol verticals
-//! (`postgres`, `redis`, `smtp`, `ldap`) own their scope types and their connection-string
+//! (`postgres`, `redis`, `smtp`, `ldap`, `nats`) own their scope types and their connection-string
 //! laws; this module owns the enum, the matching dispatch, and the
 //! collection of rules into grants.
 
 mod ldap;
+mod nats;
 mod postgres;
 mod redis;
 mod smtp;
 
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
+pub(crate) use nats::NatsUriScheme;
+pub use nats::{
+  NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsPair, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
+};
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
 pub use smtp::{SmtpLeg, SmtpScope, SmtpUriError};
@@ -107,6 +112,9 @@ pub enum Scheme {
   Smtp,
   /// Implicit TLS SMTP from the first byte. Port defaults to 465.
   Smtps,
+  /// NATS, spelled `nats://` or `tls://` in a connection string. The real
+  /// string's spelling states the upstream TLS. Port defaults to 4222.
+  Nats,
 }
 
 impl Scheme {
@@ -125,6 +133,7 @@ impl Scheme {
       Self::Ssh => "ssh",
       Self::Smtp => "smtp",
       Self::Smtps => "smtps",
+      Self::Nats => "nats",
     }
   }
 
@@ -235,7 +244,7 @@ impl FromStr for EndpointScope {
       "https" => Scheme::Https,
       "tcp" => Scheme::Tcp,
       "ssh" => Scheme::Ssh,
-      "postgres" | "redis" | "rediss" | "smtp" | "smtps" | "ldap" | "ldaps" => {
+      "postgres" | "redis" | "rediss" | "smtp" | "smtps" | "ldap" | "ldaps" | "nats" | "tls" => {
         return Err(format!(
           "bad allow entry `{entry}`: database rules state no allow entries — the connection string is the grant"
         ));
@@ -277,6 +286,7 @@ impl FromStr for EndpointScope {
       (None, Scheme::Ssh) => 22,
       (None, Scheme::Smtp) => 587,
       (None, Scheme::Smtps) => 465,
+      (None, Scheme::Nats) => NATS_DEFAULT_PORT,
     };
     reject_endpoint_query(entry, &url)?;
     Ok(EndpointScope {
@@ -416,6 +426,14 @@ pub enum Grant {
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<LdapScope>,
   },
+  /// One NATS connection-string mapping: fake string to real, 1:1. The real
+  /// string's spelling states whether the upstream leg is TLS.
+  Nats {
+    /// The wire needles: the fake and real password or token.
+    credential: Credential,
+    /// The one scope this rule maps, carrying both legs' facts.
+    scope: Box<NatsScope>,
+  },
   /// One SSH identity mapping: the guest presents the decoy key, arkham
   /// presents the real key upstream. No wire substitution, so no credential.
   Ssh {
@@ -434,7 +452,8 @@ impl Grant {
       | Grant::Postgres { credential, .. }
       | Grant::Redis { credential, .. }
       | Grant::Smtp { credential, .. }
-      | Grant::Ldap { credential, .. } => Some(credential),
+      | Grant::Ldap { credential, .. }
+      | Grant::Nats { credential, .. } => Some(credential),
       Grant::Ssh { .. } => None,
     }
   }
@@ -448,6 +467,7 @@ impl Grant {
       Grant::Redis { scope, .. } => RedisScope::matches(scope, scheme, host, port),
       Grant::Smtp { scope, .. } => SmtpScope::matches(scope, scheme, host, port),
       Grant::Ldap { scope, .. } => LdapScope::matches(scope, scheme, host, port),
+      Grant::Nats { scope, .. } => NatsScope::matches(scope, scheme, host, port),
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }
@@ -504,6 +524,17 @@ impl Grant {
   #[must_use]
   pub fn ldap(&self, host: Option<&str>, port: u16) -> Option<&LdapScope> {
     let Grant::Ldap { scope, .. } = self else {
+      return None;
+    };
+    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+  }
+
+  /// The NATS scope whose downstream (guest-side) port and host cover a
+  /// destination, `host` optional as above: transparent capture knows the
+  /// port before it knows the host.
+  #[must_use]
+  pub fn nats(&self, host: Option<&str>, port: u16) -> Option<&NatsScope> {
+    let Grant::Nats { scope, .. } = self else {
       return None;
     };
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
@@ -620,6 +651,7 @@ impl GrantCollector {
       Scheme::Redis | Scheme::Rediss => redis::grant(label, rule, real.expose_secret()),
       Scheme::Smtp | Scheme::Smtps => smtp::grant(label, rule, real.expose_secret()),
       Scheme::Ldap | Scheme::Ldaps => ldap::grant(label, rule, real.expose_secret()),
+      Scheme::Nats => nats::grant(label, rule, real.expose_secret()),
       _ => {
         return Err(Error::ConnectionStringScheme {
           label: label.to_string(),
@@ -1132,6 +1164,73 @@ mod tests {
     };
     assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
     assert!(scope.is_downstream_tls);
+  }
+
+  #[test]
+  fn nats_grant_answers_for_the_nats_scheme_on_its_downstream_port() {
+    let grant = redis_grant_like(
+      "nats://agent:fake@nats.internal",                               // betterleaks:allow
+      "tls://agent:real@nats.upstream:4443?sslrootcert=/certs/ca.crt", // betterleaks:allow
+    );
+    assert!(grant.matches(Scheme::Nats, "NATS.internal", 4222));
+    assert!(!grant.matches(Scheme::Nats, "nats.internal", 4443));
+    assert!(!grant.matches(Scheme::Tcp, "nats.internal", 4222));
+    assert!(grant.nats(None, 4222).is_some());
+    assert!(grant.nats(Some("other.internal"), 4222).is_none());
+    assert!(grant.smtp(Some("nats.internal"), 4222).is_none());
+    let credential = grant.credential().expect("a nats grant swaps a credential");
+    assert_eq!((credential.fake.as_str(), credential.value.expose_secret()), ("fake", "real"));
+    let scope = grant.nats(Some("nats.internal"), 4222).expect("scope");
+    assert_eq!(scope.upstream.port, 4443);
+  }
+
+  #[test]
+  fn nats_tls_spelling_reaches_the_nats_vertical() {
+    let grant = redis_grant_like("tls://fake-token@nats.internal", "tls://real-token@nats.upstream");
+    let credential = grant.credential().expect("a nats grant swaps a credential");
+    assert_eq!(
+      (credential.fake.as_str(), credential.value.expose_secret()),
+      ("fake-token", "real-token")
+    );
+    assert!(grant.nats(Some("nats.internal"), NATS_DEFAULT_PORT).is_some());
+  }
+
+  #[test]
+  fn nats_spellings_are_not_endpoint_grants() {
+    for entry in ["nats://nats.internal:4222", "tls://nats.internal:4222"] {
+      let err = entry.parse::<EndpointScope>().unwrap_err();
+      assert!(err.contains("the connection string is the grant"), "{err}");
+    }
+  }
+
+  #[test]
+  fn nats_rule_table_states_only_the_guest_leg() {
+    let mut cfg = cfg_with_db(
+      "nats://agent:fake@nats.internal", // betterleaks:allow
+      "tls://agent:real@nats.upstream",  // betterleaks:allow
+    );
+    let entry = || HostTlsCfg {
+      client_cert: None,
+      client_key: None,
+      root_cert: None,
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: None,
+      guest_key: None,
+    };
+    let mut trust = entry();
+    trust.root_cert = Some(PathBuf::from("/certs/ca.crt"));
+    cfg.rules.get_mut("t").unwrap().tls = BTreeMap::from([("DATABASE_URL".to_string(), trust)]);
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("nats states upstream trust"), "{err}");
+    let mut identity = entry();
+    identity.client_cert = Some(PathBuf::from("/c.pem"));
+    identity.client_key = Some(PathBuf::from("/c.key"));
+    cfg.rules.get_mut("t").unwrap().tls = BTreeMap::from([("DATABASE_URL".to_string(), identity)]);
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("nats states the upstream identity"), "{err}");
+    cfg.rules.get_mut("t").unwrap().tls = BTreeMap::from([("DATABASE_URL".to_string(), entry())]);
+    let grant = resolve(&cfg).unwrap().grants.into_iter().next().unwrap();
+    assert_eq!(grant.nats(None, 4222).expect("scope").guest_tls, GuestTlsMode::Mtls);
   }
 
   #[test]
