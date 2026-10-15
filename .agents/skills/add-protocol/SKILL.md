@@ -35,7 +35,26 @@ Grant matching stays in `arkham-config`. Substitution stays in `arkham-proxy` (`
 
 10. **Capture.** nft, tun, and eBPF do not special-case a protocol port. The only special case is UDP/443 (QUIC). Leave this protocol's port out of those crates.
 
-11. **Tests.** Unit tests sit next to the machine and the grant parser. In-process tests go in `mod tests` in `crates/arkham-proxy/src/e2e.rs`, including a no-SNI case, as `redis_tls_without_sni_mints_for_the_grant_host` does. Property tests follow `crates/arkham-proxy/src/transports/engine/fuzz_props.rs`: invariants on valid framing, and no panic on arbitrary bytes. The compose scenario uses the official server image and a maintained client. `retry`'s first argument is the scheme; a scenario that covers none passes `""` and is not recorded. Gate the scenario on its env var so `integration/client/run.ts` still runs when that service is absent. `integration/bwrap/run.sh` does not run `run.ts`.
+11. **Tests.** Unit tests sit next to the machine and the grant parser. In-process tests go in `mod tests` in `crates/arkham-proxy/src/e2e.rs`, including a no-SNI case, as `redis_tls_without_sni_mints_for_the_grant_host` does. Property tests follow `crates/arkham-proxy/src/transports/engine/fuzz_props.rs` for arbitrary bytes, and `crates/arkham-proxy/src/transports/smtp/props.rs` for a generated session. Bound the case count. The same session fed whole, at arbitrary cuts, and one byte at a time must emit the same bytes. Guest-bound output must not contain the real secret. A reply cut at the old line cap must still leave the next server reply unread.
+
+```rust
+proptest! {
+  #![proptest_config(ProptestConfig::with_cases(32))]
+  #[test]
+  fn prop_chunks_match_and_hide_the_secret(
+    cuts in proptest::collection::vec(0usize..64, 0..4),
+  ) {
+    let whole = drive(&session, Feed::Whole);
+    let split = drive(&session, Feed::Cuts(&cuts));
+    let bytes = drive(&session, Feed::Bytes);
+    prop_assert_eq!(&whole.guest, &split.guest);
+    prop_assert_eq!(&whole.guest, &bytes.guest);
+    prop_assert!(!whole.guest.windows(real.len()).any(|window| window == real.as_bytes()));
+  }
+}
+```
+
+The compose scenario uses the official server image and a maintained client. `retry`'s first argument is the scheme; a scenario that covers none passes `""` and is not recorded. Gate the scenario on its env var so `integration/client/run.ts` still runs when that service is absent. `integration/bwrap/run.sh` does not run `run.ts`.
 
 12. **Docs.** Add a row to the protocol table in `README.md` and the scenario list in `integration/README.md`. Document the rule in `docs/user/reference/configuration.md` and add a fake rule to `integration/arkham.toml`. The existing `rust` jobs already run `mise run test:ssh` on x86_64 and ARM. Do not add a job per protocol.
 
