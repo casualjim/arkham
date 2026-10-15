@@ -26,8 +26,8 @@ use arkham_config::grants::{Credential, Grant, GuestTlsMode, Scheme, SmtpLeg, Sm
 use base64::Engine as _;
 use secrecy::SecretString;
 
-use crate::transports::nats::machine::Nats;
 use crate::transports::nats::machine::tests::nats_grants;
+use crate::transports::nats::machine::{MAX_COMMAND as NATS_MAX_COMMAND, Nats};
 use crate::transports::nats::server_info;
 use crate::transports::smtp::{GuestLeg, MAX_COMMAND, Smtp, acceptance_reply, plain_guest};
 
@@ -1709,6 +1709,35 @@ proptest! {
     prop_assert!(once.closed && split.closed && byte.closed, "a partial server frame stayed open at EOF");
     prop_assert_eq!(&once.out, &split.out);
     prop_assert_eq!(&once.out, &byte.out);
+  }
+
+  /// A CONNECT past the cap is forwarded byte-identical. One shot and the
+  /// random cuts each end with the empty EOF flush. A TLS leg does not swap
+  /// it, and the command after it keeps the session open. One byte at a time
+  /// stays in the unit tests: this line is longer than the cap, and walking
+  /// every byte for 256 cases would pass the slow-test deadline.
+  #[test]
+  fn prop_nats_oversize_connect_is_forwarded(
+    extra in 0usize..64,
+    lower in any::<bool>(),
+    cuts in proptest::collection::vec(any::<usize>(), 0..6),
+  ) {
+    let verb = if lower { "connect" } else { "CONNECT" };
+    let name = "b".repeat(NATS_MAX_COMMAND.saturating_add(extra));
+    let line = format!("{verb} {{\"verbose\":false,\"user\":\"agent\",\"pass\":\"{NATS_FAKE}\",\"name\":\"{name}\"}}\r\n");
+    prop_assert!(line.len() > NATS_MAX_COMMAND);
+    let mut data = line.into_bytes();
+    data.extend_from_slice(b"PING\r\n");
+    let scaled = nats_cuts(&cuts, &data);
+    for leg in [NatsLeg::DownSwap, NatsLeg::DownClear] {
+      let once = run_nats(leg, &data, &[]);
+      let split = run_nats(leg, &data, &scaled);
+      prop_assert!(!once.closed && !split.closed, "an oversize CONNECT closed the {leg:?} leg");
+      prop_assert_eq!(&once.out, &data);
+      prop_assert_eq!(&split.out, &data);
+      prop_assert_eq!(once.hits, 0);
+      prop_assert_eq!(split.hits, 0);
+    }
   }
 
   /// Crash resistance: arbitrary bytes, one cut, any leg, then EOF; and the

@@ -1,10 +1,16 @@
 //! NATS wire format: one [`Framer`] cuts both directions into command lines
 //! and counted payloads.
 //!
-//! Downstream, CONNECT is the only buffered command. When the server leg is
-//! already TLS, its `user`/`pass` or `auth_token` carry the real values, and
-//! only when every one of those fields holds the decoy. Every other byte,
+//! Downstream, CONNECT is buffered only while the server leg is TLS, so the
+//! swap can see every field. A cleartext leg forwards CONNECT as it arrives.
+//! Past [`MAX_COMMAND`] the bytes already held and the rest of that line go
+//! out untouched, and the session stays open. When the server leg is TLS,
+//! `user`/`pass` or `auth_token` carry the real values, and only when every
+//! one of those fields holds the decoy. `nkey`, `jwt`, and `sig` pass
+//! through and are still real secrets inside the agent. Every other byte,
 //! including PUB and HPUB payloads, streams as it arrives.
+//!
+//! No NATS parser crate is used: counted payloads must stream.
 //!
 //! Upstream, delimited lines (INFO, -ERR, +OK, PING, PONG) redact the real
 //! value back to the decoy. MSG and HMSG payloads are counted down and never
@@ -22,7 +28,8 @@ use crate::transports::engine::{
   CredentialPair, Direction, Hit, Location, Raw, Rewritten, Wire, eligible_pairs, find_new_match, max_tail_size, needle_prefix_suffix_len,
 };
 
-/// Longest CONNECT line the downstream leg buffers. A longer one closes.
+/// Longest CONNECT line a TLS downstream leg buffers before forwarding the
+/// rest of that line unchanged.
 pub(crate) const MAX_COMMAND: usize = 16 * 1024;
 
 /// The two bytes that must follow every counted payload.
@@ -323,8 +330,7 @@ impl Framer {
   }
 }
 
-/// The leg must close: a malformed frame, an oversized CONNECT, or the real
-/// value inside a payload.
+/// The leg must close: a malformed frame, or the real value inside a payload.
 #[derive(Debug)]
 struct CloseLeg;
 
@@ -359,6 +365,7 @@ impl Nats {
       framer: Framer::new(Side::Client),
       policy,
       connect: Vec::new(),
+      spilling: false,
     })
   }
 
@@ -467,8 +474,11 @@ fn swap_connect(line: &[u8], auth: &NatsAuth) -> Option<Vec<u8>> {
 pub(crate) struct Down {
   framer: Framer,
   policy: Policy,
-  /// CONNECT bytes so far. The line leaves whole once its LF arrives.
+  /// CONNECT bytes held for a swap. Empty unless [`Policy::Swap`] is still
+  /// under [`MAX_COMMAND`].
   connect: Vec<u8>,
+  /// This CONNECT line passed the cap. The rest of it is forwarded.
+  spilling: bool,
 }
 
 impl Down {
@@ -490,28 +500,45 @@ impl Down {
           framing: Framing::Credential,
           bytes,
           end,
-        }) => {
-          if self.connect.len().saturating_add(bytes.len()) > MAX_COMMAND {
-            return Err(CloseLeg);
-          }
-          self.connect.extend_from_slice(&bytes);
-          if end {
-            let line = std::mem::take(&mut self.connect);
-            match self.policy.swap(&line) {
-              Some((swapped, hit)) => {
-                out.extend_from_slice(&swapped);
-                hits.push(hit);
-              }
-              None => out.extend_from_slice(&line),
-            }
-          }
-        }
+        }) => self.credential(&bytes, end, &mut out, hits),
         Next::Piece(Piece::Line {
           framing: Framing::Counted | Framing::Line,
           bytes,
           ..
         }) => out.extend_from_slice(&bytes),
         Next::Piece(Piece::Body { bytes, .. }) => out.extend_from_slice(bytes),
+      }
+    }
+  }
+
+  /// One piece of a CONNECT line.
+  ///
+  /// A cleartext leg forwards the piece. A TLS leg holds it until the line
+  /// ends, unless the hold would pass [`MAX_COMMAND`]: then the bytes
+  /// already held and the rest of the line go out unchanged.
+  fn credential(&mut self, bytes: &[u8], end: bool, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
+    if self.spilling || matches!(self.policy, Policy::Forward) {
+      out.extend_from_slice(bytes);
+      if end {
+        self.spilling = false;
+      }
+      return;
+    }
+    if self.connect.len().saturating_add(bytes.len()) > MAX_COMMAND {
+      out.append(&mut self.connect);
+      out.extend_from_slice(bytes);
+      self.spilling = !end;
+      return;
+    }
+    self.connect.extend_from_slice(bytes);
+    if end {
+      let line = std::mem::take(&mut self.connect);
+      match self.policy.swap(&line) {
+        Some((swapped, hit)) => {
+          out.extend_from_slice(&swapped);
+          hits.push(hit);
+        }
+        None => out.extend_from_slice(&line),
       }
     }
   }
@@ -817,10 +844,61 @@ pub(crate) mod tests {
   }
 
   #[tokio::test]
-  async fn connect_longer_than_the_cap_closes() {
+  async fn connect_longer_than_the_cap_is_forwarded() {
     let grants = user_pass();
+    let name = "a".repeat(MAX_COMMAND);
+    let line = format!("CONNECT {{\"user\":\"agent\",\"pass\":\"{FAKE_PASS}\",\"name\":\"{name}\"}}\r\n");
+    let follow = user_connect("agent", FAKE_PASS);
+    let swapped = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
+    let input = format!("{line}{follow}");
     let mut machine = down(&grants, true);
-    let long = format!("CONNECT {{\"name\":\"{}\"", "a".repeat(MAX_COMMAND));
-    assert_eq!(feed(&mut machine, long.as_bytes()).await, (Out::Close, 0));
+    assert_eq!(feed(&mut machine, input.as_bytes()).await, (emit(&format!("{line}{swapped}")), 1));
+    let (head, tail) = line.split_at(32);
+    let mut machine = down(&grants, true);
+    assert_eq!(feed(&mut machine, head.as_bytes()).await, (Out::Hold, 0));
+    assert_eq!(
+      feed(&mut machine, format!("{tail}{follow}").as_bytes()).await,
+      (emit(&format!("{line}{swapped}")), 1)
+    );
+  }
+
+  #[tokio::test]
+  async fn oversize_connect_one_byte_at_a_time_is_forwarded() {
+    let grants = user_pass();
+    let name = "a".repeat(MAX_COMMAND);
+    let line = format!("CONNECT {{\"user\":\"agent\",\"pass\":\"{FAKE_PASS}\",\"name\":\"{name}\"}}\r\n");
+    let follow = user_connect("agent", FAKE_PASS);
+    let swapped = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
+    let input = format!("{line}{follow}");
+    let mut machine = down(&grants, true);
+    let mut out = String::new();
+    let mut hits = 0usize;
+    for byte in input.bytes() {
+      let (got, found) = feed(&mut machine, &[byte]).await;
+      assert_ne!(got, Out::Close);
+      hits = hits.saturating_add(found);
+      if let Out::Emit(emitted) = got {
+        out.push_str(&emitted);
+      }
+    }
+    let (tail, found) = feed(&mut machine, &[]).await;
+    assert_ne!(tail, Out::Close);
+    hits = hits.saturating_add(found);
+    if let Out::Emit(emitted) = tail {
+      out.push_str(&emitted);
+    }
+    assert_eq!(hits, 1);
+    assert_eq!(out, format!("{line}{swapped}"));
+  }
+
+  #[tokio::test]
+  async fn cleartext_connect_streams_without_buffering() {
+    let grants = user_pass();
+    let mut machine = down(&grants, false);
+    let partial = format!("CONNECT {{\"pass\":\"{FAKE_PASS}\"");
+    assert_eq!(feed(&mut machine, partial.as_bytes()).await, (emit(&partial), 0));
+    let mut machine = down(&grants, false);
+    let huge = format!("CONNECT {{\"name\":\"{}\"", "a".repeat(MAX_COMMAND));
+    assert_eq!(feed(&mut machine, huge.as_bytes()).await, (emit(&huge), 0));
   }
 }
