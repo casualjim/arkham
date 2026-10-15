@@ -29,7 +29,7 @@ use crate::transports::TlsHalves;
 use crate::transports::engine::{Direction, Rewritten, Wire};
 
 /// Guest socket, cleartext or terminated TLS.
-pub(super) enum GuestLeg<G> {
+pub(crate) enum GuestLeg<G> {
   /// Bytes still in the clear.
   Plain(G),
   /// TLS terminated with a leaf minted for the grant host.
@@ -426,7 +426,7 @@ where
 /// decide whether the line is final; the line itself is not kept. The
 /// returned code is that final line's status, for the `220` check. Bytes
 /// after the final line, including a handshake record, stay in `reader`.
-pub(super) async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<[u8; 3]>, Error>
+pub(crate) async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<[u8; 3]>, Error>
 where
   R: AsyncRead + Unpin,
   G: AsyncRead + AsyncWrite + Unpin,
@@ -548,7 +548,7 @@ fn is_220(code: [u8; 3]) -> bool {
 }
 
 /// Cleartext guest leg.
-pub(super) fn plain_guest<G>(stream: G) -> GuestLeg<G> {
+pub(crate) fn plain_guest<G>(stream: G) -> GuestLeg<G> {
   GuestLeg::Plain(stream)
 }
 

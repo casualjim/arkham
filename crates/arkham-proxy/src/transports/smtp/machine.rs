@@ -31,7 +31,7 @@ use crate::transports::engine::{Direction, Hit, Location, Raw, Rewritten, Wire};
 
 /// Cap for one buffered AUTH line. A real AUTH command is a few kilobytes;
 /// anything past this is a drip or an attack, never an auth command.
-pub(super) const MAX_COMMAND: usize = 16_384;
+pub(crate) const MAX_COMMAND: usize = 16_384;
 
 /// Local reply when the upstream leg is already TLS and the guest asks for
 /// `STARTTLS`. The command is not written into that encrypted leg.

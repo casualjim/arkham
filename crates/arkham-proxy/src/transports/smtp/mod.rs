@@ -7,9 +7,12 @@
 //! verify the chain and the host name.
 
 mod machine;
-#[cfg(test)]
-mod props;
 mod session;
+
+#[cfg(test)]
+pub(crate) use machine::{MAX_COMMAND, Smtp};
+#[cfg(test)]
+pub(crate) use session::{GuestLeg, acceptance_reply, plain_guest};
 
 use std::sync::Arc;
 use std::time::Duration;
