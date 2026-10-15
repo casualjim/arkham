@@ -7,6 +7,8 @@
 //! verify the chain and the host name.
 
 mod machine;
+#[cfg(test)]
+mod props;
 mod session;
 
 use std::sync::Arc;

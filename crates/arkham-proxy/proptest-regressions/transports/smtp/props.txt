@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6d14f18d9cf820b83d24b9b308e9c2e8ee00e12564cc9912d5ea6ebd2fe5f7ab # shrinks to mech = Plain, inline = false, fake_chars = ['a', 'a', 'a', 'a', 'a', 'a'], real_chars = ['b', 'f', 'r', 'y', 'f', 'h', 's', 'r', 'i', 'k', 'j', 'x', 'b', 'g', 'p', 't'], body_len = 5, bdat_len = 1, multiline_354 = true, cuts = [436, 461, 70]

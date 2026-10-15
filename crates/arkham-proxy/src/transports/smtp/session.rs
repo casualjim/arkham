@@ -426,7 +426,7 @@ where
 /// decide whether the line is final; the line itself is not kept. The
 /// returned code is that final line's status, for the `220` check. Bytes
 /// after the final line, including a handshake record, stay in `reader`.
-async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<[u8; 3]>, Error>
+pub(super) async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<[u8; 3]>, Error>
 where
   R: AsyncRead + Unpin,
   G: AsyncRead + AsyncWrite + Unpin,
