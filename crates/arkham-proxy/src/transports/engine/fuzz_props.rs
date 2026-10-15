@@ -5,9 +5,9 @@
 //! - **Invariants** (valid framing, adversarial splits): a token split
 //!   across any arrival boundary must recombine and substitute whole;
 //!   fixed-length bodies must not drift; chunked output must re-parse.
-//!   LDAP uses the same cut loop at 32 cases: one shot, random cuts, and
-//!   one byte at a time must match, and the real password must stay off
-//!   the guest-bound leg.
+//!   LDAP uses the same cut loop at 256 cases: one shot, random cuts, and
+//!   one byte at a time must match, the real password must stay off the
+//!   guest-bound leg, and every run ends with the empty EOF flush.
 //! - **Crash resistance** (arbitrary bytes): no input, arrival split, or
 //!   pipelining combination may panic or hang.
 //!
@@ -1085,11 +1085,11 @@ struct LdapFed {
   starttls: Option<bool>,
 }
 
-/// Drain an LDAP cursor the way [`run_split`] drains HTTP, without the EOF feed.
+/// Drain an LDAP cursor the way [`run_split`] drains HTTP, then one empty EOF flush.
 ///
-/// HTTP flushes a close-delimited body on empty input. An LDAP message
-/// releases its needle suffix when the frame ends. An EOF flush would hide
-/// a suffix that the finished message never emitted.
+/// A finished message already released a held needle suffix. EOF still runs
+/// `finish`: it emits a suffix that release left behind, and it closes a
+/// partial message.
 fn run_ldap(mut machine: Ldap, data: &[u8], splits: &[usize]) -> LdapFed {
   let mut out = Vec::new();
   let mut closed = false;
@@ -1104,6 +1104,12 @@ fn run_ldap(mut machine: Ldap, data: &[u8], splits: &[usize]) -> LdapFed {
       }
       prev = cut;
     }
+  }
+  let (rewritten, _) = block_on(machine.feed(&[]));
+  match rewritten {
+    Rewritten::Emit(bytes) => out.extend_from_slice(&bytes),
+    Rewritten::Hold => {}
+    Rewritten::Close => closed = true,
   }
   LdapFed {
     out,
@@ -1259,6 +1265,21 @@ fn ldap_secret_frame(place: &LdapSecret) -> Vec<u8> {
   }
 }
 
+/// A proper prefix of an accepted frame is not idle. EOF must close it, and
+/// every cut must agree on the bytes emitted before that close.
+fn ldap_truncated_closes_alike(machine: impl Fn() -> Ldap, data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
+  let once = run_ldap(machine(), data, &[]);
+  let split = run_ldap(machine(), data, cuts);
+  let byte_cuts: Vec<usize> = (1..data.len()).collect();
+  let byte = run_ldap(machine(), data, &byte_cuts);
+  prop_assert!(once.closed);
+  prop_assert_eq!(once.closed, split.closed);
+  prop_assert_eq!(once.closed, byte.closed);
+  prop_assert_eq!(&once.out, &split.out);
+  prop_assert_eq!(&once.out, &byte.out);
+  Ok(())
+}
+
 fn ldap_hides_real(data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
   let once = run_ldap(ldap_leg(LdapLeg::Up), data, &[]);
   let split = run_ldap(ldap_leg(LdapLeg::Up), data, cuts);
@@ -1270,8 +1291,35 @@ fn ldap_hides_real(data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
   Ok(())
 }
 
+#[test]
+fn ldap_truncated_prefix_closes_on_eof_for_every_cut() {
+  let frame = ldap_bind_response(1, "invalid");
+  let prefix = &frame[..frame.len() - 1];
+  let once = run_ldap(ldap_leg(LdapLeg::Up), prefix, &[]);
+  assert!(once.closed, "a partial LDAP message must close on EOF");
+  let byte_cuts: Vec<usize> = (1..prefix.len()).collect();
+  let byte = run_ldap(ldap_leg(LdapLeg::Up), prefix, &byte_cuts);
+  assert_eq!(once.closed, byte.closed);
+  assert_eq!(once.out, byte.out);
+}
+
 proptest! {
-  #![proptest_config(ProptestConfig::with_cases(32))]
+  #![proptest_config(ProptestConfig::with_cases(256))]
+
+  /// A prefix of an accepted frame closes on EOF, the same way for every cut.
+  #[test]
+  fn prop_ldap_truncated_prefix_closes_alike(
+    leg in prop_oneof![Just(LdapLeg::DownSwap), Just(LdapLeg::DownClear), Just(LdapLeg::Up)],
+    frame in ldap_safe_message(),
+    keep in any::<usize>(),
+    cuts in proptest::collection::vec(any::<usize>(), 0..6),
+  ) {
+    prop_assume!(frame.len() > 1);
+    let end = 1 + (keep % (frame.len() - 1));
+    let prefix = &frame[..end];
+    let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % prefix.len().max(1)).collect();
+    ldap_truncated_closes_alike(|| ldap_leg(leg), prefix, &scaled)?;
+  }
 
   /// Any cut of one accepted LDAP stream, including one byte at a time, matches one shot.
   #[test]
@@ -1361,5 +1409,15 @@ proptest! {
         prop_assert_eq!(&byte.out, &frame);
       }
     }
+  }
+
+  /// Crash resistance: arbitrary bytes, one cut, either leg, then EOF.
+  #[test]
+  fn prop_ldap_arbitrary_no_panic(
+    data in proptest::collection::vec(any::<u8>(), 0..1024),
+    cut in 0usize..1024,
+    leg in prop_oneof![Just(LdapLeg::DownSwap), Just(LdapLeg::DownClear), Just(LdapLeg::Up)],
+  ) {
+    let _ = run_ldap(ldap_leg(leg), &data, &[cut.min(data.len())]);
   }
 }
