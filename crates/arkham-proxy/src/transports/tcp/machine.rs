@@ -70,20 +70,25 @@ impl Wire for Raw {
         })
     });
     if !hit {
-      let hold = if self.held.is_empty() {
-        needle_prefix_suffix_len(chunk, &self.pairs, self.tail_size)
-      } else {
-        let bound = self.tail_size.min(chunk.len());
-        let mut window = std::mem::take(&mut self.held);
-        window.extend_from_slice(&chunk[..bound]);
-        needle_prefix_suffix_len(&window, &self.pairs, self.tail_size)
-      };
-      let emit_len = chunk.len().saturating_sub(hold);
-      let out = Cow::Borrowed(&chunk[..emit_len]);
-      if hold > 0 {
-        self.held = chunk[emit_len..].to_vec();
+      if self.held.is_empty() {
+        let hold = needle_prefix_suffix_len(chunk, &self.pairs, self.tail_size);
+        let emit_len = chunk.len().saturating_sub(hold);
+        if hold > 0 {
+          self.held = chunk[emit_len..].to_vec();
+        }
+        let out = Cow::Borrowed(&chunk[..emit_len]);
+        return std::future::ready((Rewritten::Emit(out), Vec::new()));
       }
-      return std::future::ready((Rewritten::Emit(out), Vec::new()));
+      // The previous chunk ended on a needle prefix. This chunk does not
+      // finish it, so those bytes are emitted ahead of the chunk. The new
+      // hold-back is a suffix of the combined bytes, at most the longest
+      // needle minus one.
+      let mut combined = std::mem::take(&mut self.held);
+      combined.extend_from_slice(chunk);
+      let hold = needle_prefix_suffix_len(&combined, &self.pairs, self.tail_size);
+      let emit_len = combined.len().saturating_sub(hold);
+      self.held = combined.split_off(emit_len);
+      return std::future::ready((Rewritten::Emit(Cow::Owned(combined)), Vec::new()));
     }
     let mut combined = std::mem::take(&mut self.held);
     combined.extend_from_slice(chunk);
@@ -269,5 +274,45 @@ mod tests {
     };
     assert_eq!(out.as_ref(), b"ok FAKE1234\n");
     assert_eq!(hits.len(), 1);
+  }
+
+  /// A chunk that ends on a needle prefix holds those bytes. The next
+  /// chunk, which does not complete the needle, must emit them. The
+  /// hold-back stays a suffix no longer than the needle minus one.
+  #[tokio::test]
+  async fn held_prefix_is_emitted_when_the_next_chunk_misses() {
+    const NEEDLE: &str = "real-smtp-pass-extended"; // betterleaks:allow
+    const REPLACEMENT: &str = "fake-smtp-pass"; // betterleaks:allow
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "smtp".into(),
+        fake: REPLACEMENT.into(),
+        value: secrecy::SecretString::from(NEEDLE),
+      },
+      allow: vec!["tcp://10.0.0.8:5432".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
+    }];
+    let mut raw = Raw::length_changing(&grants, Scheme::Tcp, "10.0.0.8", 5432, Direction::Upstream);
+    let first = format!("535 {}", &NEEDLE[..5]);
+    let second = format!(" missed {}", &NEEDLE[..2]);
+    let (head, head_hits) = match raw.feed(first.as_bytes()).await {
+      (Rewritten::Emit(bytes), hits) => (bytes.into_owned(), hits),
+      _ => unreachable!("expected emit"),
+    };
+    let (tail, tail_hits) = match raw.feed(second.as_bytes()).await {
+      (Rewritten::Emit(bytes), hits) => (bytes.into_owned(), hits),
+      _ => unreachable!("expected emit"),
+    };
+    let (flush, _) = match raw.feed(&[]).await {
+      (Rewritten::Emit(bytes), hits) => (bytes.into_owned(), hits),
+      _ => unreachable!("expected emit"),
+    };
+    assert_eq!(head, b"535 ");
+    assert_eq!(tail, b"real- missed ");
+    assert_eq!(flush, b"re");
+    assert!(head_hits.is_empty(), "an unfinished prefix is not a hit");
+    assert!(tail_hits.is_empty(), "a miss must not consume the held prefix");
+    assert!(flush.len() <= NEEDLE.len().saturating_sub(1));
   }
 }
