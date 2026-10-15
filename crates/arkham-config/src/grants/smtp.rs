@@ -133,6 +133,18 @@ pub enum SmtpUriError {
   /// `sslcert` and `sslkey` were not paired.
   #[error("bad connection string: sslcert and sslkey come together")]
   CertKeyPair,
+  /// The fake string carried an option that only the real string may set.
+  #[error("bad connection string: `{key}` belongs on the real connection string")]
+  FakeRealOnly {
+    /// `starttls`, or a trust or identity key.
+    key: String,
+  },
+  /// The fake string carried a query key it does not accept.
+  #[error("bad connection string: the fake connection string does not accept `{key}`")]
+  FakeUnknown {
+    /// The rejected key.
+    key: String,
+  },
 }
 
 /// One parsed `smtp://` or `smtps://` string.
@@ -234,6 +246,23 @@ struct SmtpTls {
   client_key: Option<PathBuf>,
 }
 
+/// Query keys that state transport, trust, or identity. They belong on
+/// the real string. `starttls` is consumed before it reaches `query`.
+const REAL_ONLY_QUERY: &[&str] = &["sslmode", "ssl", "sslnegotiation", "sslrootcert", "sslcert", "sslkey"];
+
+fn reject_fake_query(uri: &SmtpUri) -> Result<(), SmtpUriError> {
+  if uri.starttls_required {
+    return Err(SmtpUriError::FakeRealOnly { key: "starttls".into() });
+  }
+  let Some((key, _)) = uri.query.first() else {
+    return Ok(());
+  };
+  if REAL_ONLY_QUERY.contains(&key.as_str()) {
+    return Err(SmtpUriError::FakeRealOnly { key: key.clone() });
+  }
+  Err(SmtpUriError::FakeUnknown { key: key.clone() })
+}
+
 fn smtp_tls(tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
   let mut root_cert = None;
   let mut client_cert = None;
@@ -295,11 +324,14 @@ impl SmtpScope {
   ///
   /// # Errors
   ///
-  /// Either string is not an `smtp://` or `smtps://` connection string, or
-  /// its query breaks the law above.
+  /// Either string is not an `smtp://` or `smtps://` connection string, the
+  /// fake string has a query, or the real string's query breaks the law above.
+  /// The guest's TLS mode comes from the rule `tls` table, so the fake
+  /// string takes no query options.
   pub fn from_strings(fake: &str, real: &str) -> Result<Self, SmtpUriError> {
     let downstream = fake.parse::<SmtpUri>()?;
     let upstream = real.parse::<SmtpUri>()?;
+    reject_fake_query(&downstream)?;
     let upstream_tls = upstream.scheme == Scheme::Smtps || upstream.starttls_required;
     let SmtpTls {
       root_cert,
@@ -421,6 +453,25 @@ mod tests {
         source: SmtpScope::from_strings(&fake, &real).expect_err("rejected string"),
       };
       assert_hides(&real, &wrapped.to_string(), problem);
+    }
+  }
+
+  #[test]
+  fn fake_query_rejects_real_only_and_unknown_options() {
+    let real = format!("smtp://{USER}:{PASS}@mail.internal:587");
+    let cases = [
+      (format!("smtp://{USER}:{PASS}@mail.internal:587?starttls=required"), "starttls"),
+      (format!("smtp://{USER}:{PASS}@mail.internal:587?sslmode=require"), "sslmode"),
+      (format!("smtp://{USER}:{PASS}@mail.internal:587?sslrootcert=/ca.pem"), "sslrootcert"),
+      (format!("smtps://{USER}:{PASS}@mail.internal:465?sslcert=/c.pem"), "sslcert"),
+      (format!("smtp://{USER}:{PASS}@mail.internal:587?foo=1"), "foo"),
+    ];
+    for (fake, key) in cases {
+      let err = SmtpScope::from_strings(&fake, &real).expect_err("fake query");
+      let text = err.to_string();
+      assert_hides(&fake, &text, key);
+      assert_hides(&real, &text, key);
+      assert!(!text.contains("smtp://"), "{text}");
     }
   }
 
