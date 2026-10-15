@@ -206,7 +206,7 @@ impl NatsTransport {
     let upstream = &open.scope.upstream;
     let mut tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
     let (down, mut up) = open.pair(trust.is_some());
-    let Some(rest) = within(open.budget, server_info(&mut tcp, &mut up, &mut guest)).await? else {
+    let Some(rest) = server_info(&mut tcp, &mut up, &mut guest).await? else {
       return Ok(());
     };
     if let Some(trust) = trust {
@@ -263,7 +263,7 @@ impl NatsTransport {
       mut down,
       mut up,
     } = server;
-    let Some(head) = guest_head(&mut guest, initial, open.budget).await? else {
+    let Some(head) = guest_head(&mut guest, initial).await? else {
       return Ok(());
     };
     if head.first() != Some(&TLS_RECORD_HANDSHAKE) {
@@ -325,8 +325,8 @@ where
 }
 
 /// The guest's first bytes after INFO: the ingress replay, or one read.
-/// `None` when the guest closes or stays silent past the budget.
-async fn guest_head<G>(guest: &mut G, initial: &[u8], budget: Duration) -> Result<Option<Vec<u8>>, Error>
+/// `None` when the guest closes. A slow guest is not cut off.
+async fn guest_head<G>(guest: &mut G, initial: &[u8]) -> Result<Option<Vec<u8>>, Error>
 where
   G: AsyncRead + Unpin,
 {
@@ -334,11 +334,7 @@ where
     return Ok(Some(initial.to_vec()));
   }
   let mut buf = vec![0u8; OPENING_READ];
-  let Ok(read) = tokio::time::timeout(budget, guest.read(&mut buf)).await else {
-    tracing::debug!("nats guest sent nothing after INFO; closing");
-    return Ok(None);
-  };
-  let n = read_count(read).map_err(|source| Error::GuestRead { source })?;
+  let n = read_count(guest.read(&mut buf).await).map_err(|source| Error::GuestRead { source })?;
   if n == 0 {
     return Ok(None);
   }
