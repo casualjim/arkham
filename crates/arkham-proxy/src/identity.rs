@@ -73,8 +73,6 @@ pub(crate) enum Expect<'a> {
   /// A `nats://` or `tls://` scope: NATS framing after a cleartext INFO, or
   /// TLS first when the real string asks for `handshake_first`.
   Nats(&'a NatsScope),
-  /// An `amqp://` or `amqps://` scope: AMQP 0-9-1 or 1.0 framing, each
-  /// string stating its own leg's transport.
   Amqp(&'a AmqpScope),
   /// An `ssh://` scope: the guest leg terminates here against a decoy key.
   Ssh(&'a SshScope),
@@ -180,7 +178,6 @@ impl<'a> Expect<'a> {
       Expect::Ldap(scope) => state.ldap.serve(ServeStream { guest, params, scope }).await,
       // Declared NATS: INFO stays cleartext unless the real string asks for TLS first.
       Expect::Nats(scope) => state.nats.serve(ServeStream { guest, params, scope }).await,
-      // Declared AMQP: a TLS leg settles first; there is no in-band upgrade.
       Expect::Amqp(scope) => state.amqp.serve(ServeStream { guest, params, scope }).await,
       // Declared ssh: the guest leg terminates here against a decoy key.
       Expect::Ssh(scope) => state.ssh.serve(ServeStream { guest, params, scope }).await,
