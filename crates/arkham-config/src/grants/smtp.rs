@@ -246,9 +246,43 @@ struct SmtpTls {
   client_key: Option<PathBuf>,
 }
 
-/// Query keys that state transport, trust, or identity. They belong on
-/// the real string. `starttls` is consumed before it reaches `query`.
-const REAL_ONLY_QUERY: &[&str] = &["sslmode", "ssl", "sslnegotiation", "sslrootcert", "sslcert", "sslkey"];
+/// A query key the real string may carry. `starttls` is consumed before
+/// the query list, so it is not a variant. Both the fake-string check and
+/// `smtp_tls` match this enum, so a new key has one place to land.
+#[derive(Clone, Copy)]
+enum SmtpQuery {
+  SslMode,
+  Ssl,
+  SslNegotiation,
+  SslRootCert,
+  SslCert,
+  SslKey,
+}
+
+impl SmtpQuery {
+  fn parse(key: &str) -> Option<Self> {
+    Some(match key {
+      "sslmode" => Self::SslMode,
+      "ssl" => Self::Ssl,
+      "sslnegotiation" => Self::SslNegotiation,
+      "sslrootcert" => Self::SslRootCert,
+      "sslcert" => Self::SslCert,
+      "sslkey" => Self::SslKey,
+      _ => return None,
+    })
+  }
+
+  fn as_str(self) -> &'static str {
+    match self {
+      Self::SslMode => "sslmode",
+      Self::Ssl => "ssl",
+      Self::SslNegotiation => "sslnegotiation",
+      Self::SslRootCert => "sslrootcert",
+      Self::SslCert => "sslcert",
+      Self::SslKey => "sslkey",
+    }
+  }
+}
 
 fn reject_fake_query(uri: &SmtpUri) -> Result<(), SmtpUriError> {
   if uri.starttls_required {
@@ -257,7 +291,7 @@ fn reject_fake_query(uri: &SmtpUri) -> Result<(), SmtpUriError> {
   let Some((key, _)) = uri.query.first() else {
     return Ok(());
   };
-  if REAL_ONLY_QUERY.contains(&key.as_str()) {
+  if SmtpQuery::parse(key).is_some() {
     return Err(SmtpUriError::FakeRealOnly { key: key.clone() });
   }
   Err(SmtpUriError::FakeUnknown { key: key.clone() })
@@ -268,13 +302,14 @@ fn smtp_tls(tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
   let mut client_cert = None;
   let mut client_key = None;
   for (key, value) in &uri.query {
-    let tls_material = match key.as_str() {
-      "sslmode" | "ssl" | "sslnegotiation" => {
+    let tls_material = match SmtpQuery::parse(key) {
+      None => return Err(SmtpUriError::UnknownQuery { key: key.clone() }),
+      Some(SmtpQuery::SslMode | SmtpQuery::Ssl | SmtpQuery::SslNegotiation) => {
         return Err(SmtpUriError::TransportQuery { key: key.clone() });
       }
-      "sslrootcert" => {
+      Some(query @ SmtpQuery::SslRootCert) => {
         if value.is_empty() {
-          return Err(SmtpUriError::EmptyMaterial { key: "sslrootcert" });
+          return Err(SmtpUriError::EmptyMaterial { key: query.as_str() });
         }
         Some(if value == "system" {
           RootCert::System
@@ -282,21 +317,20 @@ fn smtp_tls(tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
           RootCert::Path(PathBuf::from(value))
         })
       }
-      "sslcert" => {
+      Some(query @ SmtpQuery::SslCert) => {
         if value.is_empty() {
-          return Err(SmtpUriError::EmptyMaterial { key: "sslcert" });
+          return Err(SmtpUriError::EmptyMaterial { key: query.as_str() });
         }
         client_cert = Some(PathBuf::from(value));
         None
       }
-      "sslkey" => {
+      Some(query @ SmtpQuery::SslKey) => {
         if value.is_empty() {
-          return Err(SmtpUriError::EmptyMaterial { key: "sslkey" });
+          return Err(SmtpUriError::EmptyMaterial { key: query.as_str() });
         }
         client_key = Some(PathBuf::from(value));
         None
       }
-      _ => return Err(SmtpUriError::UnknownQuery { key: key.clone() }),
     };
     if let Some(root) = tls_material {
       if !tls_leg {
