@@ -14,6 +14,10 @@
 use proptest::prelude::*;
 
 use std::io::Cursor;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, ReadBuf};
 
 use arkham_config::grants::{Credential, Grant, GuestTlsMode, Scheme, SmtpLeg, SmtpScope};
 use base64::Engine as _;
@@ -817,7 +821,52 @@ struct SmtpOpening {
   rest: Vec<u8>,
 }
 
-fn smtp_read_opening(up: &mut Smtp, reader: &mut Cursor<Vec<u8>>, lead: &[u8]) -> Result<SmtpOpening, crate::Error> {
+/// One reply stream. `cuts` are the interior offsets the property chose.
+/// Polls still return the whole buffer, the same as `Cursor`, so a cut
+/// does not pend.
+struct CutPend {
+  data: Vec<u8>,
+  cuts: Vec<usize>,
+  at: usize,
+  reads: usize,
+  pends: usize,
+}
+
+impl CutPend {
+  fn new(data: Vec<u8>, cuts: &[usize]) -> Self {
+    let mut cuts: Vec<usize> = cuts.iter().copied().filter(|cut| *cut > 0 && *cut < data.len()).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    Self {
+      data,
+      cuts,
+      at: 0,
+      reads: 0,
+      pends: 0,
+    }
+  }
+}
+
+impl AsyncRead for CutPend {
+  fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    let Some(rest) = self.data.get(self.at..) else {
+      return Poll::Ready(Ok(()));
+    };
+    if rest.is_empty() || buf.remaining() == 0 {
+      return Poll::Ready(Ok(()));
+    }
+    let n = rest.len().min(buf.remaining());
+    let Some(chunk) = rest.get(..n) else {
+      return Poll::Ready(Ok(()));
+    };
+    buf.put_slice(chunk);
+    self.at = self.at.saturating_add(n);
+    self.reads = self.reads.saturating_add(1);
+    Poll::Ready(Ok(()))
+  }
+}
+
+fn smtp_read_opening(up: &mut Smtp, reader: &mut CutPend, lead: &[u8]) -> Result<SmtpOpening, crate::Error> {
   block_on(async {
     let mut guest = plain_guest(Cursor::new(Vec::new()));
     let done = acceptance_reply(reader, up, &mut guest, lead).await?;
@@ -932,13 +981,21 @@ proptest! {
 
     let mut stream = greet.clone();
     stream.extend_from_slice(b"250 ok\r\n");
-    let mut cursor = Cursor::new(stream);
-    let first = smtp_read_opening(&mut up, &mut cursor, &[]).expect("greeting");
+    let mut reader = CutPend::new(stream, &cuts);
+    let first = smtp_read_opening(&mut up, &mut reader, &[]).expect("greeting");
+    prop_assert!(!reader.cuts.is_empty(), "the greeting had no interior cut");
+    prop_assert!(
+      reader.pends >= 1,
+      "reply reader pends {}, reads {}",
+      reader.pends,
+      reader.reads
+    );
     prop_assert_eq!(first.code, Some(*b"220"), "the final line decides the opening");
     prop_assert!(!first.guest.windows(6).any(|window| window == b"250 ok"), "the next reply was written with the greeting");
     prop_assert!(!first.guest.windows(real.len()).any(|window| window == real.as_bytes()), "guest saw the real password");
     prop_assert!(first.guest.windows(fake.len()).any(|window| window == fake.as_bytes()), "guest missed the decoy");
-    let second = smtp_read_opening(&mut up, &mut cursor, &first.rest).expect("next reply");
+    prop_assert_eq!(&first.guest, &whole, "reader chunks diverged from one feed");
+    let second = smtp_read_opening(&mut up, &mut reader, &first.rest).expect("next reply");
     prop_assert_eq!(second.code, Some(*b"250"), "the following reply was no longer in sync");
     prop_assert!(second.guest.windows(6).any(|window| window == b"250 ok"), "the following reply was dropped");
 
