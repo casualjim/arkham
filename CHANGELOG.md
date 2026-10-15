@@ -1,3 +1,9 @@
+## [0.3.18] - 2026-10-15
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.18 [ci skip]
+- Release
 ## [0.3.17] - 2026-10-14
 
 ### ⚙️ Miscellaneous Tasks
