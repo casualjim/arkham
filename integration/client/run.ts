@@ -531,8 +531,12 @@ if (SMTPS_URL) {
   await retry("smtps", "smtps implicit TLS AUTH PLAIN swaps the password", async () => {
     const out = await runSmtp("smtps", SMTPS_URL);
     stage(out.trim());
+    const authed = out.includes("plain ok") && out.includes("wrong refused") && out.includes("smtps ok") && !out.includes("arkham_real_smtp_pass");
+    if (!SMTP_URL) {
+      return authed;
+    }
     const direct = await readFile("/out/smtp-direct.txt", "utf8").catch(() => "");
-    return direct.includes("decoy refused 465") && out.includes("plain ok") && out.includes("wrong refused") && out.includes("smtps ok") && !out.includes("arkham_real_smtp_pass");
+    return authed && direct.includes("decoy refused 465");
   });
 } else {
   stage("smtps scenarios skipped: no SMTPS_URL");
