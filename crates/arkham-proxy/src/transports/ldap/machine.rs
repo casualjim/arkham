@@ -5,8 +5,11 @@
 //! until the simple password, and an extended operation only until the
 //! `StartTLS` OID or the result code and diagnostic. Everything after that
 //! is forwarded as it arrives, including a body whose header announced a
-//! huge length. A cleartext upstream keeps the decoy. A diagnostic that
-//! still carries the real password closes the leg.
+//! huge length. A message id wider than four bytes is forwarded and counted
+//! down; its body is not peeked. The upstream needle suffix is released when
+//! the message ends, because that frame cannot grow. A cleartext upstream
+//! keeps the decoy. A diagnostic that still carries the real password closes
+//! the leg.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -50,8 +53,10 @@ pub(crate) struct Ldap {
   starttls: Option<u32>,
   /// Bytes that followed that request. They are the handshake, not more LDAP.
   prefix: Vec<u8>,
-  /// `Some` once the extended response for [`Self::expect_starttls`] arrives.
+  /// `Some` once the extended response for [`Self::expect_starttls`] is complete.
   starttls_ok: Option<bool>,
+  /// Result already parsed, waiting until that message is back at [`Phase::Head`].
+  pending_starttls: Option<bool>,
   /// Upstream needle hold-back. Same window [`Raw`] keeps, not a frame buffer.
   held: Vec<u8>,
   closed: bool,
@@ -238,6 +243,7 @@ impl Ldap {
       starttls: None,
       prefix: Vec::new(),
       starttls_ok: None,
+      pending_starttls: None,
       held: Vec::new(),
       closed: false,
     }
@@ -261,6 +267,9 @@ impl Ldap {
   }
 
   /// `Some(true)` when the expected `StartTLS` response succeeded.
+  ///
+  /// The value appears only once that response is complete. A split success
+  /// stays pending through `responseName` so the caller keeps reading.
   pub(crate) fn take_starttls_result(&mut self) -> Option<bool> {
     self.starttls_ok.take()
   }
@@ -430,9 +439,12 @@ impl Ldap {
 
   /// Classify the message id and `protocolOp`. A non-integer body closes
   /// downstream and is forwarded upstream: search results are not buffered.
+  /// An id wider than four bytes is not a message this cursor rewrites, so
+  /// both directions forward it and count the body down.
   fn classify(&mut self, peek: &mut Peek) -> Result<ClassAct, ()> {
     let class = match classify_op(&peek.buf, peek.header)? {
       Classified::Need(need) => return Ok(ClassAct::Need(need)),
+      Classified::Wide => return Ok(ClassAct::Forward),
       Classified::NotInteger => {
         if self.down.is_some() {
           return Err(());
@@ -506,7 +518,7 @@ impl Ldap {
           self.prefix = input.to_vec();
           *input = &[];
           self.starttls = Some(id);
-          self.phase = Phase::Head(Vec::new());
+          self.phase = self.finish_message(out);
         } else {
           self.phase = Phase::Tail { left: peek.left, id };
         }
@@ -529,7 +541,8 @@ impl Ldap {
       ResultParse::Ready(cut) => {
         if cut.extended && up.expect_id == Some(cut.id) {
           let ok = result_ok(&peek.buf, &cut)?;
-          self.starttls_ok = Some(ok);
+          // `responseName` may still be unread. Publish once the message ends.
+          self.pending_starttls = Some(ok);
           if let Some(up) = self.up.as_mut() {
             up.expect_id = None;
           }
@@ -573,10 +586,20 @@ impl Ldap {
     *input = input.get(n..).unwrap_or_default();
     left = left.saturating_sub(n);
     if left == 0 {
-      Ok(Phase::Head(Vec::new()))
+      Ok(self.finish_message(out))
     } else {
       Ok(Phase::Forward(left))
     }
+  }
+
+  /// The current message is complete. Publish a pending `StartTLS` result and
+  /// release the needle suffix: LDAP framing says this frame cannot grow.
+  fn finish_message(&mut self, out: &mut Vec<u8>) -> Phase {
+    if let Some(ok) = self.pending_starttls.take() {
+      self.starttls_ok = Some(ok);
+    }
+    out.extend(std::mem::take(&mut self.held));
+    Phase::Head(Vec::new())
   }
 
   /// Finish a `StartTLS` message, then park the handshake bytes.
@@ -593,7 +616,7 @@ impl Ldap {
       self.prefix = input.to_vec();
       *input = &[];
       self.starttls = Some(id);
-      self.phase = Phase::Head(Vec::new());
+      self.phase = self.finish_message(out);
     } else {
       self.phase = Phase::Tail { left, id };
     }
@@ -687,6 +710,8 @@ enum Classified {
   Need(usize),
   /// The first content tag is not an `INTEGER`.
   NotInteger,
+  /// The message id is wider than four bytes. Forward it; do not peek the body.
+  Wide,
   Op(Class),
 }
 
@@ -703,6 +728,10 @@ fn classify_op(buf: &[u8], header: usize) -> Result<Classified, ()> {
   };
   if id.tag != 0x02 {
     return Ok(Classified::NotInteger);
+  }
+  // Wider than a `u32`. The body is not requested: `Forward` counts it down.
+  if id.content_len > 4 {
+    return Ok(Classified::Wide);
   }
   let id_end = header.checked_add(id.total().ok_or(())?).ok_or(())?;
   if buf.len() < id_end {
@@ -1461,6 +1490,76 @@ mod tests {
     let out = emit(&mut machine, &frame).await;
     assert_eq!(out, frame);
     assert_eq!(machine.take_starttls_result(), Some(true));
+  }
+
+  #[tokio::test]
+  async fn starttls_success_waits_until_the_message_is_complete() {
+    let frame = {
+      let message = LdapMessage::new(
+        4,
+        ProtocolOp::ExtendedResp(ExtendedResponse {
+          result_code: ResultCode::Success,
+          matched_dn: LdapString::from(""),
+          diagnostic_message: LdapString::from(""),
+          referral: None,
+          response_name: Some(OctetString::from_static(STARTTLS_OID)),
+          response_value: None,
+        }),
+      );
+      rasn::ber::encode(&message).unwrap()
+    };
+    let mut machine = up();
+    machine.expect_starttls(4);
+    let mut out = Vec::new();
+    for (index, byte) in frame.iter().enumerate() {
+      out.extend(collect(&mut machine, std::slice::from_ref(byte)).await);
+      if index + 1 < frame.len() {
+        assert_eq!(machine.take_starttls_result(), None, "byte {index}");
+      }
+    }
+    assert_eq!(out, frame);
+    assert_eq!(machine.take_starttls_result(), Some(true));
+  }
+
+  #[tokio::test]
+  async fn complete_response_flushes_a_held_password_prefix() {
+    // The real password starts with `a`. A finished diagnostic ending in that
+    // byte must not stay in the needle window while the server is still open.
+    let frame = bind_response(1, "invalid data");
+    assert_eq!(frame.last().copied(), Some(b'a'));
+    let mut machine = up();
+    let mut out = collect(&mut machine, &frame[..frame.len() - 1]).await;
+    out.extend(collect(&mut machine, &frame[frame.len() - 1..]).await);
+    assert_eq!(out, frame);
+    let next = [0x30, 0x06, 0x02, 0x01, 0x02, 0x42, 0x01, 0x00];
+    let out = emit(&mut machine, &next).await;
+    assert_eq!(out, next);
+  }
+
+  #[tokio::test]
+  async fn wide_message_id_is_forwarded_without_peeking() {
+    let small = [0x30, 0x0a, 0x02, 0x05, 0x11, 0x22, 0x33, 0x44, 0x55, 0x42, 0x01, 0x00];
+    for mut machine in [down(), up()] {
+      let out = emit(&mut machine, &small).await;
+      assert_eq!(out, small);
+    }
+    // The id announces 64 KiB. Those bytes are not pulled into the peek.
+    let mut huge = vec![
+      0x30, 0x84, 0x00, 0x01, 0x00, 0x06, // outer content 65542
+      0x02, 0x84, 0x00, 0x01, 0x00, 0x00, // integer content 65536
+      0x11, 0x22, 0x33, 0x44,
+    ];
+    for mut machine in [down(), up()] {
+      let out = emit(&mut machine, &huge).await;
+      assert_eq!(out, huge);
+    }
+    huge.extend_from_slice(&[0x55, 0x66]);
+    let split = huge.len() - 2;
+    let mut machine = up();
+    let out = emit(&mut machine, &huge[..split]).await;
+    assert_eq!(out, &huge[..split]);
+    let out = emit(&mut machine, &huge[split..]).await;
+    assert_eq!(out, &huge[split..]);
   }
 
   fn block_on<F: std::future::Future>(fut: F) -> F::Output {
