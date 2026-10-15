@@ -269,7 +269,7 @@ impl LdapTransport {
       First::Eof | First::Close => Ok(()),
       First::Relay(prefix) => {
         let (mut downstream, mut upstream) = ldap_pair(pump.ctx, swap);
-        relay_guarded(guest, server, &mut downstream, &mut upstream, &prefix).await
+        relay_guarded(guest, server, &mut downstream, &mut upstream, &prefix, &[]).await
       }
       First::StartTls(open) => self.starttls(&open, guest, server, pump).await,
     }
@@ -306,9 +306,9 @@ impl LdapTransport {
     let (mut downstream, mut upstream) = ldap_pair(pump.ctx, true);
     if pump.upgrade_upstream {
       let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
-      relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[]).await
+      relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[], &[]).await
     } else {
-      relay_guarded(guest_plain, server, &mut downstream, &mut upstream, &[]).await
+      relay_guarded(guest_plain, server, &mut downstream, &mut upstream, &[], &[]).await
     }
   }
 }
@@ -550,7 +550,7 @@ where
   S: AsyncRead + AsyncWrite + Unpin,
 {
   let (mut downstream, mut upstream) = ldap_pair(ctx, swap);
-  relay_guarded(guest, server, &mut downstream, &mut upstream, &[]).await
+  relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
 /// Both directions for an LDAP scope. `swap` applies to the downstream leg:
