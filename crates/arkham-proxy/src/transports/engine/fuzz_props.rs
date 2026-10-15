@@ -545,14 +545,6 @@ enum Arrival<'a> {
   Bytes,
 }
 
-/// SMTP walks a 16 KiB reply one byte at a time, so the count stays under
-/// the 256 used by the HTTP block.
-fn smtp_cases(n: u32) -> ProptestConfig {
-  let mut config = ProptestConfig::with_cases(n);
-  config.max_shrink_iters = 256;
-  config
-}
-
 fn smtp_b64(raw: &[u8]) -> String {
   base64::engine::general_purpose::STANDARD.encode(raw)
 }
@@ -853,7 +845,7 @@ fn smtp_distinct(fake: &[char], real: &[char]) -> bool {
 }
 
 proptest! {
-  #![proptest_config(smtp_cases(64))]
+  #![proptest_config(ProptestConfig::with_cases(256))]
 
   /// AUTH, a multiline reply, DATA, and BDAT survive every arrival split
   /// from [`run_split`]. The real password is absent from guest-bound bytes.
@@ -895,7 +887,7 @@ proptest! {
 }
 
 proptest! {
-  #![proptest_config(smtp_cases(16))]
+  #![proptest_config(ProptestConfig::with_cases(256))]
 
   /// A reply cut at any offset, including the old 16 KiB boundary, is still
   /// one opening reply. The next status line stays unread until the next read.
