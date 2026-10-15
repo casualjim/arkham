@@ -8,6 +8,7 @@
 pub(crate) mod engine;
 pub(crate) mod http;
 pub(crate) mod ldap;
+pub(crate) mod nats;
 pub(crate) mod postgres;
 pub(crate) mod redis;
 pub(crate) mod smtp;

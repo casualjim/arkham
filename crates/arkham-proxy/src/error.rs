@@ -328,6 +328,30 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
+  /// A guest NATS TLS handshake fails.
+  #[error("guest nats TLS: {source}")]
+  GuestNatsTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A server NATS TLS handshake fails.
+  #[error("server nats TLS: {source}")]
+  ServerNatsTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A NATS upstream name cannot become a TLS server name.
+  #[error("nats server name: {source}")]
+  NatsServerName {
+    /// Underlying name failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+  },
+  /// A NATS INFO read or TLS handshake exceeded the configured budget.
+  #[error("nats handshake timed out")]
+  NatsHandshakeTimeout,
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,
