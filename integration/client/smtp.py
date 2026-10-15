@@ -59,7 +59,9 @@ def prove_direct(url: str) -> None:
         submission.ehlo()
         try:
             submission.login(user, password)
-        except smtplib.SMTPException as err:
+        except smtplib.SMTPAuthenticationError as err:
+            if err.smtp_code != 535:
+                fail(f"decoy refusal on 587 was {err.smtp_code}, expected 535")
             print(f"decoy refused 587 {check(str(err))}")
         else:
             fail("decoy authenticated on 587 without the proxy")
@@ -74,7 +76,9 @@ def prove_direct(url: str) -> None:
         implicit.ehlo()
         try:
             implicit.login(user, password)
-        except smtplib.SMTPException as err:
+        except smtplib.SMTPAuthenticationError as err:
+            if err.smtp_code != 535:
+                fail(f"decoy refusal on 465 was {err.smtp_code}, expected 535")
             print(f"decoy refused 465 {check(str(err))}")
         else:
             fail("decoy authenticated on 465 without the proxy")
