@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use secrecy::{ExposeSecret as _, SecretString};
+use strum::EnumIter;
 use url::Url;
 
 use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme};
@@ -249,7 +250,7 @@ struct SmtpTls {
 /// A query key the real string may carry. `starttls` is consumed before
 /// the query list, so it is not a variant. Both the fake-string check and
 /// `smtp_tls` match this enum, so a new key has one place to land.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 enum SmtpQuery {
   SslMode,
   Ssl,
@@ -493,15 +494,8 @@ mod tests {
   #[test]
   fn every_real_query_key_is_rejected_on_the_fake_string() {
     let real = format!("smtp://{USER}:{PASS}@mail.internal:587");
-    let keys = [
-      super::SmtpQuery::SslMode,
-      super::SmtpQuery::Ssl,
-      super::SmtpQuery::SslNegotiation,
-      super::SmtpQuery::SslRootCert,
-      super::SmtpQuery::SslCert,
-      super::SmtpQuery::SslKey,
-    ];
-    for query in keys {
+    for query in <super::SmtpQuery as strum::IntoEnumIterator>::iter() {
+      assert_eq!(super::SmtpQuery::parse(query.as_str()), Some(query));
       let key = query.as_str();
       let fake = format!("smtp://{USER}:{PASS}@mail.internal:587?{key}=1");
       let err = SmtpScope::from_strings(&fake, &real).expect_err(key);
