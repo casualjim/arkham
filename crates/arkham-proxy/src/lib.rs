@@ -44,6 +44,7 @@ mod transports;
 mod relay;
 
 use identity::CandidateParams;
+use transports::amqp::AmqpTransport;
 use transports::http::{HttpTransport, HttpsTransport};
 use transports::ldap::LdapTransport;
 use transports::nats::NatsTransport;
@@ -80,6 +81,7 @@ pub struct ProxyState {
   smtp: Arc<SmtpTransport>,
   ldap: Arc<LdapTransport>,
   nats: Arc<NatsTransport>,
+  amqp: Arc<AmqpTransport>,
   mint: MintBucket,
   /// Runtime token-mint store, shared across connections.
   mint_store: Arc<crate::mint::MintStore>,
@@ -174,6 +176,7 @@ impl ProxyState {
     let smtp = Arc::new(SmtpTransport::new(ca)?);
     let ldap = Arc::new(LdapTransport::new(ca)?);
     let nats = Arc::new(NatsTransport::new(ca)?);
+    let amqp = Arc::new(AmqpTransport::new(ca)?);
     Ok(Self {
       config: Arc::new(resolved),
       relay,
@@ -188,6 +191,7 @@ impl ProxyState {
       smtp,
       ldap,
       nats,
+      amqp,
       mint: MintBucket::new(),
       mint_store: Arc::new(MintStore::default()),
       fwmark: None,
