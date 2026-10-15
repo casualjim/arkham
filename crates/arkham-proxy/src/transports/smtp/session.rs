@@ -2,8 +2,8 @@
 //!
 //! The greeting, `EHLO` / `HELO`, `HELP` / `VRFY` / `EXPN`, an `AUTH` that
 //! still precedes `STARTTLS`, and `STARTTLS` plus its acceptance run
-//! lockstep. Each completed reply line is redacted and written before the
-//! next line is read. The reader stops on the final reply line, so the
+//! lockstep. Reply bytes are redacted as they arrive. The hold-back flushes
+//! on newline or EOF, and the reader stops on the final line, so the
 //! following handshake bytes stay unread. A non-`220` answer to `STARTTLS`
 //! returns to that loop. After the upgrade, or when the guest sends anything
 //! else, both sockets go to [`relay_guarded`]. Implicit TLS skips the
@@ -269,10 +269,10 @@ where
         Forwarded::Held => return Ok(StarttlsStep::Relay),
         Forwarded::Sent => {}
       }
-      let Some(last) = acceptance_reply(&mut self.server, self.up, &mut self.guest).await? else {
+      let Some(code) = acceptance_reply(&mut self.server, self.up, &mut self.guest).await? else {
         return Ok(StarttlsStep::Closed);
       };
-      if is_220(&last) {
+      if is_220(code) {
         Ok(StarttlsStep::Upgrade)
       } else {
         Ok(StarttlsStep::Continue)
@@ -359,25 +359,6 @@ async fn handshake<T>(budget: Duration, handshake: impl Future<Output = Result<T
   }
 }
 
-/// Redact one complete server reply. The opening is lockstep, so the suffix
-/// the upstream machine holds back is flushed before the guest is written.
-async fn redact_opening_reply(up: &mut Smtp, reply: &[u8]) -> Vec<u8> {
-  let (rewritten, hits) = up.feed(reply).await;
-  log_hits(&hits);
-  let mut out = emitted(rewritten);
-  let (flushed, more) = up.feed(&[]).await;
-  log_hits(&more);
-  out.extend(emitted(flushed));
-  out
-}
-
-fn emitted(rewritten: Rewritten<'_>) -> Vec<u8> {
-  match rewritten {
-    Rewritten::Emit(bytes) => bytes.into_owned(),
-    Rewritten::Hold | Rewritten::Close => Vec::new(),
-  }
-}
-
 async fn write_guest<G>(guest: &mut GuestLeg<G>, bytes: &[u8]) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
@@ -437,98 +418,109 @@ where
 }
 
 /// One SMTP reply, including a multiline (`250-` … `250 `) continuation.
-/// Each completed line is redacted and written before the next byte is
-/// read. The returned line is the last one, for the `220` check. Bytes
-/// after the final line, including a handshake record, stay in `reader`.
-async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<Vec<u8>>, Error>
+/// Each byte is fed to the upstream machine as it arrives. `feed(&[])`
+/// runs only on newline or EOF, so a password split across reads stays
+/// inside the needle hold-back. The first four bytes decide whether the
+/// line is final; the line itself is not kept. The returned code is that
+/// final line's status, for the `220` check. Bytes after the final line,
+/// including a handshake record, stay in `reader`.
+async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<[u8; 3]>, Error>
 where
   R: AsyncRead + Unpin,
   G: AsyncRead + AsyncWrite + Unpin,
 {
-  let mut last = Vec::new();
-  let mut line = Vec::new();
-  let mut byte = [0u8; 1];
+  let mut head = ReplyHead::default();
   let mut saw = false;
+  let mut byte = [0u8; 1];
   loop {
     match reader.read(&mut byte).await {
-      Ok(0) => return finish_reply(up, guest, &mut last, line, saw).await,
+      Ok(0) => return end_reply(up, guest, saw, &head).await,
       Ok(_) => {
         let Some(next) = byte.first().copied() else {
           return Err(Error::UpstreamRead {
             source: std::io::Error::other("empty read"),
           });
         };
-        line.push(next);
         saw = true;
-        if next != b'\n' && line.len() < MAX_COMMAND {
-          continue;
-        }
-        let finished = is_final_line(&line) || !line.ends_with(b"\n");
-        stream_reply_line(up, guest, &line).await?;
-        last = std::mem::take(&mut line);
-        if finished {
-          return Ok(Some(last));
+        write_fed(up, guest, &byte).await?;
+        if next == b'\n' {
+          write_fed(up, guest, &[]).await?;
+          if head.is_final() {
+            return Ok(Some(head.code));
+          }
+          head = ReplyHead::default();
+        } else {
+          head.observe(next);
         }
       }
-      Err(err) if err.kind() == ErrorKind::UnexpectedEof => return finish_reply(up, guest, &mut last, line, saw).await,
+      Err(err) if err.kind() == ErrorKind::UnexpectedEof => return end_reply(up, guest, saw, &head).await,
       Err(source) => return Err(Error::UpstreamRead { source }),
     }
   }
 }
 
-/// Write a partial line the peer closed on, and return the last line kept.
-async fn finish_reply<G>(
-  up: &mut Smtp,
-  guest: &mut GuestLeg<G>,
-  last: &mut Vec<u8>,
-  line: Vec<u8>,
-  saw: bool,
-) -> Result<Option<Vec<u8>>, Error>
+/// Status and separator of the reply line being read. Four bytes decide
+/// the line. Nothing here retains the text.
+#[derive(Default)]
+struct ReplyHead {
+  /// `0..3` collect the status code. `3` is the separator. `4` is the rest.
+  at: u8,
+  code: [u8; 3],
+  /// The separator was `-`, so another line follows.
+  continues: bool,
+}
+
+impl ReplyHead {
+  fn observe(&mut self, byte: u8) {
+    if self.at >= 4 {
+      return;
+    }
+    if self.at < 3 {
+      if let Some(slot) = self.code.get_mut(usize::from(self.at)) {
+        *slot = byte;
+      }
+    } else {
+      self.continues = byte == b'-';
+    }
+    self.at = self.at.saturating_add(1);
+  }
+
+  /// Newline or EOF ended a line that is not a continuation.
+  fn is_final(&self) -> bool {
+    self.at > 0 && !self.continues
+  }
+}
+
+/// Flush the hold-back when the peer closes, and return the status when
+/// that partial line was already final.
+async fn end_reply<G>(up: &mut Smtp, guest: &mut GuestLeg<G>, saw: bool, head: &ReplyHead) -> Result<Option<[u8; 3]>, Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
-  if !saw && line.is_empty() && last.is_empty() {
+  if !saw {
     return Ok(None);
   }
-  if !line.is_empty() {
-    stream_reply_line(up, guest, &line).await?;
-    *last = line;
-  }
-  if last.is_empty() {
-    Ok(None)
-  } else {
-    Ok(Some(std::mem::take(last)))
-  }
+  write_fed(up, guest, &[]).await?;
+  if head.is_final() { Ok(Some(head.code)) } else { Ok(None) }
 }
 
-/// Redact one completed reply line and write it. The line itself is not
-/// retained with the lines that preceded it.
-async fn stream_reply_line<G>(up: &mut Smtp, guest: &mut GuestLeg<G>, line: &[u8]) -> Result<(), Error>
+/// Feed one arrival to the upstream machine and write what it emits.
+/// An empty chunk flushes the hold-back; the caller does that on newline
+/// or EOF only.
+async fn write_fed<G>(up: &mut Smtp, guest: &mut GuestLeg<G>, bytes: &[u8]) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
-  let redacted = redact_opening_reply(up, line).await;
-  write_guest(guest, &redacted).await
+  let (rewritten, hits) = up.feed(bytes).await;
+  log_hits(&hits);
+  match rewritten {
+    Rewritten::Emit(emitted) if !emitted.is_empty() => write_guest(guest, &emitted).await,
+    Rewritten::Emit(_) | Rewritten::Hold | Rewritten::Close => Ok(()),
+  }
 }
 
-fn is_final_line(line: &[u8]) -> bool {
-  strip_crlf(line).get(3) != Some(&b'-')
-}
-
-fn is_220(buf: &[u8]) -> bool {
-  let Some(line) = buf.rsplit(|byte| *byte == b'\n').find(|line| !line.is_empty()) else {
-    return false;
-  };
-  let line = line.strip_suffix(b"\r").unwrap_or(line);
-  line.get(..3) == Some(b"220".as_slice())
-}
-
-fn strip_crlf(line: &[u8]) -> &[u8] {
-  line
-    .strip_suffix(b"\r\n")
-    .or_else(|| line.strip_suffix(b"\n"))
-    .or_else(|| line.strip_suffix(b"\r"))
-    .unwrap_or(line)
+fn is_220(code: [u8; 3]) -> bool {
+  code == *b"220"
 }
 
 /// Cleartext guest leg.
@@ -556,10 +548,24 @@ mod tests {
   use arkham_config::grants::{Credential, GuestTlsMode, SmtpLeg, SmtpScope};
   use secrecy::SecretString;
 
-  use super::{Direction, Smtp};
+  use super::{Direction, Smtp, Wire};
 
   const FAKE_PASS: &str = "fake-smtp-pass"; // betterleaks:allow
   const REAL_PASS: &str = "real-smtp-pass"; // betterleaks:allow
+
+  /// Feed one complete reply and flush the hold-back, the way a newline does.
+  async fn redact_reply(up: &mut Smtp, reply: &[u8]) -> Vec<u8> {
+    let (rewritten, _) = up.feed(reply).await;
+    let mut out = match rewritten {
+      super::Rewritten::Emit(bytes) => bytes.into_owned(),
+      super::Rewritten::Hold | super::Rewritten::Close => Vec::new(),
+    };
+    let (flushed, _) = up.feed(&[]).await;
+    if let super::Rewritten::Emit(bytes) = flushed {
+      out.extend(bytes.into_owned());
+    }
+    out
+  }
 
   fn upstream() -> Smtp {
     let scope = SmtpScope {
@@ -600,7 +606,7 @@ mod tests {
   async fn opening_reply_redacts_the_real_password() {
     let mut up = upstream();
     let reply = format!("535 5.7.8 authentication failed for {REAL_PASS}\r\n");
-    let out = super::redact_opening_reply(&mut up, reply.as_bytes()).await;
+    let out = redact_reply(&mut up, reply.as_bytes()).await;
     assert_eq!(out, format!("535 5.7.8 authentication failed for {FAKE_PASS}\r\n").into_bytes());
     assert!(!out.windows(REAL_PASS.len()).any(|window| window == REAL_PASS.as_bytes()));
   }
@@ -616,8 +622,8 @@ mod tests {
     let mut guest = super::plain_guest(std::io::Cursor::new(Vec::new()));
     let mut up = upstream();
     let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
-    assert_eq!(reply, b"220 2.0.0 Ready to start TLS\r\n");
-    assert!(super::is_220(&reply));
+    assert_eq!(reply, *b"220");
+    assert!(super::is_220(reply));
     let super::GuestLeg::Plain(writer) = guest else {
       unreachable!("the guest leg is the cursor");
     };
@@ -662,10 +668,73 @@ mod tests {
     };
     let mut up = Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream);
     let reply = format!("535 5.7.8 authentication failed for {LONG_REAL}\r\n");
-    let out = super::redact_opening_reply(&mut up, reply.as_bytes()).await;
+    let out = redact_reply(&mut up, reply.as_bytes()).await;
     let text = String::from_utf8(out).unwrap();
     assert!(text.starts_with("535 "), "{text}");
     assert!(text.contains(FAKE_PASS), "{text}");
     assert!(!text.contains(LONG_REAL), "{text}");
+  }
+
+  /// A real password that crosses the old 16 KiB cut is one reply. The
+  /// guest sees the decoy, and the bytes after the newline stay unread.
+  #[tokio::test]
+  async fn long_reply_redacts_a_password_across_the_old_cut() {
+    const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
+    let scope = SmtpScope {
+      downstream: SmtpLeg {
+        host: "mail".into(),
+        port: 587,
+        user: "agent@demo.test".into(),
+        password: SecretString::from(FAKE_PASS),
+      },
+      is_downstream_tls: false,
+      upstream: SmtpLeg {
+        host: "mail".into(),
+        port: 587,
+        user: "agent@demo.test".into(),
+        password: SecretString::from(LONG_REAL),
+      },
+      is_upstream_tls: true,
+      starttls_required: false,
+      root_cert: None,
+      client_cert: None,
+      client_key: None,
+      guest_tls: GuestTlsMode::default(),
+    };
+    let grant = arkham_config::grants::Grant::Smtp {
+      credential: Credential {
+        label: "smtp".into(),
+        fake: FAKE_PASS.into(),
+        value: SecretString::from(LONG_REAL),
+      },
+      scope: Box::new(scope),
+    };
+    let pass = LONG_REAL.as_bytes();
+    let start = super::MAX_COMMAND.saturating_sub(4);
+    let lead = b"535 ";
+    assert!(start > lead.len());
+    let mut line = Vec::new();
+    line.extend_from_slice(lead);
+    line.resize(start, b'x');
+    line.extend_from_slice(pass);
+    line.extend_from_slice(b"\r\n");
+    let reply_len = line.len();
+    let mut payload = line;
+    payload.extend_from_slice(&[0x16, 0x03, 0x01]);
+    let mut cursor = std::io::Cursor::new(payload);
+    let mut guest = super::plain_guest(std::io::Cursor::new(Vec::new()));
+    let mut up = Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream);
+    let code = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    assert_eq!(code, *b"535");
+    let super::GuestLeg::Plain(writer) = guest else {
+      unreachable!("the guest leg is the cursor");
+    };
+    let text = String::from_utf8(writer.into_inner()).unwrap();
+    assert!(text.starts_with("535 "), "{text}");
+    assert!(text.contains(FAKE_PASS), "{text}");
+    assert!(!text.contains(LONG_REAL), "{text}");
+    let at = usize::try_from(cursor.position()).unwrap();
+    assert_eq!(at, reply_len);
+    assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
   }
 }
