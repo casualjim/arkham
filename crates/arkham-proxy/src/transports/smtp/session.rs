@@ -1214,10 +1214,10 @@ mod tests {
     assert!(!text.contains(LONG_REAL), "{text}");
   }
 
-  /// A real password that crosses the old 16 KiB cut is one reply. The
-  /// guest sees the decoy. The handshake is the suffix after the newline.
+  /// A reply longer than one command redacts the password. The handshake
+  /// is the suffix after the newline.
   #[tokio::test]
-  async fn long_reply_redacts_a_password_across_the_old_cut() {
+  async fn long_reply_redacts_the_password() {
     const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
     let scope = SmtpScope {
       downstream: SmtpLeg {

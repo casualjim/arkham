@@ -797,8 +797,8 @@ fn smtp_first_diff(left: &[u8], right: &[u8]) -> Option<usize> {
 }
 
 /// Greeting bytes and the index where `pass` starts.
-/// `at` is an offset in the final line. `220 ` is the first four bytes, so
-/// `MAX_COMMAND - 4` puts the password across the old per-line cut.
+/// `at` is an offset in the final line. `MAX_COMMAND - 4` places the
+/// password after a command-sized prefix.
 fn smtp_greeting(continuations: u8, at: usize, pass: &str) -> (Vec<u8>, usize) {
   let mut out = Vec::new();
   for _ in 0..continuations {
@@ -821,15 +821,16 @@ struct SmtpOpening {
   rest: Vec<u8>,
 }
 
-/// One reply stream. `cuts` are the interior offsets the property chose.
-/// Polls still return the whole buffer, the same as `Cursor`, so a cut
-/// does not pend.
+/// One reply stream. Each poll yields bytes up to the next cut, then
+/// pends once before the following poll. The waker is woken so
+/// `block_on` resumes.
 struct CutPend {
   data: Vec<u8>,
   cuts: Vec<usize>,
   at: usize,
   reads: usize,
   pends: usize,
+  arm_pend: bool,
 }
 
 impl CutPend {
@@ -843,25 +844,40 @@ impl CutPend {
       at: 0,
       reads: 0,
       pends: 0,
+      arm_pend: false,
     }
   }
 }
 
 impl AsyncRead for CutPend {
-  fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+  fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    if self.arm_pend {
+      self.arm_pend = false;
+      self.pends = self.pends.saturating_add(1);
+      cx.waker().wake_by_ref();
+      return Poll::Pending;
+    }
+    if buf.remaining() == 0 {
+      return Poll::Ready(Ok(()));
+    }
     let Some(rest) = self.data.get(self.at..) else {
       return Poll::Ready(Ok(()));
     };
-    if rest.is_empty() || buf.remaining() == 0 {
+    if rest.is_empty() {
       return Poll::Ready(Ok(()));
     }
-    let n = rest.len().min(buf.remaining());
+    let end = self.cuts.iter().copied().find(|cut| *cut > self.at).unwrap_or(self.data.len());
+    let n = end.saturating_sub(self.at).min(buf.remaining());
+    if n == 0 {
+      return Poll::Ready(Err(std::io::Error::other("reply cut produced an empty read")));
+    }
     let Some(chunk) = rest.get(..n) else {
       return Poll::Ready(Ok(()));
     };
     buf.put_slice(chunk);
     self.at = self.at.saturating_add(n);
     self.reads = self.reads.saturating_add(1);
+    self.arm_pend = self.at < self.data.len();
     Poll::Ready(Ok(()))
   }
 }
@@ -941,8 +957,9 @@ proptest! {
 proptest! {
   #![proptest_config(ProptestConfig::with_cases(256))]
 
-  /// A reply cut at any offset, including the old 16 KiB boundary, is still
-  /// one opening reply. Bytes after its final newline are the next read.
+  /// A reply cut at any offset is still one opening reply. The reader
+  /// splits at those cuts and pends between them. Bytes after the final
+  /// newline are the next read.
   #[test]
   fn prop_reply_cut_keeps_the_opening_in_sync(
     fake_chars in proptest::collection::vec(prop::char::range('a', 'z'), 6..10),
