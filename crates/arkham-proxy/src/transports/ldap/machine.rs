@@ -1123,6 +1123,7 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
 mod tests {
   use super::*;
   use arkham_config::grants::{Credential, GuestTlsMode, LdapScope};
+  use proptest::prelude::*;
   use rasn_ldap::{AuthenticationChoice, BindRequest};
   use secrecy::SecretString;
 
@@ -1581,6 +1582,291 @@ mod tests {
         let _ = downstream.feed(&[]).await;
         let _ = upstream.feed(&[]).await;
       });
+    }
+  }
+
+  /// One direction the properties drive. Guest-bound output is [`Leg::Up`].
+  #[derive(Clone, Copy, Debug)]
+  enum Leg {
+    DownSwap,
+    DownClear,
+    Up,
+  }
+
+  fn open_leg(leg: Leg) -> Ldap {
+    match leg {
+      Leg::DownSwap => down(),
+      Leg::DownClear => Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false),
+      Leg::Up => up(),
+    }
+  }
+
+  fn up_expecting(id: u32) -> Ldap {
+    let mut machine = up();
+    machine.expect_starttls(id);
+    machine
+  }
+
+  struct Fed {
+    out: Vec<u8>,
+    closed: bool,
+    starttls: Option<bool>,
+  }
+
+  /// Feed `data` on the given cuts. An empty cut list is one shot.
+  ///
+  /// Empty input is not fed. That call is EOF, and flushing there would hide
+  /// a needle suffix that a finished message is supposed to release on its own.
+  fn feed_at(mut machine: Ldap, data: &[u8], cuts: &[usize]) -> Fed {
+    let mut out = Vec::new();
+    let mut prev = 0usize;
+    let mut points: Vec<usize> = cuts.iter().copied().filter(|cut| (1..data.len()).contains(cut)).collect();
+    points.sort_unstable();
+    points.dedup();
+    if !data.is_empty() {
+      points.push(data.len());
+    }
+    for cut in points {
+      let (rewritten, _) = block_on(machine.feed(&data[prev..cut]));
+      match rewritten {
+        Rewritten::Emit(bytes) => out.extend_from_slice(&bytes),
+        Rewritten::Hold => {}
+        Rewritten::Close => {
+          return Fed {
+            out,
+            closed: true,
+            starttls: machine.take_starttls_result(),
+          };
+        }
+      }
+      prev = cut;
+    }
+    Fed {
+      out,
+      closed: machine.closed,
+      starttls: machine.take_starttls_result(),
+    }
+  }
+
+  fn splits_match(machine: impl Fn() -> Ldap, data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
+    let once = feed_at(machine(), data, &[]);
+    let split = feed_at(machine(), data, cuts);
+    let byte_cuts: Vec<usize> = (1..data.len()).collect();
+    let byte = feed_at(machine(), data, &byte_cuts);
+    prop_assert_eq!(&once.out, &split.out);
+    prop_assert_eq!(&once.out, &byte.out);
+    prop_assert_eq!(once.closed, split.closed);
+    prop_assert_eq!(once.closed, byte.closed);
+    prop_assert_eq!(once.starttls, split.starttls);
+    prop_assert_eq!(once.starttls, byte.starttls);
+    prop_assert!(!once.closed);
+    Ok(())
+  }
+
+  fn definite(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+      return vec![u8::try_from(len).unwrap()];
+    }
+    if len <= 0xff {
+      return vec![0x81, u8::try_from(len).unwrap()];
+    }
+    let len = u16::try_from(len).unwrap();
+    vec![0x82, u8::try_from(len >> 8).unwrap(), u8::try_from(len & 0xff).unwrap()]
+  }
+
+  fn ber_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len().saturating_add(3));
+    out.push(tag);
+    out.extend(definite(content.len()));
+    out.extend_from_slice(content);
+    out
+  }
+
+  fn wide_frame(id: &[u8], tail: &[u8]) -> Vec<u8> {
+    let mut content = ber_tlv(0x02, id);
+    content.extend_from_slice(tail);
+    ber_tlv(0x30, &content)
+  }
+
+  fn forwarded_with(id: u8, payload: &[u8]) -> Vec<u8> {
+    let mut content = ber_tlv(0x02, &[id]);
+    content.extend(ber_tlv(0x64, payload));
+    ber_tlv(0x30, &content)
+  }
+
+  fn starttls_response(id: u32) -> Vec<u8> {
+    let message = LdapMessage::new(
+      id,
+      ProtocolOp::ExtendedResp(ExtendedResponse {
+        result_code: ResultCode::Success,
+        matched_dn: LdapString::from(""),
+        diagnostic_message: LdapString::from(""),
+        referral: None,
+        response_name: Some(OctetString::from_static(STARTTLS_OID)),
+        response_value: None,
+      }),
+    );
+    rasn::ber::encode(&message).unwrap()
+  }
+
+  /// Text that cannot spell the decoy or the real password. Both start with `a`.
+  fn plain_text() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[b-z]{0,8}").unwrap()
+  }
+
+  fn safe_message() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+      (1u8..=127).prop_map(|id| bind_frame(u32::from(id), DN, FAKE_PW)),
+      (1u8..=127).prop_map(|id| bind_frame(u32::from(id), DN, "guest-pass")),
+      (1u8..=127, plain_text()).prop_map(|(id, text)| bind_response(u32::from(id), &text)),
+      (1u8..=127).prop_map(|id| bind_response(u32::from(id), &format!("rejected {REAL_PW}"))),
+      (1u8..=127, 1usize..REAL_PW.len()).prop_map(|(id, k)| {
+        let prefix = REAL_PW.get(..k).unwrap_or(REAL_PW);
+        bind_response(u32::from(id), prefix)
+      }),
+      (
+        proptest::collection::vec(any::<u8>(), 5..=8),
+        proptest::collection::vec(any::<u8>(), 0..16)
+      )
+        .prop_map(|(id, tail)| wide_frame(&id, &tail)),
+      (1u8..=127).prop_map(|id| starttls_response(u32::from(id))),
+    ]
+  }
+
+  #[derive(Clone, Debug)]
+  enum SecretPlace {
+    Diagnostic { id: u8, pad: String },
+    Body { id: u8, pre: Vec<u8>, post: Vec<u8> },
+    Wide { id: Vec<u8>, pre: Vec<u8>, post: Vec<u8> },
+  }
+
+  fn secret_frame(place: &SecretPlace) -> Vec<u8> {
+    match place {
+      SecretPlace::Diagnostic { id, pad } => bind_response(u32::from(*id), &format!("{pad}{REAL_PW}")),
+      SecretPlace::Body { id, pre, post } => {
+        let mut payload = Vec::with_capacity(pre.len().saturating_add(REAL_PW.len()).saturating_add(post.len()));
+        payload.extend_from_slice(pre);
+        payload.extend_from_slice(REAL_PW.as_bytes());
+        payload.extend_from_slice(post);
+        forwarded_with(*id, &payload)
+      }
+      SecretPlace::Wide { id, pre, post } => {
+        let mut tail = Vec::with_capacity(pre.len().saturating_add(REAL_PW.len()).saturating_add(post.len()));
+        tail.extend_from_slice(pre);
+        tail.extend_from_slice(REAL_PW.as_bytes());
+        tail.extend_from_slice(post);
+        wide_frame(id, &tail)
+      }
+    }
+  }
+
+  fn hides_real(data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
+    let once = feed_at(up(), data, &[]);
+    let split = feed_at(up(), data, cuts);
+    let byte_cuts: Vec<usize> = (1..data.len()).collect();
+    let byte = feed_at(up(), data, &byte_cuts);
+    for out in [&once.out, &split.out, &byte.out] {
+      prop_assert!(!contains_bytes(out, REAL_PW.as_bytes()));
+    }
+    Ok(())
+  }
+
+  proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Any cut of one accepted stream, including one byte at a time, matches one shot.
+    #[test]
+    fn prop_ldap_split_output_is_identical(
+      leg in prop_oneof![Just(Leg::DownSwap), Just(Leg::DownClear), Just(Leg::Up)],
+      first in safe_message(),
+      second in proptest::option::of(safe_message()),
+      cuts in proptest::collection::vec(any::<usize>(), 0..6),
+    ) {
+      let mut data = first;
+      if let Some(extra) = second {
+        data.extend(extra);
+      }
+      let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % data.len().max(1)).collect();
+      splits_match(|| open_leg(leg), &data, &scaled)?;
+      if matches!(leg, Leg::Up) {
+        let out = feed_at(up(), &data, &[]);
+        prop_assert!(!contains_bytes(&out.out, REAL_PW.as_bytes()));
+      }
+    }
+
+    /// The real password stays out of guest-bound output for every cut.
+    #[test]
+    fn prop_ldap_guest_output_hides_the_real_password(
+      place in prop_oneof![
+        (1u8..=127, plain_text()).prop_map(|(id, pad)| SecretPlace::Diagnostic { id, pad }),
+        (1u8..=127, proptest::collection::vec(any::<u8>(), 0..8), proptest::collection::vec(any::<u8>(), 0..8))
+          .prop_map(|(id, pre, post)| SecretPlace::Body { id, pre, post }),
+        (
+          proptest::collection::vec(any::<u8>(), 5..=8),
+          proptest::collection::vec(any::<u8>(), 0..8),
+          proptest::collection::vec(any::<u8>(), 0..8),
+        ).prop_map(|(id, pre, post)| SecretPlace::Wide { id, pre, post }),
+      ],
+      cuts in proptest::collection::vec(any::<usize>(), 0..6),
+    ) {
+      let data = secret_frame(&place);
+      let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % data.len().max(1)).collect();
+      hides_real(&data, &scaled)?;
+      if matches!(place, SecretPlace::Diagnostic { .. }) {
+        splits_match(up, &data, &scaled)?;
+        let out = feed_at(up(), &data, &[]);
+        prop_assert!(contains_bytes(&out.out, FAKE_PW.as_bytes()));
+      }
+    }
+
+    /// Wide ids, a split StartTLS reply, and a held password prefix.
+    #[test]
+    fn prop_ldap_wide_id_starttls_and_password_prefix(
+      shape in prop_oneof![
+        Just(0u8),
+        Just(1u8),
+        Just(2u8),
+      ],
+      id in 1u8..=127u8,
+      id_len in 5usize..=8,
+      k in 1usize..REAL_PW.len(),
+      tail in proptest::collection::vec(any::<u8>(), 0..16),
+      cuts in proptest::collection::vec(any::<usize>(), 0..6),
+    ) {
+      match shape {
+        0 => {
+          let id_bytes = vec![0x11; id_len];
+          let frame = wide_frame(&id_bytes, &tail);
+          let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len().max(1)).collect();
+          splits_match(down, &frame, &scaled)?;
+          splits_match(up, &frame, &scaled)?;
+          let wide = feed_at(up(), &frame, &[]);
+          prop_assert_eq!(&wide.out, &frame);
+        }
+        1 => {
+          let frame = starttls_response(u32::from(id));
+          let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len().max(1)).collect();
+          splits_match(|| up_expecting(u32::from(id)), &frame, &scaled)?;
+          let full = feed_at(up_expecting(u32::from(id)), &frame, &[]);
+          prop_assert_eq!(full.starttls, Some(true));
+          prop_assert_eq!(&full.out, &frame);
+          for cut in 0..frame.len() {
+            let partial = feed_at(up_expecting(u32::from(id)), &frame[..cut], &[]);
+            prop_assert_eq!(partial.starttls, None);
+          }
+        }
+        _ => {
+          let prefix = REAL_PW.get(..k).unwrap_or(REAL_PW);
+          let frame = bind_response(u32::from(id), prefix);
+          let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len().max(1)).collect();
+          splits_match(up, &frame, &scaled)?;
+          let once = feed_at(up(), &frame, &[]);
+          prop_assert_eq!(&once.out, &frame);
+          let byte_cuts: Vec<usize> = (1..frame.len()).collect();
+          let byte = feed_at(up(), &frame, &byte_cuts);
+          prop_assert_eq!(&byte.out, &frame);
+        }
+      }
     }
   }
 
