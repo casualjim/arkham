@@ -1339,6 +1339,11 @@ proptest! {
       let out = run_ldap(ldap_leg(LdapLeg::Up), &data, &[]);
       prop_assert!(!ldap_contains(&out.out, LDAP_REAL.as_bytes()));
     }
+    if matches!(leg, LdapLeg::DownSwap) && ldap_contains(&data, LDAP_FAKE.as_bytes()) {
+      let swapped = run_ldap(ldap_leg(LdapLeg::DownSwap), &data, &[]);
+      prop_assert!(ldap_contains(&swapped.out, LDAP_REAL.as_bytes()));
+      prop_assert!(!ldap_contains(&swapped.out, LDAP_FAKE.as_bytes()));
+    }
   }
 
   /// The real password stays out of guest-bound LDAP output for every cut.
