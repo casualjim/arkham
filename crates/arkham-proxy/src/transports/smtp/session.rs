@@ -420,10 +420,12 @@ where
 /// One SMTP reply, including a multiline (`250-` … `250 `) continuation.
 /// Each byte is fed to the upstream machine as it arrives. `feed(&[])`
 /// runs only on newline or EOF, so a password split across reads stays
-/// inside the needle hold-back. The first four bytes decide whether the
-/// line is final; the line itself is not kept. The returned code is that
-/// final line's status, for the `220` check. Bytes after the final line,
-/// including a handshake record, stay in `reader`.
+/// inside the needle hold-back. Bytes already emitted for the current
+/// line go to the guest in one write when that line ends, so the capture
+/// path can deliver the line before the handshake. The first four bytes
+/// decide whether the line is final; the line itself is not kept. The
+/// returned code is that final line's status, for the `220` check. Bytes
+/// after the final line, including a handshake record, stay in `reader`.
 async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<[u8; 3]>, Error>
 where
   R: AsyncRead + Unpin,
@@ -431,10 +433,11 @@ where
 {
   let mut head = ReplyHead::default();
   let mut saw = false;
+  let mut pending = Vec::new();
   let mut byte = [0u8; 1];
   loop {
     match reader.read(&mut byte).await {
-      Ok(0) => return end_reply(up, guest, saw, &head).await,
+      Ok(0) => return end_reply(up, guest, saw, &head, &mut pending).await,
       Ok(_) => {
         let Some(next) = byte.first().copied() else {
           return Err(Error::UpstreamRead {
@@ -442,9 +445,10 @@ where
           });
         };
         saw = true;
-        write_fed(up, guest, &byte).await?;
+        collect_fed(up, &mut pending, &byte).await?;
         if next == b'\n' {
-          write_fed(up, guest, &[]).await?;
+          collect_fed(up, &mut pending, &[]).await?;
+          flush_pending(guest, &mut pending).await?;
           if head.is_final() {
             return Ok(Some(head.code));
           }
@@ -453,7 +457,7 @@ where
           head.observe(next);
         }
       }
-      Err(err) if err.kind() == ErrorKind::UnexpectedEof => return end_reply(up, guest, saw, &head).await,
+      Err(err) if err.kind() == ErrorKind::UnexpectedEof => return end_reply(up, guest, saw, &head, &mut pending).await,
       Err(source) => return Err(Error::UpstreamRead { source }),
     }
   }
@@ -491,32 +495,52 @@ impl ReplyHead {
   }
 }
 
-/// Flush the hold-back when the peer closes, and return the status when
-/// that partial line was already final.
-async fn end_reply<G>(up: &mut Smtp, guest: &mut GuestLeg<G>, saw: bool, head: &ReplyHead) -> Result<Option<[u8; 3]>, Error>
+/// Flush the hold-back when the peer closes, write what was already
+/// emitted, and return the status when that partial line was already final.
+async fn end_reply<G>(
+  up: &mut Smtp,
+  guest: &mut GuestLeg<G>,
+  saw: bool,
+  head: &ReplyHead,
+  pending: &mut Vec<u8>,
+) -> Result<Option<[u8; 3]>, Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
   if !saw {
     return Ok(None);
   }
-  write_fed(up, guest, &[]).await?;
+  collect_fed(up, pending, &[]).await?;
+  flush_pending(guest, pending).await?;
   if head.is_final() { Ok(Some(head.code)) } else { Ok(None) }
 }
 
-/// Feed one arrival to the upstream machine and write what it emits.
+/// Feed one arrival to the upstream machine and keep what it emits.
 /// An empty chunk flushes the hold-back; the caller does that on newline
-/// or EOF only.
-async fn write_fed<G>(up: &mut Smtp, guest: &mut GuestLeg<G>, bytes: &[u8]) -> Result<(), Error>
-where
-  G: AsyncRead + AsyncWrite + Unpin,
-{
+/// or EOF only. The guest is not written here.
+async fn collect_fed(up: &mut Smtp, pending: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
   let (rewritten, hits) = up.feed(bytes).await;
   log_hits(&hits);
   match rewritten {
-    Rewritten::Emit(emitted) if !emitted.is_empty() => write_guest(guest, &emitted).await,
+    Rewritten::Emit(emitted) if !emitted.is_empty() => {
+      pending.extend_from_slice(&emitted);
+      Ok(())
+    }
     Rewritten::Emit(_) | Rewritten::Hold | Rewritten::Close => Ok(()),
   }
+}
+
+/// One guest write for the line whose bytes have already been through `feed`.
+async fn flush_pending<G>(guest: &mut GuestLeg<G>, pending: &mut Vec<u8>) -> Result<(), Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  if pending.is_empty() {
+    return Ok(());
+  }
+  write_guest(guest, pending).await?;
+  pending.clear();
+  Ok(())
 }
 
 fn is_220(code: [u8; 3]) -> bool {
@@ -545,10 +569,42 @@ pub(super) fn tls_server(stream: ClientTlsStream<TcpStream>) -> ServerLeg {
 
 #[cfg(test)]
 mod tests {
+  use std::pin::Pin;
+  use std::task::{Context, Poll};
+
   use arkham_config::grants::{Credential, GuestTlsMode, SmtpLeg, SmtpScope};
   use secrecy::SecretString;
+  use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
   use super::{Direction, Smtp, Wire};
+
+  #[derive(Default)]
+  struct WriteLog {
+    buf: Vec<u8>,
+    writes: Vec<usize>,
+  }
+
+  impl AsyncRead for WriteLog {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+  }
+
+  impl AsyncWrite for WriteLog {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+      self.writes.push(buf.len());
+      self.buf.extend_from_slice(buf);
+      Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+  }
 
   const FAKE_PASS: &str = "fake-smtp-pass"; // betterleaks:allow
   const REAL_PASS: &str = "real-smtp-pass"; // betterleaks:allow
@@ -630,6 +686,23 @@ mod tests {
     assert_eq!(writer.into_inner(), banner);
     let at = usize::try_from(cursor.position()).unwrap();
     assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
+  }
+
+  /// Each finished line is one guest write. A write per byte fills the
+  /// capture path's outbound queue before `STARTTLS` can handshake.
+  #[tokio::test]
+  async fn reply_lines_are_one_guest_write() {
+    let banner = b"220-wait\r\n220 2.0.0 Ready to start TLS\r\n";
+    let mut cursor = std::io::Cursor::new(banner.to_vec());
+    let mut guest = super::plain_guest(WriteLog::default());
+    let mut up = upstream();
+    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    assert_eq!(reply, *b"220");
+    let super::GuestLeg::Plain(log) = guest else {
+      unreachable!("the guest leg is the write log");
+    };
+    assert_eq!(log.writes, vec![b"220-wait\r\n".len(), b"220 2.0.0 Ready to start TLS\r\n".len()]);
+    assert_eq!(log.buf, banner);
   }
 
   /// A reply that echoes a real password longer than the decoy is written
