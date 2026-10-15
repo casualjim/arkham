@@ -947,8 +947,7 @@ mod tests {
     assert!(!out.windows(REAL_PASS.len()).any(|window| window == REAL_PASS.as_bytes()));
   }
 
-  /// Each reply line is written as it finishes. The next bytes are a
-  /// handshake record; consuming them as another SMTP line fails it.
+  /// The handshake record is the suffix after the final line.
   #[tokio::test]
   async fn acceptance_line_leaves_the_handshake_bytes() {
     let banner = b"220-wait\r\n220 2.0.0 Ready to start TLS\r\n";
@@ -971,8 +970,7 @@ mod tests {
     assert_eq!(at, payload_len, "the chunk includes the bytes after the final line");
   }
 
-  /// A bare newline is a final line. The handshake that follows it stays
-  /// in the reader; the old `at == 0` check kept reading those bytes.
+  /// A bare newline is a final line. The handshake that follows it is the suffix.
   #[tokio::test]
   async fn bare_newline_is_final_and_leaves_the_handshake() {
     let mut payload = vec![b'\n'];
@@ -1101,6 +1099,35 @@ mod tests {
     assert!(text.ends_with("\r\n"), "{text}");
   }
 
+  /// A password split across two reads, with no newline, is still the decoy.
+  /// EOF flushes the hold-back.
+  #[tokio::test]
+  async fn password_split_across_reads_redacts_without_a_newline() {
+    let line = format!("535 {REAL_PASS}");
+    let pass_at = line.find(REAL_PASS).unwrap();
+    let cut = pass_at + 4;
+    let mut reader = PauseReader {
+      first: line.as_bytes().get(..cut).unwrap().to_vec(),
+      second: line.as_bytes().get(cut..).unwrap().to_vec(),
+      at: 0,
+      stage: 0,
+    };
+    let mut guest = super::plain_guest(WriteLog::default());
+    let mut up = upstream();
+    let reply = drive(super::acceptance_reply(&mut reader, &mut up, &mut guest, &[]))
+      .unwrap()
+      .code
+      .unwrap();
+    assert_eq!(reply, *b"535");
+    let super::GuestLeg::Plain(log) = guest else {
+      unreachable!("the guest leg is the write log");
+    };
+    let text = String::from_utf8(log.buf).unwrap();
+    assert!(text.contains(FAKE_PASS), "{text}");
+    assert!(!text.contains(REAL_PASS), "{text}");
+    assert_eq!(log.writes.len(), 2, "{:?}", log.writes);
+  }
+
   /// Each read chunk is one guest write. A line longer than the read is
   /// several writes. A write per byte fills the capture path's outbound
   /// queue before `STARTTLS` can handshake.
@@ -1188,7 +1215,7 @@ mod tests {
   }
 
   /// A real password that crosses the old 16 KiB cut is one reply. The
-  /// guest sees the decoy, and the bytes after the newline stay unread.
+  /// guest sees the decoy. The handshake is the suffix after the newline.
   #[tokio::test]
   async fn long_reply_redacts_a_password_across_the_old_cut() {
     const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
