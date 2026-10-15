@@ -20,7 +20,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 | `listen` | `127.0.0.1:8080` | `ARKHAM_LISTEN` | Address the explicit proxy listens on. |
 | `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/arkham/ca.pem` | `ARKHAM_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `arkham ca` also writes `ca.crt` and `ca.key` beside it. |
 | `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
-| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, the LDAP StartTLS reply, the NATS server's INFO line, and the upstream `SSLRequest` answer all share this budget. |
+| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, the LDAP StartTLS reply, and the upstream `SSLRequest` answer all share this budget. The NATS server's INFO line is not on this budget. |
 
 ## `[rules.<label>]`
 
@@ -150,7 +150,7 @@ A rule whose `value` states a `nats://` or `tls://` connection string is a NATS 
 
 The fake string takes no query; its spelling does not matter, because the guest picks its own TLS after the server's INFO line. The real string states how arkham reaches the server. `nats://` is cleartext: the leg never upgrades, CONNECT forwards the decoy, and loading the rule logs a warning. `tls://` reads the server's cleartext INFO line, upgrades the upstream leg, and only then swaps CONNECT. With `handshake_first=true`, both legs do TLS before any protocol byte. A real `tls://` string may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together. Arkham reads the query off the real string and does not send it to the server. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`. That table rejects `root_cert`, `client_cert`, and `client_key`, because upstream trust and identity belong on the real string.
 
-The wire machine swaps CONNECT only when every mapped field holds the decoy, and re-encodes that CONNECT as compact JSON. A CONNECT with any other value is forwarded byte-identical. `nkey`, `jwt`, and `sig` pass unchanged. PUB and HPUB payloads stream untouched. Server lines such as INFO and `-ERR` redact the real value back to the decoy. MSG and HMSG payloads are never rewritten: a payload that carries the real value closes the connection.
+The wire machine swaps CONNECT only when every mapped field holds the decoy, and re-encodes that CONNECT as compact JSON. A CONNECT with any other value is forwarded byte-identical. A CONNECT longer than 16 KiB is forwarded byte-identical too, and the session stays open. `nkey`, `jwt`, and `sig` pass unchanged, so they are still real secrets inside the agent. PUB and HPUB payloads stream untouched. Server lines such as INFO and `-ERR` redact the real value back to the decoy. MSG and HMSG payloads are never rewritten: a payload that carries the real value closes the connection.
 
 ```toml
 [rules.bus]
