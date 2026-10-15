@@ -423,8 +423,9 @@ where
 const REPLY_READ: usize = 8192;
 
 /// One SMTP reply, including a multiline (`250-` … `250 `) continuation.
-/// Each read is fed to the upstream machine and what it emits is written
-/// before the next read. `feed(&[])` runs only on newline or EOF, so a
+/// Each read is fed to the upstream machine. What it emits is collected
+/// into one buffer for that read and written before the next read.
+/// `feed(&[])` runs only on newline or EOF, so a
 /// password split across reads stays inside the needle hold-back, and the
 /// guest is flushed there too. The first four bytes decide whether the
 /// line is final; the line itself is not kept. The returned code is that
@@ -438,6 +439,9 @@ where
   let mut head = ReplyHead::default();
   let mut saw = false;
   let mut buf = [0u8; REPLY_READ];
+  // One chunk's emit. Cleared after the write, so the next read starts empty.
+  // `Raw` is what keeps a needle prefix across reads.
+  let mut emit = Vec::with_capacity(REPLY_READ);
   loop {
     match read_reply_chunk(reader, &mut buf).await? {
       ReplyChunk::Eof(0) if !saw => return Ok(None),
@@ -445,9 +449,10 @@ where
         if n > 0 {
           let bytes = chunk_bytes(&buf, n)?;
           observe_reply(&mut head, bytes, false);
-          write_fed(up, guest, bytes).await?;
+          append_fed(up, &mut emit, bytes).await?;
         }
-        write_fed(up, guest, &[]).await?;
+        append_fed(up, &mut emit, &[]).await?;
+        write_emit(guest, &mut emit).await?;
         flush_guest(guest).await?;
         if head.is_final() {
           return Ok(Some(head.code));
@@ -458,11 +463,14 @@ where
         saw = true;
         let bytes = chunk_bytes(&buf, n)?;
         observe_reply(&mut head, bytes, newline);
-        write_fed(up, guest, bytes).await?;
+        append_fed(up, &mut emit, bytes).await?;
+        if newline {
+          append_fed(up, &mut emit, &[]).await?;
+        }
+        write_emit(guest, &mut emit).await?;
         if !newline {
           continue;
         }
-        write_fed(up, guest, &[]).await?;
         flush_guest(guest).await?;
         // A bare `\n` never reaches `observe`, so `at` stays 0. That line
         // is still final: continuing would consume the following handshake.
@@ -581,18 +589,32 @@ impl ReplyHead {
   }
 }
 
-/// Feed one chunk and write what the machine emits. An empty chunk flushes
-/// the hold-back; the caller does that on newline or EOF only.
-async fn write_fed<G>(up: &mut Smtp, guest: &mut GuestLeg<G>, bytes: &[u8]) -> Result<(), Error>
-where
-  G: AsyncRead + AsyncWrite + Unpin,
-{
+/// Append what one feed emits. An empty chunk flushes the hold-back. The
+/// caller does that on newline or EOF, then writes `emit` once.
+async fn append_fed(up: &mut Smtp, emit: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
   let (rewritten, hits) = up.feed(bytes).await;
   log_hits(&hits);
   match rewritten {
-    Rewritten::Emit(emitted) if !emitted.is_empty() => write_guest_bytes(guest, &emitted).await,
+    Rewritten::Emit(part) if !part.is_empty() => {
+      emit.extend_from_slice(&part);
+      Ok(())
+    }
     Rewritten::Emit(_) | Rewritten::Hold | Rewritten::Close => Ok(()),
   }
+}
+
+/// One guest write for the chunk just fed. `emit` is empty afterwards.
+async fn write_emit<G>(guest: &mut GuestLeg<G>, emit: &mut Vec<u8>) -> Result<(), Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  if emit.is_empty() {
+    return Ok(());
+  }
+  write_guest_bytes(guest, emit).await?;
+  emit.clear();
+  emit.shrink_to(REPLY_READ);
+  Ok(())
 }
 
 /// Write without flushing. The caller flushes on newline or EOF.
@@ -680,6 +702,7 @@ mod tests {
   #[derive(Clone, Default)]
   struct SharedLog {
     buf: Arc<Mutex<Vec<u8>>>,
+    writes: Arc<Mutex<Vec<usize>>>,
     flushes: Arc<Mutex<u32>>,
   }
 
@@ -692,6 +715,7 @@ mod tests {
   impl AsyncWrite for SharedLog {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
       self.buf.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(buf);
+      self.writes.lock().unwrap_or_else(PoisonError::into_inner).push(buf.len());
       Poll::Ready(Ok(buf.len()))
     }
 
@@ -897,6 +921,7 @@ mod tests {
     let mut reader = PendAfter { data: data.clone(), at: 0 };
     let log = SharedLog::default();
     let buf = Arc::clone(&log.buf);
+    let writes = Arc::clone(&log.writes);
     let flushes = Arc::clone(&log.flushes);
     let mut guest = super::plain_guest(log);
     let mut up = upstream();
@@ -909,7 +934,33 @@ mod tests {
     );
     let got = buf.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert_eq!(got, data, "guest holds {} bytes while the line is still open", got.len());
+    let writes = writes.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert!(writes.len() > 1, "one write would be the whole line: {writes:?}");
+    assert!(
+      writes.iter().all(|len| *len <= super::REPLY_READ),
+      "a write grew past one read: {writes:?}"
+    );
+    assert_eq!(writes.iter().sum::<usize>(), data.len());
     assert_eq!(*flushes.lock().unwrap_or_else(PoisonError::into_inner), 0);
+  }
+
+  /// The hold-back released at EOF belongs to that same read. A second
+  /// write is another queue message for bytes already in hand.
+  #[tokio::test]
+  async fn eof_holdback_is_one_write_with_the_chunk() {
+    let line = format!("535 {REAL_PASS}");
+    let cut = line.len() - 4;
+    let bytes = line.as_bytes().get(..cut).unwrap().to_vec();
+    let mut cursor = std::io::Cursor::new(bytes.clone());
+    let mut guest = super::plain_guest(WriteLog::default());
+    let mut up = upstream();
+    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    assert_eq!(reply, *b"535");
+    let super::GuestLeg::Plain(log) = guest else {
+      unreachable!("the guest leg is the write log");
+    };
+    assert_eq!(log.writes.len(), 1, "{:?}", log.writes);
+    assert_eq!(log.buf, bytes);
   }
 
   /// A needle prefix still in the hold-back is written when the peer
@@ -961,8 +1012,9 @@ mod tests {
     assert!(text.ends_with("\r\n"), "{text}");
   }
 
-  /// Each finished line is one guest write. A write per byte fills the
-  /// capture path's outbound queue before `STARTTLS` can handshake.
+  /// Each read chunk is one guest write. A line longer than the read is
+  /// several writes. A write per byte fills the capture path's outbound
+  /// queue before `STARTTLS` can handshake.
   #[tokio::test]
   async fn reply_lines_are_one_guest_write() {
     let banner = b"220-wait\r\n220 2.0.0 Ready to start TLS\r\n";
@@ -976,6 +1028,25 @@ mod tests {
     };
     assert_eq!(log.writes, vec![b"220-wait\r\n".len(), b"220 2.0.0 Ready to start TLS\r\n".len()]);
     assert_eq!(log.buf, banner);
+
+    let mut line = vec![b'q'; super::REPLY_READ + 50];
+    line.extend_from_slice(b"\r\n");
+    let reply_len = line.len();
+    let mut payload = line;
+    payload.extend_from_slice(&[0x16, 0x03, 0x01]);
+    let mut cursor = std::io::Cursor::new(payload);
+    let mut guest = super::plain_guest(WriteLog::default());
+    let mut up = upstream();
+    let code = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    assert_eq!(code, *b"qqq");
+    let super::GuestLeg::Plain(log) = guest else {
+      unreachable!("the guest leg is the write log");
+    };
+    assert_eq!(log.writes, vec![super::REPLY_READ, 50 + 2]);
+    assert!(log.writes.iter().all(|len| *len <= super::REPLY_READ));
+    let at = usize::try_from(cursor.position()).unwrap();
+    assert_eq!(at, reply_len);
+    assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
   }
 
   /// A reply that echoes a real password longer than the decoy is written
