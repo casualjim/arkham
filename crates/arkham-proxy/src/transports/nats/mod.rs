@@ -267,6 +267,9 @@ impl NatsTransport {
       return Ok(());
     };
     if head.first() != Some(&TLS_RECORD_HANDSHAKE) {
+      if open.scope.guest_tls == GuestTlsMode::Mtls {
+        return Err(Error::NatsGuestPlaintext);
+      }
       return relay_guarded(guest, stream, &mut down, &mut up, &head, &first).await;
     }
     let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &head, open.budget, Some(open.authority), open.mint).await? else {
@@ -363,13 +366,71 @@ where
 #[cfg(test)]
 mod tests {
   use std::io::Cursor;
+  use std::time::Duration;
 
+  use arkham_config::grants::{GuestTlsMode, NatsScope};
+  use arkham_pki::ca::CertAuthority;
   use pretty_assertions::assert_eq;
+  use tokio::io::AsyncReadExt as _;
+
+  use super::{NatsTransport, Open, ServerLeg, nats_pair};
 
   use super::machine::Nats;
   use super::machine::tests::nats_grants;
   use super::server_info;
   use crate::transports::engine::{Rewritten, Wire};
+
+  #[tokio::test]
+  async fn mtls_plaintext_guest_closes_without_forwarding() {
+    let ca = CertAuthority::generate().expect("ca");
+    let transport = NatsTransport::new(&ca).expect("transport");
+    let mut scope = NatsScope::from_strings(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",   // betterleaks:allow
+      "tls://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    )
+    .expect("scope");
+    scope.guest_tls = GuestTlsMode::Mtls;
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",   // betterleaks:allow
+      "tls://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let (down, up) = nats_pair(&grants, "nats.internal", 4222, true);
+    let (mut upstream, server) = tokio::io::duplex(256);
+    let (guest_peer, guest) = tokio::io::duplex(64);
+    drop(guest_peer);
+    let mint = crate::mint::MintBucket::new();
+    let open = Open {
+      scope: &scope,
+      grants: &grants,
+      port: 4222,
+      budget: Duration::from_secs(10),
+      mint: &mint,
+      authority: "nats.internal",
+      fwmark: None,
+    };
+    let connect = b"CONNECT {\"user\":\"agent\",\"pass\":\"arkham_fake_nats_pass\"}\r\n"; // betterleaks:allow
+    let finished = tokio::time::timeout(
+      Duration::from_millis(200),
+      transport.relay_guest(
+        guest,
+        connect,
+        ServerLeg {
+          stream: server,
+          first: Vec::new(),
+          down,
+          up,
+        },
+        &open,
+      ),
+    )
+    .await
+    .expect("plaintext mtls guest must not enter the relay");
+    let err = finished.expect_err("plaintext mtls guest");
+    assert!(matches!(err, crate::Error::NatsGuestPlaintext), "{err}");
+    let mut forwarded = Vec::new();
+    upstream.read_to_end(&mut forwarded).await.expect("upstream read");
+    assert_eq!(forwarded, b"");
+  }
 
   #[tokio::test]
   async fn info_reader_leaves_the_bytes_after_the_newline() {

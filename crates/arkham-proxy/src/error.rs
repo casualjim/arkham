@@ -352,6 +352,9 @@ pub enum Error {
   /// A NATS TLS handshake exceeded the configured budget.
   #[error("nats handshake timed out")]
   NatsHandshakeTimeout,
+  /// `guest_tls_mode` is `mtls` and the guest sent plaintext after INFO.
+  #[error("nats mtls guest sent plaintext")]
+  NatsGuestPlaintext,
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,
