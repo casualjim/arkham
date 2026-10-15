@@ -246,10 +246,12 @@ impl FromStr for NatsUri {
   fn from_str(entry: &str) -> Result<Self, Self::Err> {
     let scheme = NatsUriScheme::of(entry).ok_or(NatsUriError::Scheme)?;
     let url = Url::parse(entry).map_err(|source| NatsUriError::Url { source })?;
-    let host = url
-      .host()
-      .map(|host| host.to_string().to_ascii_lowercase())
-      .ok_or(NatsUriError::EmptyHost)?;
+    let host = match url.host() {
+      Some(url::Host::Domain(domain)) => domain.to_ascii_lowercase(),
+      Some(url::Host::Ipv4(addr)) => addr.to_string(),
+      Some(url::Host::Ipv6(addr)) => addr.to_string(),
+      None => return Err(NatsUriError::EmptyHost),
+    };
     // `url` drops an empty password, so `user:@host` reads as a token.
     let auth = match (url.username(), url.password()) {
       ("", None) => return Err(NatsUriError::CredentialRequired),
@@ -611,6 +613,14 @@ mod tests {
       assert_eq!(scope.upstream_tls, upstream_tls, "{real}");
       assert_eq!(fields(&scope.auth), swapped, "{real}");
     }
+  }
+
+  #[test]
+  fn tls_ipv6_host_drops_the_brackets() {
+    let scope = NatsScope::from_strings("nats://u:p@[::1]:4222", "tls://u:p@[::1]:4222").expect("ipv6");
+    assert_eq!(scope.downstream.host, "::1");
+    assert_eq!(scope.upstream.host, "::1");
+    assert_eq!(scope.upstream.port, 4222);
   }
 
   #[test]
