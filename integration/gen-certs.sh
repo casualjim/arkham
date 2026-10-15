@@ -61,6 +61,8 @@ openssl req -new -key "$dir/nats.key" -out "$dir/nats.csr" -subj "/CN=nats"
 printf "subjectAltName=IP:10.202.0.90,DNS:nats\n" >"$dir/nats.ext"
 openssl x509 -req -in "$dir/nats.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
   -CAcreateserial -out "$dir/nats.crt" -days 2 -extfile "$dir/nats.ext"
+# The nats image reads this leaf as its service user. Match mail.key.
+chmod 644 "$dir/nats.key" "$dir/nats.crt"
 
 cat "$dir/ca.crt" "$dir/ca.key" >"$dir/ca.pem"
 chmod 600 "$dir/ca.key" "$dir/ca.pem"
