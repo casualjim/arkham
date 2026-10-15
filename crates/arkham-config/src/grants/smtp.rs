@@ -491,6 +491,31 @@ mod tests {
   }
 
   #[test]
+  fn every_real_query_key_is_rejected_on_the_fake_string() {
+    let real = format!("smtp://{USER}:{PASS}@mail.internal:587");
+    let keys = [
+      super::SmtpQuery::SslMode,
+      super::SmtpQuery::Ssl,
+      super::SmtpQuery::SslNegotiation,
+      super::SmtpQuery::SslRootCert,
+      super::SmtpQuery::SslCert,
+      super::SmtpQuery::SslKey,
+    ];
+    for query in keys {
+      let key = query.as_str();
+      let fake = format!("smtp://{USER}:{PASS}@mail.internal:587?{key}=1");
+      let err = SmtpScope::from_strings(&fake, &real).expect_err(key);
+      assert!(
+        matches!(err, super::SmtpUriError::FakeRealOnly { key: ref got } if got == key),
+        "{key}: {err}"
+      );
+      let text = err.to_string();
+      assert_hides(&fake, &text, key);
+      assert!(!text.contains("smtp://"), "{text}");
+    }
+  }
+
+  #[test]
   fn fake_query_rejects_real_only_and_unknown_options() {
     let real = format!("smtp://{USER}:{PASS}@mail.internal:587");
     let cases = [
