@@ -882,6 +882,7 @@ mod tests {
     let banner = b"220-wait\r\n220 2.0.0 Ready to start TLS\r\n";
     let mut payload = banner.to_vec();
     payload.extend_from_slice(&[0x16, 0x03, 0x01]);
+    let payload_len = payload.len();
     let mut cursor = std::io::Cursor::new(payload);
     let mut guest = super::plain_guest(std::io::Cursor::new(Vec::new()));
     let mut up = upstream();
@@ -893,7 +894,8 @@ mod tests {
     };
     assert_eq!(writer.into_inner(), banner);
     let at = usize::try_from(cursor.position()).unwrap();
-    assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
+    assert_eq!(at, payload_len, "the chunk includes the bytes after the final line");
+    assert_eq!(cursor.get_ref().get(banner.len()..), Some(&[0x16, 0x03, 0x01][..]));
   }
 
   /// A bare newline is a final line. The handshake that follows it stays
@@ -1026,7 +1028,8 @@ mod tests {
     let super::GuestLeg::Plain(log) = guest else {
       unreachable!("the guest leg is the write log");
     };
-    assert_eq!(log.writes, vec![b"220-wait\r\n".len(), b"220 2.0.0 Ready to start TLS\r\n".len()]);
+    // One `read` returns both lines. One guest write covers that chunk.
+    assert_eq!(log.writes, vec![banner.len()]);
     assert_eq!(log.buf, banner);
 
     let mut line = vec![b'q'; super::REPLY_READ + 50];
