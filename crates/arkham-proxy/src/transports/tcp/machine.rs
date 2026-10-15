@@ -1,9 +1,8 @@
-//! Raw wire: no format, equal-length swap only.
-//!
-//! Pairs must be needle-length-equal (enforced at pair selection), so
-//! substitution never reframes the byte stream. A suffix hold-back window
-//! keeps cross-chunk matches whole; a fixed window would stall lockstep
-//! protocols (send a line, wait for the reply).
+//! Raw wire: no format. [`Raw::new`] keeps equal-length pairs so a TCP
+//! stream is never reframed. [`Raw::length_changing`] keeps every pair;
+//! SMTP replies use it, because a reply is a CRLF line and a shorter
+//! decoy does not shift a length prefix. Both hold back the longest
+//! needle minus one so a match split across chunks is substituted whole.
 
 use std::borrow::Cow;
 
@@ -27,10 +26,21 @@ impl Raw {
   /// grant whose replacement differs in length is skipped rather than
   /// corrupting the stream.
   pub(crate) fn new(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction) -> Self {
-    let pairs: Vec<CredentialPair> = eligible_pairs(grants, scheme, host, port, dir)
+    let pairs = eligible_pairs(grants, scheme, host, port, dir)
       .into_iter()
       .filter(|pair| pair.needle.len() == pair.replacement.len())
       .collect();
+    Self::from_pairs(pairs)
+  }
+
+  /// Like [`Self::new`], including pairs whose replacement differs in
+  /// length. The hold-back is still the longest needle minus one. The
+  /// emitted prefix carries the shorter or longer replacement.
+  pub(crate) fn length_changing(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction) -> Self {
+    Self::from_pairs(eligible_pairs(grants, scheme, host, port, dir))
+  }
+
+  fn from_pairs(pairs: Vec<CredentialPair>) -> Self {
     let tail_size = max_tail_size(&pairs);
     Self {
       pairs,

@@ -121,23 +121,35 @@ where
 
 /// Submission dialogue that refuses AUTH until STARTTLS, recording both
 /// AUTH lines so the test can see the decoy and then the real password.
-async fn serve_starttls<S>(mut conn: S, acceptor: TlsAcceptor, seen: Arc<Mutex<Vec<String>>>)
+/// `refuse_once` answers the first STARTTLS with `454` and the next with
+/// `220`. `HELP`, `VRFY`, and `EXPN` stay in the cleartext loop.
+async fn serve_starttls<S>(mut conn: S, acceptor: TlsAcceptor, seen: Arc<Mutex<Vec<String>>>, mut refuse_once: bool)
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
   write_cmd(&mut conn, "220 mail.demo.test ESMTP\r\n").await;
   loop {
     let line = read_reply(&mut conn).await;
-    if line.to_ascii_uppercase().starts_with("EHLO") || line.to_ascii_uppercase().starts_with("HELO") {
+    let upper = line.to_ascii_uppercase();
+    if upper.starts_with("EHLO") || upper.starts_with("HELO") {
       write_cmd(&mut conn, "250-mail.demo.test\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n").await;
       continue;
     }
-    if line.to_ascii_uppercase().starts_with("AUTH ") {
+    if upper.starts_with("HELP") || upper.starts_with("VRFY") || upper.starts_with("EXPN") {
+      write_cmd(&mut conn, "250 2.0.0 ok\r\n").await;
+      continue;
+    }
+    if upper.starts_with("AUTH ") {
       seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(line);
       write_cmd(&mut conn, "530 5.7.0 Must issue a STARTTLS command first\r\n").await;
       continue;
     }
-    if line.to_ascii_uppercase().starts_with("STARTTLS") {
+    if upper.starts_with("STARTTLS") {
+      if refuse_once {
+        refuse_once = false;
+        write_cmd(&mut conn, "454 4.7.0 TLS temporarily unavailable\r\n").await;
+        continue;
+      }
       write_cmd(&mut conn, "220 2.0.0 Ready to start TLS\r\n").await;
       let tls = acceptor.accept(conn).await.unwrap();
       serve_authed(tls, seen).await;
@@ -170,7 +182,7 @@ async fn smtp_auth_before_starttls_stays_the_decoy_and_swaps_after() {
   let stub_seen = Arc::clone(&seen);
   let stub_task = tokio::spawn(async move {
     let (conn, _) = fx.stub.accept().await.unwrap();
-    serve_starttls(conn, acceptor, stub_seen).await;
+    serve_starttls(conn, acceptor, stub_seen, false).await;
   });
 
   let mut stream = {
@@ -228,6 +240,118 @@ async fn smtp_auth_before_starttls_stays_the_decoy_and_swaps_after() {
   );
   assert!(!recorded[1].contains(&plain_initial(USER, FAKE)));
   fx.proxy.abort();
+}
+
+/// `HELP` is an opening command. `STARTTLS` after it still upgrades, and
+/// the AUTH that follows carries the real password.
+#[tokio::test]
+async fn help_then_starttls_still_swaps_auth() {
+  let (fx, bundle, acceptor, seen) = starttls_fixture().await;
+  let stub_seen = Arc::clone(&seen);
+  let proxy_addr = fx.proxy_addr;
+  let stub_port = fx.stub_port;
+  let stub_task = tokio::spawn(async move {
+    let (conn, _) = fx.stub.accept().await.unwrap();
+    serve_starttls(conn, acceptor, stub_seen, false).await;
+  });
+  let mut stream = tunnel(proxy_addr, stub_port).await;
+  let greeting = read_reply(&mut stream).await;
+  assert!(greeting.starts_with("220"), "{greeting}");
+  write_cmd(&mut stream, "EHLO client\r\n").await;
+  let _ = read_reply(&mut stream).await;
+  for line in ["HELP\r\n", "VRFY agent@demo.test\r\n", "EXPN list\r\n"] {
+    write_cmd(&mut stream, line).await;
+    let reply = read_reply(&mut stream).await;
+    assert!(reply.starts_with("250"), "{line} {reply}");
+  }
+  upgrade_and_auth(&fx.connector, &fx.proxy, stream, &seen, stub_task).await;
+  let _ = bundle;
+}
+
+/// A `454` leaves the session in the opening. The next `STARTTLS` upgrades.
+#[tokio::test]
+async fn refused_starttls_then_retry_still_swaps_auth() {
+  let (fx, bundle, acceptor, seen) = starttls_fixture().await;
+  let stub_seen = Arc::clone(&seen);
+  let proxy_addr = fx.proxy_addr;
+  let stub_port = fx.stub_port;
+  let stub_task = tokio::spawn(async move {
+    let (conn, _) = fx.stub.accept().await.unwrap();
+    serve_starttls(conn, acceptor, stub_seen, true).await;
+  });
+  let mut stream = tunnel(proxy_addr, stub_port).await;
+  let greeting = read_reply(&mut stream).await;
+  assert!(greeting.starts_with("220"), "{greeting}");
+  write_cmd(&mut stream, "EHLO client\r\n").await;
+  let _ = read_reply(&mut stream).await;
+  write_cmd(&mut stream, "STARTTLS\r\n").await;
+  let refused = read_reply(&mut stream).await;
+  assert!(refused.starts_with("454"), "{refused}");
+  upgrade_and_auth(&fx.connector, &fx.proxy, stream, &seen, stub_task).await;
+  let _ = bundle;
+}
+
+async fn starttls_fixture() -> (MitmFixture, tempfile::TempDir, TlsAcceptor, Arc<Mutex<Vec<String>>>) {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let bundle_display = bundle.display().to_string();
+  let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+  let fx = mitm_fixture_no_alpn(move |port| {
+    vec![smtp_grant(
+      &format!("smtp://agent%40demo.test:{FAKE}@localhost:{port}"),
+      &format!("smtp://agent%40demo.test:{VALUE}@localhost:{port}?starttls=required&sslrootcert={bundle_display}"),
+    )]
+  })
+  .await;
+  (fx, bundle_dir, acceptor, seen)
+}
+
+async fn tunnel(proxy_addr: SocketAddr, stub_port: u16) -> TcpStream {
+  let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+  stream
+    .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let mut head = [0u8; 19];
+  stream.read_exact(&mut head).await.unwrap();
+  assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+  stream
+}
+
+async fn upgrade_and_auth(
+  connector: &TlsConnector,
+  proxy: &tokio::task::JoinHandle<()>,
+  mut stream: TcpStream,
+  seen: &Mutex<Vec<String>>,
+  stub_task: tokio::task::JoinHandle<()>,
+) {
+  write_cmd(&mut stream, "STARTTLS\r\n").await;
+  let ready = read_reply(&mut stream).await;
+  assert!(ready.starts_with("220"), "{ready}");
+  let name = ServerName::try_from("localhost".to_string()).unwrap();
+  let mut tls = connector.connect(name, stream).await.unwrap();
+  write_cmd(&mut tls, "EHLO client\r\n").await;
+  let ehlo = read_reply(&mut tls).await;
+  assert!(ehlo.contains("250"), "{ehlo}");
+  write_cmd(&mut tls, &auth_line(USER, FAKE)).await;
+  let ok = read_reply(&mut tls).await;
+  assert!(ok.starts_with("235"), "{ok}");
+  assert!(!ok.contains(VALUE), "{ok}");
+  drop(tls);
+  let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+  let recorded = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+  assert_eq!(recorded.len(), 1, "{recorded:?}");
+  assert!(
+    recorded[0].contains(&plain_initial(USER, VALUE)),
+    "post-upgrade AUTH must carry the real password: {}",
+    recorded[0]
+  );
+  proxy.abort();
 }
 
 /// Server that advertises CHUNKING and accepts `BDAT` chunks. Records

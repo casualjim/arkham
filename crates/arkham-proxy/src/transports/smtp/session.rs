@@ -1,13 +1,14 @@
 //! Cleartext SMTP opening, then the shared relay.
 //!
-//! The greeting, `EHLO` / `HELO`, an `AUTH` that still precedes `STARTTLS`,
-//! and `STARTTLS` plus its acceptance run lockstep. Each server reply is
-//! fed through the upstream machine before the guest sees it. The acceptance
-//! reader stops on the final reply line, so the following handshake bytes
-//! stay unread. After the upgrade, or when the guest sends anything else,
-//! both sockets go to [`relay_guarded`]. Implicit TLS skips the opening. A
-//! session that never upgrades relays with swapping off, and the decoy
-//! passes through.
+//! The greeting, `EHLO` / `HELO`, `HELP` / `VRFY` / `EXPN`, an `AUTH` that
+//! still precedes `STARTTLS`, and `STARTTLS` plus its acceptance run
+//! lockstep. Each completed reply line is redacted and written before the
+//! next line is read. The reader stops on the final reply line, so the
+//! following handshake bytes stay unread. A non-`220` answer to `STARTTLS`
+//! returns to that loop. After the upgrade, or when the guest sends anything
+//! else, both sockets go to [`relay_guarded`]. Implicit TLS skips the
+//! opening. A session that never upgrades relays with swapping off, and the
+//! decoy passes through.
 
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -175,6 +176,7 @@ where
   // cleartext `smtp://` session forwards the decoy until STARTTLS completes.
   down.set_protected(scope.is_upstream_tls);
   let mut up = Smtp::new(grants, host, port, Direction::Upstream);
+  Smtp::share_data_gate(&down, &mut up);
   if !guest.is_plain() {
     return relay_guarded(guest, server, &mut down, &mut up, &[]).await;
   }
@@ -212,20 +214,34 @@ where
   /// the relay should own. `AUTH` stays here so a refusal before the upgrade
   /// can still be followed by `STARTTLS` on the same sockets.
   async fn run(mut self) -> Result<(), Error> {
-    let Some(greeting) = acceptance_reply(&mut self.server)
-      .await
-      .map_err(|source| Error::UpstreamRead { source })?
-    else {
+    if acceptance_reply(&mut self.server, self.up, &mut self.guest).await?.is_none() {
       return Ok(());
-    };
-    let greeting = redact_opening_reply(self.up, &greeting).await;
-    write_guest(&mut self.guest, &greeting).await?;
+    }
     loop {
       let Some(line) = guest_line(&mut self.guest).await.map_err(|source| Error::GuestRead { source })? else {
         return Ok(());
       };
       if is_starttls(&line) {
-        return self.starttls(&line).await;
+        match self.forward_starttls(&line).await? {
+          StarttlsStep::Continue => continue,
+          StarttlsStep::Closed => return Ok(()),
+          StarttlsStep::Upgrade => {
+            let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
+            let server = upgrade_server(self.transport, self.scope, self.server, self.budget).await?;
+            self.down.set_protected(true);
+            return relay_guarded(guest, server, self.down, self.up, &[]).await;
+          }
+          StarttlsStep::Local => {
+            self.down.queue_starttls_ready();
+            if let Some(reply) = self.down.take_reply() {
+              write_guest(&mut self.guest, &reply).await?;
+            }
+            let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
+            self.down.set_protected(true);
+            return relay_guarded(guest, self.server, self.down, self.up, &[]).await;
+          }
+          StarttlsStep::Relay => return relay_guarded(self.guest, self.server, self.down, self.up, &[]).await,
+        }
       }
       if self.down.awaiting_auth_payload() || is_opening_command(&line) {
         match forward_down(self.down, &mut self.server, &line).await? {
@@ -233,50 +249,54 @@ where
           Forwarded::Held => return relay_guarded(self.guest, self.server, self.down, self.up, &[]).await,
           Forwarded::Sent => {}
         }
-        let Some(reply) = acceptance_reply(&mut self.server)
-          .await
-          .map_err(|source| Error::UpstreamRead { source })?
-        else {
+        if acceptance_reply(&mut self.server, self.up, &mut self.guest).await?.is_none() {
           return Ok(());
-        };
-        let reply = redact_opening_reply(self.up, &reply).await;
-        write_guest(&mut self.guest, &reply).await?;
+        }
         continue;
       }
       return relay_guarded(self.guest, self.server, self.down, self.up, &line).await;
     }
   }
 
-  /// Forward `STARTTLS` when the upstream leg is still clear, or answer it
-  /// locally when that leg is already TLS. Either way the sockets then relay.
-  async fn starttls(mut self, line: &[u8]) -> Result<(), Error> {
+  /// Forward `STARTTLS` when the upstream leg is still clear. A non-`220`
+  /// reply leaves the opening loop in place so a later `STARTTLS` can
+  /// upgrade. A `220`, or an upstream leg that is already TLS, ends the
+  /// opening.
+  async fn forward_starttls(&mut self, line: &[u8]) -> Result<StarttlsStep, Error> {
     if self.server.is_plain() {
-      write_server(&mut self.server, line).await?;
-      let Some(reply) = acceptance_reply(&mut self.server)
-        .await
-        .map_err(|source| Error::UpstreamRead { source })?
-      else {
-        return Ok(());
+      match forward_down(self.down, &mut self.server, line).await? {
+        Forwarded::Stop => return Ok(StarttlsStep::Closed),
+        Forwarded::Held => return Ok(StarttlsStep::Relay),
+        Forwarded::Sent => {}
+      }
+      let Some(last) = acceptance_reply(&mut self.server, self.up, &mut self.guest).await? else {
+        return Ok(StarttlsStep::Closed);
       };
-      let reply = redact_opening_reply(self.up, &reply).await;
-      write_guest(&mut self.guest, &reply).await?;
-      if is_220(&reply) {
-        let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
-        let server = upgrade_server(self.transport, self.scope, self.server, self.budget).await?;
-        self.down.set_protected(true);
-        return relay_guarded(guest, server, self.down, self.up, &[]).await;
+      if is_220(&last) {
+        Ok(StarttlsStep::Upgrade)
+      } else {
+        Ok(StarttlsStep::Continue)
       }
     } else if self.guest.is_plain() {
-      self.down.queue_starttls_ready();
-      if let Some(reply) = self.down.take_reply() {
-        write_guest(&mut self.guest, &reply).await?;
-      }
-      let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
-      self.down.set_protected(true);
-      return relay_guarded(guest, self.server, self.down, self.up, &[]).await;
+      Ok(StarttlsStep::Local)
+    } else {
+      Ok(StarttlsStep::Relay)
     }
-    relay_guarded(self.guest, self.server, self.down, self.up, &[]).await
   }
+}
+
+/// What `STARTTLS` did to the opening loop.
+enum StarttlsStep {
+  /// The server refused. The next guest command is still an opening command.
+  Continue,
+  /// The peer closed before the upgrade.
+  Closed,
+  /// Cleartext upstream accepted. Upgrade both legs, then relay.
+  Upgrade,
+  /// Upstream is already TLS. Answer locally and upgrade the guest.
+  Local,
+  /// Hand the sockets to the relay without an upgrade.
+  Relay,
 }
 
 /// What one downstream feed did with a complete opening line.
@@ -417,49 +437,78 @@ where
 }
 
 /// One SMTP reply, including a multiline (`250-` … `250 `) continuation.
-/// Stops on the final line. Bytes after it, including a handshake record,
-/// stay in `reader`.
-async fn acceptance_reply<R>(reader: &mut R) -> Result<Option<Vec<u8>>, std::io::Error>
+/// Each completed line is redacted and written before the next byte is
+/// read. The returned line is the last one, for the `220` check. Bytes
+/// after the final line, including a handshake record, stay in `reader`.
+async fn acceptance_reply<R, G>(reader: &mut R, up: &mut Smtp, guest: &mut GuestLeg<G>) -> Result<Option<Vec<u8>>, Error>
 where
   R: AsyncRead + Unpin,
+  G: AsyncRead + AsyncWrite + Unpin,
 {
-  let mut all = Vec::new();
+  let mut last = Vec::new();
   let mut line = Vec::new();
   let mut byte = [0u8; 1];
+  let mut saw = false;
   loop {
     match reader.read(&mut byte).await {
-      Ok(0) => {
-        if all.is_empty() && line.is_empty() {
-          return Ok(None);
-        }
-        all.extend_from_slice(&line);
-        return Ok(Some(all));
-      }
+      Ok(0) => return finish_reply(up, guest, &mut last, line, saw).await,
       Ok(_) => {
         let Some(next) = byte.first().copied() else {
-          return Err(std::io::Error::other("empty read"));
+          return Err(Error::UpstreamRead {
+            source: std::io::Error::other("empty read"),
+          });
         };
         line.push(next);
+        saw = true;
         if next != b'\n' && line.len() < MAX_COMMAND {
           continue;
         }
         let finished = is_final_line(&line) || !line.ends_with(b"\n");
-        all.extend_from_slice(&line);
-        line.clear();
+        stream_reply_line(up, guest, &line).await?;
+        last = std::mem::take(&mut line);
         if finished {
-          return Ok(Some(all));
+          return Ok(Some(last));
         }
       }
-      Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
-        if all.is_empty() && line.is_empty() {
-          return Ok(None);
-        }
-        all.extend_from_slice(&line);
-        return Ok(Some(all));
-      }
-      Err(err) => return Err(err),
+      Err(err) if err.kind() == ErrorKind::UnexpectedEof => return finish_reply(up, guest, &mut last, line, saw).await,
+      Err(source) => return Err(Error::UpstreamRead { source }),
     }
   }
+}
+
+/// Write a partial line the peer closed on, and return the last line kept.
+async fn finish_reply<G>(
+  up: &mut Smtp,
+  guest: &mut GuestLeg<G>,
+  last: &mut Vec<u8>,
+  line: Vec<u8>,
+  saw: bool,
+) -> Result<Option<Vec<u8>>, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  if !saw && line.is_empty() && last.is_empty() {
+    return Ok(None);
+  }
+  if !line.is_empty() {
+    stream_reply_line(up, guest, &line).await?;
+    *last = line;
+  }
+  if last.is_empty() {
+    Ok(None)
+  } else {
+    Ok(Some(std::mem::take(last)))
+  }
+}
+
+/// Redact one completed reply line and write it. The line itself is not
+/// retained with the lines that preceded it.
+async fn stream_reply_line<G>(up: &mut Smtp, guest: &mut GuestLeg<G>, line: &[u8]) -> Result<(), Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  let redacted = redact_opening_reply(up, line).await;
+  write_guest(guest, &redacted).await
 }
 
 fn is_final_line(line: &[u8]) -> bool {
@@ -556,7 +605,7 @@ mod tests {
     assert!(!out.windows(REAL_PASS.len()).any(|window| window == REAL_PASS.as_bytes()));
   }
 
-  /// The acceptance line is the whole reply. The next bytes are a
+  /// Each reply line is written as it finishes. The next bytes are a
   /// handshake record; consuming them as another SMTP line fails it.
   #[tokio::test]
   async fn acceptance_line_leaves_the_handshake_bytes() {
@@ -564,9 +613,59 @@ mod tests {
     let mut payload = banner.to_vec();
     payload.extend_from_slice(&[0x16, 0x03, 0x01]);
     let mut cursor = std::io::Cursor::new(payload);
-    let reply = super::acceptance_reply(&mut cursor).await.unwrap().unwrap();
-    assert_eq!(reply, banner);
+    let mut guest = super::plain_guest(std::io::Cursor::new(Vec::new()));
+    let mut up = upstream();
+    let reply = super::acceptance_reply(&mut cursor, &mut up, &mut guest).await.unwrap().unwrap();
+    assert_eq!(reply, b"220 2.0.0 Ready to start TLS\r\n");
+    assert!(super::is_220(&reply));
+    let super::GuestLeg::Plain(writer) = guest else {
+      unreachable!("the guest leg is the cursor");
+    };
+    assert_eq!(writer.into_inner(), banner);
     let at = usize::try_from(cursor.position()).unwrap();
     assert_eq!(cursor.get_ref().get(at..), Some(&[0x16, 0x03, 0x01][..]));
+  }
+
+  /// A reply that echoes a real password longer than the decoy is written
+  /// with the decoy. The status code stays the server's.
+  #[tokio::test]
+  async fn opening_reply_redacts_a_longer_real_password() {
+    const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
+    let scope = SmtpScope {
+      downstream: SmtpLeg {
+        host: "mail".into(),
+        port: 587,
+        user: "agent@demo.test".into(),
+        password: SecretString::from(FAKE_PASS),
+      },
+      is_downstream_tls: false,
+      upstream: SmtpLeg {
+        host: "mail".into(),
+        port: 587,
+        user: "agent@demo.test".into(),
+        password: SecretString::from(LONG_REAL),
+      },
+      is_upstream_tls: true,
+      starttls_required: false,
+      root_cert: None,
+      client_cert: None,
+      client_key: None,
+      guest_tls: GuestTlsMode::default(),
+    };
+    let grant = arkham_config::grants::Grant::Smtp {
+      credential: Credential {
+        label: "smtp".into(),
+        fake: FAKE_PASS.into(),
+        value: SecretString::from(LONG_REAL),
+      },
+      scope: Box::new(scope),
+    };
+    let mut up = Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream);
+    let reply = format!("535 5.7.8 authentication failed for {LONG_REAL}\r\n");
+    let out = super::redact_opening_reply(&mut up, reply.as_bytes()).await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("535 "), "{text}");
+    assert!(text.contains(FAKE_PASS), "{text}");
+    assert!(!text.contains(LONG_REAL), "{text}");
   }
 }

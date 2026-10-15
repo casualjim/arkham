@@ -5,18 +5,22 @@
 //! mechanism, and a `BDAT` size. `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`,
 //! and `AUTH OAUTHBEARER` reframe to the upstream spelling at any length,
 //! inline or on the continuation line after a `334`. The SASL payload itself
-//! stays local, because the parser does not swap credentials. `DATA` passes
-//! bytes until the terminating dot, holding back only the suffix that might
-//! still grow into `\r\n.\r\n`. `BDAT n` passes the next `n` octets and
-//! nothing more. Every other command is forwarded as it arrives. Upstream is
-//! the engine's [`Raw`] machine: equal-length password bytes are redacted,
-//! and a `334` challenge is not rewritten. Replies stay on [`Raw`]:
-//! smtp-proto parses them only through a receiver that buffers.
+//! stays local, because the parser does not swap credentials. `DATA` stays a
+//! command until the matching upstream reply is a final `354`; a `530` or
+//! `503` leaves the next command in command mode. The body then passes bytes
+//! until the terminating dot, holding back only the suffix that might still
+//! grow into `\r\n.\r\n`. `BDAT n` passes the next `n` octets and nothing
+//! more. Every other command is forwarded as it arrives. Upstream redacts
+//! through [`Raw`], including a real password longer than its decoy. A `334`
+//! challenge is not rewritten. Replies stay on [`Raw`]: smtp-proto parses
+//! them only through a receiver that buffers.
 //!
 //! `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are challenge-response mechanisms
 //! and are relayed unchanged.
 
 use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use arkham_config::grants::{Grant, Scheme};
 use base64::Engine as _;
@@ -44,8 +48,12 @@ const SASL_SEP: u8 = 0x01;
 pub(crate) struct Smtp {
   /// Parse state. `None` on the response leg.
   down: Option<Down>,
-  /// Equal-length redaction. `None` on the request leg.
+  /// Reply redaction. `None` on the request leg.
   raw: Option<Raw>,
+  /// Command and `DATA` reply accounting, shared by the two legs.
+  gate: Arc<DataGate>,
+  /// Upstream reply-line cursor. The request leg leaves it at rest.
+  scan: ReplyScan,
 }
 
 /// Downstream parse state.
@@ -62,6 +70,88 @@ struct Down {
   /// Guest-bound bytes queued for [`Wire::take_reply`].
   reply: Option<Vec<u8>>,
   closed: bool,
+  /// Shared with the upstream leg.
+  gate: Arc<DataGate>,
+}
+
+/// Commands sent downstream and the final replies that answer them.
+///
+/// `DATA` is one command. Its reply is the final line whose sequence
+/// number matches, a `354` or a refusal. The numbers are monotonic, so a
+/// reply that is still unread when a later command is forwarded still
+/// answers the earlier command.
+struct DataGate {
+  cmds: AtomicU32,
+  replies: AtomicU32,
+  /// Command number of an outstanding `DATA`, or `0`.
+  data_cmd: AtomicU32,
+  /// The matching reply was a final `354`.
+  accepted: AtomicBool,
+}
+
+impl DataGate {
+  fn new() -> Self {
+    Self {
+      cmds: AtomicU32::new(0),
+      replies: AtomicU32::new(0),
+      data_cmd: AtomicU32::new(0),
+      accepted: AtomicBool::new(false),
+    }
+  }
+
+  /// Record one line that expects a reply. Returns its command number.
+  fn note_outbound(&self) -> u32 {
+    let next = self.cmds.load(Ordering::Relaxed).saturating_add(1);
+    self.cmds.store(next, Ordering::Release);
+    next
+  }
+
+  /// `cmd` is a `DATA` command waiting for its reply.
+  fn note_data(&self, cmd: u32) {
+    self.data_cmd.store(cmd, Ordering::Release);
+  }
+
+  /// The message body ended. The server's `250` answers this line.
+  fn note_body_end(&self) {
+    let _cmd = self.note_outbound();
+  }
+
+  /// One final reply line. A final `354` for the outstanding `DATA`
+  /// opens the body; any other code for that command leaves it closed.
+  fn on_final_reply(&self, code: [u8; 3]) {
+    let cmds = self.cmds.load(Ordering::Acquire);
+    let prev = self.replies.load(Ordering::Acquire);
+    if prev >= cmds {
+      return;
+    }
+    let next = prev.saturating_add(1);
+    self.replies.store(next, Ordering::Release);
+    if self.data_cmd.load(Ordering::Acquire) != next {
+      return;
+    }
+    if code == *b"354" {
+      self.accepted.store(true, Ordering::Release);
+    } else {
+      self.data_cmd.store(0, Ordering::Release);
+    }
+  }
+
+  /// Take the `354` permit. `false` leaves the phase in command mode.
+  fn take_accepted(&self) -> bool {
+    self.accepted.swap(false, Ordering::AcqRel)
+  }
+}
+
+/// Cursor over one upstream reply line. Four bytes decide the line;
+/// the rest is skipped. Nothing here retains reply text.
+#[derive(Default)]
+struct ReplyScan {
+  /// `0..3` collect the status code, `3` waits for the separator, `4`
+  /// skips the remainder of the line.
+  at: u8,
+  code: [u8; 3],
+  /// This line already decided whether it was a final reply.
+  settled: bool,
 }
 
 /// Where the next client bytes sit.
@@ -113,6 +203,7 @@ impl Smtp {
         label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
       })
     });
+    let gate = Arc::new(DataGate::new());
     match dir {
       Direction::Downstream => Self {
         down: Some(Down {
@@ -123,14 +214,25 @@ impl Smtp {
           creds,
           reply: None,
           closed: false,
+          gate: Arc::clone(&gate),
         }),
         raw: None,
+        gate,
+        scan: ReplyScan::default(),
       },
       Direction::Upstream => Self {
         down: None,
-        raw: Some(Raw::new(grants, Scheme::Smtp, host, port, Direction::Upstream)),
+        raw: Some(Raw::length_changing(grants, Scheme::Smtp, host, port, Direction::Upstream)),
+        gate,
+        scan: ReplyScan::default(),
       },
     }
+  }
+
+  /// Both legs share one [`DataGate`]. The downstream leg counts
+  /// commands; the upstream leg reads the reply that answers `DATA`.
+  pub(crate) fn share_data_gate(downstream: &Smtp, upstream: &mut Smtp) {
+    upstream.gate = Arc::clone(&downstream.gate);
   }
 
   /// Allow AUTH rewriting. True only while the upstream leg is TLS. A
@@ -166,6 +268,7 @@ impl Smtp {
     if down.closed {
       return (Vec::new(), Vec::new());
     }
+    arm_data(down);
     let mut out = Vec::new();
     let mut hits = Vec::new();
     if chunk.is_empty() {
@@ -202,6 +305,9 @@ impl Wire for Smtp {
       };
       return (rewritten, hits);
     }
+    if self.raw.is_some() && !chunk.is_empty() {
+      observe_chunk(&mut self.scan, &self.gate, chunk);
+    }
     if let Some(raw) = self.raw.as_mut() {
       return raw.feed(chunk).await;
     }
@@ -218,6 +324,54 @@ fn is_line_phase(phase: Phase) -> bool {
     phase,
     Phase::Command | Phase::Plain | Phase::LoginUser | Phase::LoginPass | Phase::Bearer
   )
+}
+
+/// A final `354` for `DATA` opens the body on the next downstream chunk.
+fn arm_data(down: &mut Down) {
+  if down.phase != Phase::Command || !down.gate.take_accepted() {
+    return;
+  }
+  down.tail.clear();
+  down.phase = Phase::Data { at_start: true };
+}
+
+/// Walk one upstream chunk. The status code is the first bytes of a
+/// line; the password, if any, is later and is not what this records.
+fn observe_chunk(scan: &mut ReplyScan, gate: &DataGate, chunk: &[u8]) {
+  for byte in chunk {
+    observe_byte(scan, gate, *byte);
+  }
+}
+
+fn observe_byte(scan: &mut ReplyScan, gate: &DataGate, byte: u8) {
+  if byte == b'\n' {
+    if !scan.settled {
+      gate.on_final_reply(reply_code(scan));
+    }
+    *scan = ReplyScan::default();
+    return;
+  }
+  if scan.at >= 4 {
+    return;
+  }
+  if scan.at < 3 {
+    if let Some(slot) = scan.code.get_mut(usize::from(scan.at)) {
+      *slot = byte;
+    }
+    scan.at = scan.at.saturating_add(1);
+    return;
+  }
+  scan.at = 4;
+  if byte == b'-' {
+    scan.settled = true;
+    return;
+  }
+  gate.on_final_reply(scan.code);
+  scan.settled = true;
+}
+
+fn reply_code(scan: &ReplyScan) -> [u8; 3] {
+  if scan.at >= 3 { scan.code } else { [0, 0, 0] }
 }
 
 fn flush_down(down: &mut Down, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
@@ -313,6 +467,7 @@ fn drive_payload(down: &mut Down, input: &[u8], out: &mut Vec<u8>) {
         down.phase = Phase::Command;
         down.tail.clear();
         down.buf.extend_from_slice(&leftover);
+        down.gate.note_body_end();
       } else {
         down.phase = Phase::Data { at_start };
       }
@@ -367,12 +522,13 @@ fn held_is_prefix(held: &[u8], at_start: bool) -> bool {
 
 /// Rewrite one complete downstream line and advance the AUTH phase.
 fn rewrite_down_line(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
+  if !is_line_phase(down.phase) {
+    return (line.to_vec(), Vec::new());
+  }
+  let cmd = down.gate.note_outbound();
   let body = line_body(line);
   if body == b"*" {
     down.phase = Phase::Command;
-    return (line.to_vec(), Vec::new());
-  }
-  if !is_line_phase(down.phase) {
     return (line.to_vec(), Vec::new());
   }
   if down.phase != Phase::Command && is_command(line) {
@@ -408,20 +564,19 @@ fn rewrite_down_line(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
       };
       rewrite_bearer_line(line, creds, protected)
     }
-    Phase::Command => rewrite_command(line, down),
+    Phase::Command => rewrite_command(line, down, cmd),
     Phase::Data { .. } | Phase::Bdat { .. } => (line.to_vec(), Vec::new()),
   }
 }
 
 /// A command line, or an `AUTH` line with its mechanism and initial response.
-fn rewrite_command(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
+fn rewrite_command(line: &[u8], down: &mut Down, cmd: u32) -> (Vec<u8>, Vec<Hit>) {
   let Some(request) = parse_command(line) else {
     return (line.to_vec(), Vec::new());
   };
   match request {
     Request::Data => {
-      down.tail.clear();
-      down.phase = Phase::Data { at_start: true };
+      down.gate.note_data(cmd);
       (line.to_vec(), Vec::new())
     }
     Request::Bdat { chunk_size, .. } => {
@@ -520,7 +675,17 @@ pub(super) fn is_starttls(line: &[u8]) -> bool {
 pub(super) fn is_opening_command(line: &[u8]) -> bool {
   matches!(
     parse_command(line),
-    Some(Request::Ehlo { .. } | Request::Helo { .. } | Request::Noop { .. } | Request::Rset | Request::Auth { .. } | Request::Quit)
+    Some(
+      Request::Ehlo { .. }
+        | Request::Helo { .. }
+        | Request::Help { .. }
+        | Request::Vrfy { .. }
+        | Request::Expn { .. }
+        | Request::Noop { .. }
+        | Request::Rset
+        | Request::Auth { .. }
+        | Request::Quit
+    )
   )
 }
 
@@ -765,20 +930,20 @@ mod tests {
   const FAKE_PASS: &str = "fake-smtp-pass"; // betterleaks:allow
   const REAL_PASS: &str = "real-smtp-pass"; // betterleaks:allow
 
-  fn scope(fake_user: &str, real_user: &str) -> SmtpScope {
+  fn scope(fake_user: &str, real_user: &str, fake_pass: &str, real_pass: &str) -> SmtpScope {
     SmtpScope {
       downstream: SmtpLeg {
         host: "mail".into(),
         port: 587,
         user: fake_user.into(),
-        password: SecretString::from(FAKE_PASS),
+        password: SecretString::from(fake_pass),
       },
       is_downstream_tls: false,
       upstream: SmtpLeg {
         host: "mail".into(),
         port: 587,
         user: real_user.into(),
-        password: SecretString::from(REAL_PASS),
+        password: SecretString::from(real_pass),
       },
       is_upstream_tls: false,
       starttls_required: true,
@@ -790,13 +955,17 @@ mod tests {
   }
 
   fn grant(fake_user: &str, real_user: &str) -> Vec<Grant> {
+    grant_pass(fake_user, real_user, FAKE_PASS, REAL_PASS)
+  }
+
+  fn grant_pass(fake_user: &str, real_user: &str, fake_pass: &str, real_pass: &str) -> Vec<Grant> {
     vec![Grant::Smtp {
       credential: Credential {
         label: "smtp".into(),
-        fake: FAKE_PASS.into(),
-        value: SecretString::from(REAL_PASS),
+        fake: fake_pass.into(),
+        value: SecretString::from(real_pass),
       },
-      scope: Box::new(scope(fake_user, real_user)),
+      scope: Box::new(scope(fake_user, real_user, fake_pass, real_pass)),
     }]
   }
 
@@ -808,6 +977,14 @@ mod tests {
 
   fn up() -> Smtp {
     Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Upstream)
+  }
+
+  /// Downstream and upstream legs that share the `DATA` reply permit.
+  fn pair() -> (Smtp, Smtp) {
+    let down_leg = down();
+    let mut up_leg = up();
+    Smtp::share_data_gate(&down_leg, &mut up_leg);
+    (down_leg, up_leg)
   }
 
   async fn emit(machine: &mut Smtp, chunk: &[u8]) -> (Vec<u8>, usize) {
@@ -1000,27 +1177,97 @@ mod tests {
 
   #[tokio::test]
   async fn data_passes_until_the_dot_line() {
-    let mut machine = down();
-    let body = b"DATA\r\nhello\r\n.\r\nQUIT\r\n";
-    let (out, hits) = emit(&mut machine, body).await;
+    let (mut down_leg, mut up_leg) = pair();
+    let (cmd, hits) = emit(&mut down_leg, b"DATA\r\n").await;
     assert_eq!(hits, 0);
-    assert_eq!(out, body);
+    assert_eq!(cmd, b"DATA\r\n");
+    let _ = emit(&mut up_leg, b"354 go ahead\r\n").await;
+    let (out, _) = emit(&mut down_leg, b"hello\r\n.\r\nQUIT\r\n").await;
+    assert_eq!(out, b"hello\r\n.\r\nQUIT\r\n");
   }
 
   #[tokio::test]
   async fn data_holds_a_split_terminator() {
-    let mut machine = down();
-    let (head, _) = emit(&mut machine, b"DATA\r\nhello\r\n.").await;
-    assert_eq!(head, b"DATA\r\nhello");
-    let (tail, _) = emit(&mut machine, b"\r\nQUIT\r\n").await;
+    let (mut down_leg, mut up_leg) = pair();
+    let _ = emit(&mut down_leg, b"DATA\r\n").await;
+    let _ = emit(&mut up_leg, b"354 go ahead\r\n").await;
+    let (head, _) = emit(&mut down_leg, b"hello\r\n.").await;
+    assert_eq!(head, b"hello");
+    let (tail, _) = emit(&mut down_leg, b"\r\nQUIT\r\n").await;
     assert_eq!(tail, b"\r\n.\r\nQUIT\r\n");
   }
 
   #[tokio::test]
   async fn empty_data_body_ends_on_the_leading_dot() {
-    let mut machine = down();
-    let (out, _) = emit(&mut machine, b"DATA\r\n.\r\nNOOP\r\n").await;
-    assert_eq!(out, b"DATA\r\n.\r\nNOOP\r\n");
+    let (mut down_leg, mut up_leg) = pair();
+    let _ = emit(&mut down_leg, b"DATA\r\n").await;
+    let _ = emit(&mut up_leg, b"354 go ahead\r\n").await;
+    let (out, _) = emit(&mut down_leg, b".\r\nNOOP\r\n").await;
+    assert_eq!(out, b".\r\nNOOP\r\n");
+  }
+
+  /// A `530` or `503` answers `DATA`. The following `AUTH` is still a command.
+  #[tokio::test]
+  async fn rejected_data_keeps_the_next_auth() {
+    let line = format!("AUTH PLAIN {}\r\n", plain(FAKE_USER, FAKE_PASS));
+    let real = format!("AUTH PLAIN {}\r\n", plain(REAL_USER, REAL_PASS));
+    for refusal in [
+      b"530 5.7.0 Authentication required\r\n".as_slice(),
+      b"503 5.5.1 Need recipient\r\n".as_slice(),
+    ] {
+      let (mut down_leg, mut up_leg) = pair();
+      let (cmd, _) = emit(&mut down_leg, b"DATA\r\n").await;
+      assert_eq!(cmd, b"DATA\r\n");
+      let _ = emit(&mut up_leg, refusal).await;
+      let (out, hits) = emit(&mut down_leg, line.as_bytes()).await;
+      assert_eq!(hits, 1, "{}", String::from_utf8_lossy(refusal));
+      assert_eq!(out, real.as_bytes());
+    }
+  }
+
+  /// `MAIL` and `RCPT` replies are not the `DATA` reply. The body opens
+  /// on the third final line when that line is `354`.
+  #[tokio::test]
+  async fn data_body_waits_for_the_matching_354() {
+    let (mut down_leg, mut up_leg) = pair();
+    let _ = emit(&mut down_leg, b"MAIL FROM:<a@b>\r\n").await;
+    let _ = emit(&mut down_leg, b"RCPT TO:<c@d>\r\n").await;
+    let _ = emit(&mut down_leg, b"DATA\r\n").await;
+    let _ = emit(&mut up_leg, b"250 2.1.0 ok\r\n").await;
+    let (early, _) = emit(&mut down_leg, b"hello\r\n.").await;
+    assert_eq!(early, b"hello\r\n", "an earlier 250 must not open the body");
+
+    let (mut down_leg, mut up_leg) = pair();
+    let _ = emit(&mut down_leg, b"MAIL FROM:<a@b>\r\n").await;
+    let _ = emit(&mut up_leg, b"250 2.1.0 ok\r\n").await;
+    let _ = emit(&mut down_leg, b"RCPT TO:<c@d>\r\n").await;
+    let _ = emit(&mut up_leg, b"250 2.1.5 ok\r\n").await;
+    let _ = emit(&mut down_leg, b"DATA\r\n").await;
+    let _ = emit(&mut up_leg, b"354-go\r\n354 go ahead\r\n").await;
+    let (head, _) = emit(&mut down_leg, b"hello\r\n.").await;
+    assert_eq!(head, b"hello");
+  }
+
+  #[tokio::test]
+  async fn response_redacts_a_longer_real_password() {
+    const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
+    let mut machine = Smtp::new(
+      &grant_pass(FAKE_USER, REAL_USER, FAKE_PASS, LONG_REAL),
+      "mail",
+      587,
+      Direction::Upstream,
+    );
+    let line = format!("535 5.7.8 authentication failed for {LONG_REAL}\r\n");
+    let split = line.find(LONG_REAL).unwrap().saturating_add(4);
+    let (head, head_hits) = emit(&mut machine, line.as_bytes().get(..split).unwrap_or(&[])).await;
+    let (tail, tail_hits) = emit_flushed(&mut machine, line.as_bytes().get(split..).unwrap_or(&[])).await;
+    let mut out = head;
+    out.extend_from_slice(&tail);
+    let text = String::from_utf8(out).unwrap();
+    assert!(head_hits.saturating_add(tail_hits) >= 1, "{text}");
+    assert!(text.contains(FAKE_PASS), "{text}");
+    assert!(!text.contains(LONG_REAL), "{text}");
+    assert!(text.starts_with("535 "), "{text}");
   }
 
   #[tokio::test]
@@ -1066,6 +1313,7 @@ mod tests {
           let mut down = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream);
           down.set_protected(true);
           let mut up_leg = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Upstream);
+          Smtp::share_data_gate(&down, &mut up_leg);
           for chunk in &chunks {
             let _ = down.feed(chunk).await;
             let _ = up_leg.feed(chunk).await;
