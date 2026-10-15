@@ -4,6 +4,7 @@
 // passing scenario proves arkham swapped it for the real one (and redacted
 // replies). Hard bounds everywhere: 5s per network await, 20s per scenario,
 // 90s for the whole run — the demo never sits silent.
+import { spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile, writeFile } from "node:fs/promises";
@@ -15,6 +16,8 @@ const CERT_DIR = process.env.CERT_DIR ?? "/certs";
 const PG_URL = process.env.DATABASE_URL ?? ""; // the fake connection string
 const REDIS_URL = process.env.REDIS_URL ?? "";
 const REDIS_TLS_URL = process.env.REDIS_TLS_URL ?? "";
+const SMTP_URL = process.env.SMTP_URL ?? "";
+const SMTPS_URL = process.env.SMTPS_URL ?? "";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -493,6 +496,50 @@ if (REDIS_TLS_URL) {
   await redisScenarios("tls", REDIS_TLS_URL);
 } else {
   stage("redis tls scenarios skipped: no REDIS_TLS_URL");
+}
+
+function runSmtp(mode: string, url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("python3", ["/srv/smtp.py", mode, url], { env: process.env });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve(out);
+      else reject(new Error(out || `smtp.py exited ${code}`));
+    });
+  });
+}
+
+if (SMTP_URL) {
+  await retry("smtp", "smtp STARTTLS AUTH PLAIN and LOGIN swap the password", async () => {
+    const out = await runSmtp("smtp", SMTP_URL);
+    stage(out.trim());
+    const direct = await readFile("/out/smtp-direct.txt", "utf8").catch(() => "");
+    return direct.includes("decoy refused 587") && direct.includes("decoy refused 465") && out.includes("before-starttls refused") && out.includes("plain ok") && out.includes("login ok") && out.includes("login mechanism ok") && out.includes("wrong refused") && out.includes("smtp ok") && !out.includes("arkham_real_smtp_pass");
+  });
+} else {
+  stage("smtp scenarios skipped: no SMTP_URL");
+}
+
+if (SMTPS_URL) {
+  await retry("smtps", "smtps implicit TLS AUTH PLAIN swaps the password", async () => {
+    const out = await runSmtp("smtps", SMTPS_URL);
+    stage(out.trim());
+    const authed = out.includes("plain ok") && out.includes("wrong refused") && out.includes("smtps ok") && !out.includes("arkham_real_smtp_pass");
+    if (!SMTP_URL) {
+      return authed;
+    }
+    const direct = await readFile("/out/smtp-direct.txt", "utf8").catch(() => "");
+    return authed && direct.includes("decoy refused 465");
+  });
+} else {
+  stage("smtps scenarios skipped: no SMTPS_URL");
 }
 
 const coveredPath = process.env.ARKHAM_COVERED ?? "";

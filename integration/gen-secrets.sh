@@ -12,6 +12,8 @@ dir=${1:-/arkham-config}
 : "${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET not set: copy integration/.env.example to integration/.env and export it}"
 : "${ARKHAM_REDIS_REAL:?ARKHAM_REDIS_REAL not set: copy integration/.env.example to integration/.env and export it}"
 : "${ARKHAM_REDIS_TLS_REAL:?ARKHAM_REDIS_TLS_REAL not set: copy integration/.env.example to integration/.env and export it}"
+: "${ARKHAM_SMTP_REAL:?ARKHAM_SMTP_REAL not set: copy integration/.env.example to integration/.env and export it}"
+: "${ARKHAM_SMTPS_REAL:?ARKHAM_SMTPS_REAL not set: copy integration/.env.example to integration/.env and export it}"
 
 mkdir -p "$dir"
 
@@ -44,6 +46,14 @@ value = "$ARKHAM_REDIS_REAL"
 [secrets.REDIS_TLS_URL]
 provider = "plain"
 value = "$ARKHAM_REDIS_TLS_REAL"
+
+[secrets.SMTP_URL]
+provider = "plain"
+value = "$ARKHAM_SMTP_REAL"
+
+[secrets.SMTPS_URL]
+provider = "plain"
+value = "$ARKHAM_SMTPS_REAL"
 EOF
 chmod -R a+rX "$dir"
 echo "fnox config ready in $dir"

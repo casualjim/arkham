@@ -35,6 +35,17 @@ printf "subjectAltName=IP:10.202.0.50,DNS:redis\n" >"$dir/redis.ext"
 openssl x509 -req -in "$dir/redis.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
   -CAcreateserial -out "$dir/redis.crt" -days 2 -extfile "$dir/redis.ext"
 
+# Mail TLS: docker-mailserver presents this leaf for both STARTTLS (587)
+# and implicit TLS (465). The proxy verifies the name `mail`.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/mail.key"
+openssl req -new -key "$dir/mail.key" -out "$dir/mail.csr" -subj "/CN=mail.demo.test"
+printf "subjectAltName=IP:10.202.0.60,DNS:mail,DNS:mail.demo.test\n" >"$dir/mail.ext"
+openssl x509 -req -in "$dir/mail.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+  -CAcreateserial -out "$dir/mail.crt" -days 2 -extfile "$dir/mail.ext"
+# The mail image reads the key as a non-root service after it copies the
+# file. A demo CA key stays 600; this leaf key is world-readable on purpose.
+chmod 644 "$dir/mail.key" "$dir/mail.crt"
+
 cat "$dir/ca.crt" "$dir/ca.key" >"$dir/ca.pem"
 chmod 600 "$dir/ca.key" "$dir/ca.pem"
 

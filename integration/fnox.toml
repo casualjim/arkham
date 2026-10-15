@@ -19,3 +19,13 @@ value = "redis://arkham_user:arkham_real_redis_pass@redis:6379/0"
 [secrets.REDIS_TLS_URL]
 provider = "plain"
 value = "rediss://arkham_user:arkham_real_redis_pass@redis:6380/0?sslrootcert=/certs/ca.crt"
+
+# `starttls=required` withholds the password until STARTTLS completes.
+# `sslrootcert` is parsed off the string before the dial.
+[secrets.SMTP_URL]
+provider = "plain"
+value = "smtp://agent%40demo.test:arkham_real_smtp_pass@mail:587?starttls=required&sslrootcert=/certs/ca.crt"
+
+[secrets.SMTPS_URL]
+provider = "plain"
+value = "smtps://agent%40demo.test:arkham_real_smtp_pass@mail:465?sslrootcert=/certs/ca.crt"

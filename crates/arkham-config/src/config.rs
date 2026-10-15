@@ -411,6 +411,10 @@ impl RuleCfg {
       Some(Scheme::Redis)
     } else if value.starts_with("rediss://") {
       Some(Scheme::Rediss)
+    } else if value.starts_with("smtps://") {
+      Some(Scheme::Smtps)
+    } else if value.starts_with("smtp://") {
+      Some(Scheme::Smtp)
     } else {
       None
     }

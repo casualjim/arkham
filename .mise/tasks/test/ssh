@@ -53,16 +53,32 @@ for backend in $backends; do
   rm -f integration/out/covered.json
   ARKHAM_BACKEND="$backend" $compose up -d --build
 
+  # A failed one-shot leaves the client in `created`. Don't spend the
+  # rest of the poll on a container that will never start.
+  code=""
   state=running
+  direct=arkham-integration-smtp-direct-1
   for _ in $(seq 1 120); do
+    dstatus=$(docker inspect -f '{{.State.Status}}' "$direct" 2>/dev/null || echo missing)
+    if [ "$dstatus" = exited ]; then
+      dcode=$(docker inspect -f '{{.State.ExitCode}}' "$direct" 2>/dev/null || echo 1)
+      if [ "$dcode" != 0 ]; then
+        echo "smtp-direct exited $dcode"
+        code=$dcode
+        state=exited
+        break
+      fi
+    fi
     state=$(docker inspect -f '{{.State.Status}}' "$client" 2>/dev/null || echo missing)
     [ "$state" = exited ] && break
     [ "$state" = missing ] && break
     sleep 1
   done
-  code=$(docker inspect -f '{{.State.ExitCode}}' "$client" 2>/dev/null || echo 1)
-  if [ "$state" != exited ]; then
-    code=124
+  if [ -z "$code" ]; then
+    code=$(docker inspect -f '{{.State.ExitCode}}' "$client" 2>/dev/null || echo 1)
+    if [ "$state" != exited ]; then
+      code=124
+    fi
   fi
   docker logs "$client" || true
   if [ "$code" = 0 ]; then

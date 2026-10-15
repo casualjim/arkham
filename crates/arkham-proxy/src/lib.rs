@@ -47,6 +47,7 @@ use identity::CandidateParams;
 use transports::http::{HttpTransport, HttpsTransport};
 use transports::postgres::PostgresTransport;
 use transports::redis::RedisTransport;
+use transports::smtp::SmtpTransport;
 use transports::ssh::SshTransport;
 use transports::tcp::TcpTransport;
 /// One HTTPS MITM relay shape: cached in-memory leaf issuer.
@@ -74,6 +75,7 @@ pub struct ProxyState {
   ssh: Arc<SshTransport>,
   postgres: Arc<PostgresTransport>,
   redis: Arc<RedisTransport>,
+  smtp: Arc<SmtpTransport>,
   mint: MintBucket,
   /// Runtime token-mint store, shared across connections.
   mint_store: Arc<crate::mint::MintStore>,
@@ -165,6 +167,7 @@ impl ProxyState {
     let mtls_trust = trust.build();
     let postgres = Arc::new(PostgresTransport::new(ca)?);
     let redis = Arc::new(RedisTransport::new(ca)?);
+    let smtp = Arc::new(SmtpTransport::new(ca)?);
     Ok(Self {
       config: Arc::new(resolved),
       relay,
@@ -176,6 +179,7 @@ impl ProxyState {
       ssh: Arc::new(SshTransport::default()),
       postgres,
       redis,
+      smtp,
       mint: MintBucket::new(),
       mint_store: Arc::new(MintStore::default()),
       fwmark: None,
@@ -400,7 +404,7 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
     mint: Some(state.mint_handle()),
   };
   let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
-  relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head).await
+  relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head, &[]).await
 }
 
 /// Read until the end of the HTTP head (`\r\n\r\n`) or `MAX_HEAD` bytes.

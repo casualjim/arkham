@@ -314,7 +314,7 @@ where
   S: AsyncRead + AsyncWrite + Unpin,
 {
   let (mut downstream_machine, mut upstream_machine) = redis_pair(ctx);
-  relay_guarded(guest, server, &mut downstream_machine, &mut upstream_machine, &[]).await
+  relay_guarded(guest, server, &mut downstream_machine, &mut upstream_machine, &[], &[]).await
 }
 
 /// Both directions for a redis scope: AUTH and HELLO reframe downstream,

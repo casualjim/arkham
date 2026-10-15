@@ -92,6 +92,32 @@ value = "rediss://app:decoy@cache.internal:6380/0"
 
 The real `rediss://` value in fnox carries the trust anchor, for example `rediss://app:real@cache.internal:6380/0?sslrootcert=/path/ca.pem`.
 
+### SMTP rules
+
+A rule whose `value` states an `smtp://` or `smtps://` connection string is an SMTP rule. The rule states the FAKE string in `value`. The REAL string resolves from the secret source under `env`/`fnox_key` into `real`. No `allow` entries: the connection string is the grant, matched on the fake string's port.
+
+`smtp://` is cleartext. `smtps://` is TLS from the first byte. The default ports are 587 (submission) and 465 (implicit TLS). Resend also publishes 25, 2465, and 2587; write the port in the string. 25 stays cleartext SMTP. 2465 is implicit TLS (`smtps://`). 2587 is STARTTLS (`smtp://` with `starttls=required`). An explicit port is never rewritten to the default, and the port does not change the scheme. The user and the password are both required, and the user is percent-encoded when it contains `@` (`agent%40demo.test`). A `%` that is not two hex digits stays as written; a sequence that is not UTF-8 is rejected. A path is rejected. `sslmode` and `sslnegotiation` are rejected: the scheme states the transport.
+
+`starttls=required` is legal only on a real `smtp://` string. AUTH is rewritten only once the upstream leg is TLS: after that upgrade, or on `smtps://` from the first byte. A session that stays cleartext forwards the decoy. Loading a real `smtp://` string with no `starttls` query logs that the decoy is what travels until the upstream leg is TLS. `sslrootcert` (a PEM path, or `system`) and `sslcert`/`sslkey` together belong on `smtps://` or on `smtp://` with `starttls=required`.
+
+`DATA` passes bytes until the terminating dot, and `BDAT n` passes the next `n` octets. Neither payload is buffered. Upstream replies redact an equal-length password and leave the username as the server wrote it. A `334` challenge is not rewritten.
+
+The wire machine rewrites `AUTH PLAIN` (inline or after `334`), `AUTH LOGIN` (two-step, or with the username inline), `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`. `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are relayed unchanged. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name.
+
+```toml
+[rules.smtp]
+env = "SMTP_URL"
+value = "smtp://agent%40demo.test:decoy@mail.internal:587"
+```
+
+```toml
+[rules.smtps]
+env = "SMTPS_URL"
+value = "smtps://agent%40demo.test:decoy@mail.internal:465"
+```
+
+The real submission value in fnox carries the upgrade and the trust anchor, for example `smtp://agent%40demo.test:real@mail.internal:587?starttls=required&sslrootcert=/path/ca.pem`.
+
 ## `[rules.<label>.tls."<entry>"]`
 
 Per-entry TLS, keyed by the exact `allow` entry string. All keys optional.

@@ -14,6 +14,7 @@ code-workspace = { workspace = true }
 confique = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
+percent-encoding = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

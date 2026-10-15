@@ -115,6 +115,7 @@ mimalloc = "0.1"
 netlink-packet-core = "0.9"
 netlink-packet-netfilter = "0.4"
 netlink-sys = "0.8"
+percent-encoding = "2.3"
 pgwire = { version = "0.41", default-features = false }
 pretty_assertions = "1"
 proptest = "1"
@@ -132,6 +133,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 shellexpand = "3"
 smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp", "std"] }
+smtp-proto = "0.2.5"
 socket2 = "0.6"
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"

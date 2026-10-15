@@ -17,6 +17,7 @@ Underneath sits a grant-scoped proxy. A workload can also point its proxy settin
 | SSH | Terminates on decoy keys, presents the real identity upstream, never opens forwarding. |
 | PostgreSQL | Negotiation answered here, startup identity swapped, steady state equal-length relay. |
 | Redis | RESP `AUTH` and `HELLO` passwords swapped. A TLS leaf is minted for the scope host when the client sends no SNI. |
+| SMTP | `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`, and `AUTH OAUTHBEARER` credentials swapped once the upstream leg is TLS. A cleartext upstream forwards the decoy. `STARTTLS` upgrades the same sockets; `smtps://` is TLS from the first byte. |
 | Raw TCP | Equal-length byte swap that never reframes; everything else splices untouched. |
 
 ## Install

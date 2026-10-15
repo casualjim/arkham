@@ -9,6 +9,11 @@ name: arkham-integration
 # tproxy, not ebpf: the eBPF backend captures by cgroup membership, and a
 # compose service's cgroup path is not something this file can pin. Use
 # `ARKHAM_BACKEND=ebpf mise run demo:bwrap` for the same scenarios over eBPF.
+
+# One value for smtp-direct and the client. Unset keeps the demo decoy.
+# An empty value skips the direct dial and the client SMTP scenario.
+x-smtp-url: &smtp-url "${SMTP_URL-smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587}" # nosemgrep: deterministic demo decoy, not a credential
+
 services:
   certs:
     image: oven/bun:1
@@ -24,6 +29,8 @@ services:
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?copy integration/.env.example to integration/.env}
       ARKHAM_REDIS_REAL: ${ARKHAM_REDIS_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_REDIS_TLS_REAL: ${ARKHAM_REDIS_TLS_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_SMTP_REAL: ${ARKHAM_SMTP_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_SMTPS_REAL: ${ARKHAM_SMTPS_REAL:?copy integration/.env.example to integration/.env}
     volumes:
       - ./gen-certs.sh:/srv/gen-certs.sh:ro
       - ./gen-secrets.sh:/srv/gen-secrets.sh:ro
@@ -184,6 +191,101 @@ services:
       certs:
         condition: service_completed_successfully
 
+  # Official docker-mailserver. SMTP_ONLY stays unset: Dovecot is what
+  # answers SASL AUTH. The heavy scanners stay off so startup is the
+  # mail stack, not clamav. STARTTLS is required on 587 (the image
+  # default); 465 is implicit TLS. The account is added before
+  # supervisord, so Dovecot's user database includes it at first start.
+  mail:
+    image: mailserver/docker-mailserver@sha256:d0fe7668defe157aad57ea31b1707ad1e2fb57d7a91bdf17cbdf876549946c86
+    hostname: mail.demo.test
+    command: ["/bin/bash", "/tmp/docker-mailserver/add-account.sh"]
+    environment:
+      SSL_TYPE: manual
+      SSL_CERT_PATH: /certs/mail.crt
+      SSL_KEY_PATH: /certs/mail.key
+      PERMIT_DOCKER: connected-networks
+      POSTMASTER_ADDRESS: postmaster@demo.test
+      OVERRIDE_HOSTNAME: mail.demo.test
+      ENABLE_RSPAMD: 0
+      ENABLE_CLAMAV: 0
+      ENABLE_AMAVIS: 0
+      ENABLE_FAIL2BAN: 0
+      ENABLE_SPAMASSASSIN: 0
+      ENABLE_OPENDKIM: 0
+      ENABLE_OPENDMARC: 0
+      ENABLE_POLICYD_SPF: 0
+      ENABLE_SRS: 0
+      ENABLE_UPDATE_CHECK: 0
+      ARKHAM_SMTP_PASS: ${ARKHAM_SMTP_PASS:?copy integration/.env.example to integration/.env}
+    volumes:
+      - certs:/certs:ro
+      - ./mail/add-account.sh:/tmp/docker-mailserver/add-account.sh:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "setup email list | grep -q agent@demo.test && timeout 5 bash -c 'echo >/dev/tcp/127.0.0.1/587' && timeout 5 bash -c 'echo >/dev/tcp/127.0.0.1/465'",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 20s
+    networks:
+      server:
+        ipv4_address: 10.202.0.60
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
+  # Decoy AUTH straight at the mail server, from a network namespace the
+  # capture rules do not cover. Not the client: that container is the
+  # confined agent and must not hold NET_ADMIN. An empty SMTP_URL skips
+  # the dial so the client still reaches run.ts.
+  smtp-direct:
+    image: python:3-slim@sha256:db3231d3fce4c59182f8364dbec08b8bad4fdfca673dfb226f3c9e77b6b48cd2
+    working_dir: /srv
+    # The image entrypoint is python3. Replace it so the shell is the process.
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        rm -f /out/smtp-direct.txt
+        if [ -z "$${SMTP_URL:-}" ]; then
+          echo "smtp direct skipped: no SMTP_URL"
+          exit 0
+        fi
+        ok=0
+        for _ in 1 2 3 4 5; do
+          if python3 /srv/smtp.py direct | tee /out/smtp-direct.txt; then
+            ok=1
+            break
+          fi
+          sleep 2
+        done
+        test "$$ok" = 1
+        if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
+          gid="$${HOST_GID:-$$HOST_UID}"
+          chown "$$HOST_UID:$$gid" /out/smtp-direct.txt /out
+        fi
+    environment:
+      SMTP_URL: *smtp-url
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
+    volumes:
+      - ./client:/srv:ro
+      - certs:/certs:ro
+      - ./out:/out
+    networks:
+      server:
+        ipv4_address: 10.202.0.70
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      mail:
+        condition: service_healthy
+    restart: "no"
+
   client:
     image: oven/bun:1
     working_dir: /srv
@@ -196,7 +298,7 @@ services:
       - -c
       - |
         set -euo pipefail
-        apt-get update -qq && apt-get install -qq -y openssh-client
+        apt-get update -qq && apt-get install -qq -y openssh-client python3
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -226,6 +328,8 @@ services:
       OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `arkham fake OIDC_CLIENT_SECRET`, not a credential
       REDIS_URL: redis://arkham_user:arkham_fake_redis_pass@redis:6379/0 # nosemgrep: deterministic demo decoy, not a credential
       REDIS_TLS_URL: rediss://arkham_user:arkham_fake_redis_pass@redis:6380/0 # nosemgrep: deterministic demo decoy, not a credential
+      SMTP_URL: *smtp-url
+      SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
@@ -233,6 +337,8 @@ services:
       - ./out:/out
     network_mode: service:arkham
     depends_on:
+      smtp-direct:
+        condition: service_completed_successfully
       arkham:
         condition: service_started
       api:
@@ -242,6 +348,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      mail:
         condition: service_healthy
 
 networks:

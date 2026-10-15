@@ -9,7 +9,7 @@
 //! `match` on the picked protocol in the crate; every arm lives in its
 //! vertical under `transports/`.
 
-use arkham_config::grants::{Grant, PostgresScope, RedisScope, ResolvedConfig, Scheme, SshScope};
+use arkham_config::grants::{Grant, PostgresScope, RedisScope, ResolvedConfig, Scheme, SmtpScope, SshScope};
 use rama::tls::client::{ClientHello, ClientHelloHandshakePrefix, parse_client_hello_handshake_prefix};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
@@ -62,6 +62,9 @@ pub(crate) enum Expect<'a> {
   /// A `redis://` or `rediss://` scope: RESP framing, each string stating
   /// its own leg's transport.
   Redis(&'a RedisScope),
+  /// An `smtp://` or `smtps://` scope: SMTP framing. Implicit TLS settles
+  /// before the dialogue; `STARTTLS` upgrades the same sockets mid-session.
+  Smtp(&'a SmtpScope),
   /// An `ssh://` scope: the guest leg terminates here against a decoy key.
   Ssh(&'a SshScope),
   Splice,
@@ -82,6 +85,7 @@ impl PartialEq for Expect<'_> {
     match (self, other) {
       (Expect::Postgres(a), Expect::Postgres(b)) => std::ptr::eq(*a, *b),
       (Expect::Redis(a), Expect::Redis(b)) => std::ptr::eq(*a, *b),
+      (Expect::Smtp(a), Expect::Smtp(b)) => std::ptr::eq(*a, *b),
       (Expect::Ssh(a), Expect::Ssh(b)) => std::ptr::eq(*a, *b),
       (Expect::Tls, Expect::Tls) | (Expect::Plain, Expect::Plain) | (Expect::Raw, Expect::Raw) | (Expect::Splice, Expect::Splice) => true,
       _ => false,
@@ -98,6 +102,9 @@ pub(crate) fn expect<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> 
   }
   if let Some(scope) = grants.iter().find_map(|grant| grant.redis(host, port)) {
     return Expect::Redis(scope);
+  }
+  if let Some(scope) = grants.iter().find_map(|grant| grant.smtp(host, port)) {
+    return Expect::Smtp(scope);
   }
   if let Some(scope) = grants.iter().find_map(|grant| grant.ssh(host, port)) {
     return Expect::Ssh(scope);
@@ -144,6 +151,8 @@ impl<'a> Expect<'a> {
       Expect::Postgres(scope) => state.postgres.serve(ServeStream { guest, params, scope }).await,
       // Declared Redis: each connection string states its own leg's transport.
       Expect::Redis(scope) => state.redis.serve(ServeStream { guest, params, scope }).await,
+      // Declared SMTP: implicit TLS settles first; STARTTLS upgrades later.
+      Expect::Smtp(scope) => state.smtp.serve(ServeStream { guest, params, scope }).await,
       // Declared ssh: the guest leg terminates here against a decoy key.
       Expect::Ssh(scope) => state.ssh.serve(ServeStream { guest, params, scope }).await,
     }
@@ -419,6 +428,32 @@ mod tests {
       "another host does not"
     );
   }
+  #[test]
+  fn an_smtp_grant_routes_to_the_smtp_arm_and_only_its_port() {
+    let scope = SmtpScope::from_strings(
+      "smtp://agent:fake@mail.internal:587",                   // betterleaks:allow
+      "smtp://agent:real@mail.internal:587?starttls=required", // betterleaks:allow
+    )
+    .unwrap();
+    let grants = vec![Grant::Smtp {
+      credential: Credential {
+        label: "smtp".into(),
+        fake: "fake".into(),
+        value: SecretString::from("real"),
+      },
+      scope: Box::new(scope),
+    }];
+    let Expect::Smtp(found) = expect(&grants, Some("mail.internal"), 587) else {
+      panic!("an smtp grant resolves to the smtp arm")
+    };
+    assert!(found.starttls_required);
+    assert!(
+      matches!(expect(&grants, None, 587), Expect::Smtp(other) if std::ptr::eq(other, found)),
+      "port alone routes"
+    );
+    assert_eq!(expect(&grants, Some("mail.internal"), 25), Expect::Splice, "another port does not");
+  }
+
   #[tokio::test]
   async fn a_complete_hello_without_sni_returns_unnamed_at_once() {
     // Minimal TLS 1.3 ClientHello with no SNI extension, as an IP-literal

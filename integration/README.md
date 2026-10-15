@@ -39,6 +39,8 @@ Topology:
 | 8 | OpenSSH client with the decoy identity to `10.202.0.40` | `[rules.ssh]` `ssh://10.202.0.40:22` | `echo ssh-ok`, and `known_hosts` records arkham's host key |
 | 9 | Redis RESP via Bun's `RedisClient` to `redis:6379`: requirepass, ACL user, `HELLO 3 AUTH`, a pipeline, and `WRONGPASS` | `[rules.redis_plain]`: fake `redis://` URL; real URL rendered into fnox by `gen-secrets.sh` | official Redis accepts the swapped password; the real password is absent from the client error |
 | 10 | Same client to `redis:6380` over TLS. Bun sends no SNI | `[rules.redis_tls]`: fake `rediss://` URL; real URL carries `sslrootcert` | same swap. The guest leaf is minted for the scope host. Redis is started with `tls-auth-clients no` |
+| 11 | Python `smtplib` to `mail:587`: AUTH before STARTTLS is refused; AUTH PLAIN and `SMTP.login` after STARTTLS succeed; a wrong password fails; a one-shot on the server network dials the decoy at `mail` and is refused | `[rules.smtp]`: fake `smtp://` URL; real URL says `starttls=required` and carries `sslrootcert` | docker-mailserver accepts the swapped password and the client never sees it; the decoy is refused when the dial is outside the captured namespace |
+| 12 | Same client to `mail:465` with implicit TLS | `[rules.smtps]`: fake `smtps://` URL; real URL carries `sslrootcert` | same swap on a session that is TLS from the first byte |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -64,6 +66,9 @@ Scenarios 9 and 10 are the official `redis:7-alpine` image and Bun's
 `tls-ca-cert-file` makes Redis require a client certificate; this demo
 authenticates with passwords and the upstream client has no certificate,
 so the server is started with `tls-auth-clients no`. Scenarios 9 and 10 are gated on `REDIS_URL` and `REDIS_TLS_URL`, so `run.ts` still runs when the Redis service is absent. `integration/bwrap/run.sh` does not run `run.ts`.
+Scenarios 11 and 12 are `mailserver/docker-mailserver` 16.0.1 (pinned by digest) and Python's `smtplib`. The proxy is the only code we wrote on that path. `SMTP_ONLY` stays unset because Dovecot answers SASL. `setup email add` runs before supervisord so the account is in Dovecot's user database at first start. The server presents a demo-CA leaf and does not ask for a client certificate; the demo authenticates with passwords. Scenarios 11 and 12 are gated on `SMTP_URL` and `SMTPS_URL`.
+
+AUTH before STARTTLS being refused in scenario 11 is Postfix's own `530`. That refusal does not show which password was on the wire. The proof that the real password stays off the cleartext upstream is the in-process test `smtp_auth_before_starttls_stays_the_decoy_and_swaps_after`. The decoy-only failure against the real server is `smtp-direct`: a one-shot on the server network, outside the captured namespace, that runs `SMTP.login` of the decoy against `mail:587` and `mail:465`. It does not run when `SMTP_URL` is empty. The client container never holds `NET_ADMIN`. The wrong-password check in the scenario is a different password sent through the proxy, not that dial.
 
 ## Run
 

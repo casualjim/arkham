@@ -23,6 +23,7 @@ rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
+smtp-proto = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
