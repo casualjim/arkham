@@ -264,3 +264,16 @@ async fn ldap_tls_without_sni_mints_for_the_grant_host() {
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   serve.await.unwrap().unwrap();
 }
+
+#[test]
+fn ldap_mtls_plaintext_guest_is_rejected_at_load() {
+  let fake = format!("ldap://{}:{FAKE}@localhost:389", user(DN));
+  let real = format!("ldaps://{}:{VALUE}@localhost:636", user(DN));
+  let Err(err) = super::resolve_mtls_grants("LDAP_URL", &fake, &real) else {
+    panic!("mtls on an ldap fake with an ldaps real must be rejected");
+  };
+  assert!(matches!(err.as_ref(), arkham_config::Error::LdapCleartextMtls { .. }), "{err}");
+  let text = err.to_string();
+  assert!(!text.contains(FAKE), "mtls rejection included a credential");
+  assert!(!text.contains(VALUE), "mtls rejection included a credential");
+}
