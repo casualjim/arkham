@@ -5,16 +5,16 @@
 //! strategies, and the picker (identity.rs) routes one stream to one
 //! strategy in one place.
 
-pub(crate) mod engine;
-pub(crate) mod http;
-pub(crate) mod ldap;
-pub(crate) mod nats;
-pub(crate) mod postgres;
-pub(crate) mod redis;
-pub(crate) mod smtp;
-pub(crate) mod ssh;
-pub(crate) mod tcp;
-pub(crate) mod tls;
+pub mod engine;
+pub mod http;
+pub mod ldap;
+pub mod nats;
+pub mod postgres;
+pub mod redis;
+pub mod smtp;
+pub mod ssh;
+pub mod tcp;
+pub mod tls;
 
 use arkham_config::grants::{Grant, GuestTlsMode};
 use tokio::io::{AsyncRead, AsyncWrite};

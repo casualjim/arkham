@@ -10,6 +10,8 @@ use crate::transports::nats::machine::tests::nats_grants;
 const FAKE: &str = "arkham_fake_nats_pass"; // betterleaks:allow
 const VALUE: &str = "arkham_real_nats_pass_01"; // betterleaks:allow
 const INFO: &[u8] = b"INFO {\"server_id\":\"NSTUB\",\"auth_required\":true,\"tls_required\":true}\r\n";
+/// A cleartext upstream whose INFO does not demand TLS.
+const CLEAR_INFO: &[u8] = b"INFO {\"server_id\":\"NSTUB\",\"auth_required\":true,\"tls_required\":false}\r\n";
 
 /// How the real string opens the server leg.
 #[derive(Clone, Copy)]
@@ -130,7 +132,7 @@ async fn nats_cleartext_server_leg_receives_the_decoy() {
   let listener = stub.listener;
   let stub_task = tokio::spawn(async move {
     let (mut conn, _) = listener.accept().await.unwrap();
-    let mut opening = INFO.to_vec();
+    let mut opening = CLEAR_INFO.to_vec();
     opening.extend_from_slice(b"PING\r\n");
     conn.write_all(&opening).await.unwrap();
     expect_connect(&mut conn, FAKE, VALUE).await;
@@ -139,7 +141,7 @@ async fn nats_cleartext_server_leg_receives_the_decoy() {
     assert_eq!(read_line(&mut conn).await, b"PONG\r\n");
   });
   let mut guest = connect_through_proxy(proxy_addr, port).await;
-  assert_eq!(read_line(&mut guest).await, INFO);
+  assert_eq!(read_line(&mut guest).await, CLEAR_INFO);
   guest.write_all(format!("{}PING\r\n", connect_line(FAKE)).as_bytes()).await.unwrap();
   assert_eq!(read_line(&mut guest).await, b"PING\r\n", "the bytes after INFO reach the guest");
   assert_eq!(read_line(&mut guest).await, b"PONG\r\n");

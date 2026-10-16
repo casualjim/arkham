@@ -462,6 +462,7 @@ dependencies = [
  "arkham-pki",
  "arkham-plugin",
  "async-trait",
+ "atoi",
  "base64 0.22.1",
  "bytes",
  "dashmap",
@@ -472,6 +473,7 @@ dependencies = [
  "httparse",
  "hyper 1.12.0",
  "hyper-util",
+ "memchr",
  "pgwire",
  "pretty_assertions",
  "proptest",
@@ -482,6 +484,7 @@ dependencies = [
  "rustls 0.23.46",
  "rustls-native-certs",
  "secrecy",
+ "serde",
  "serde_json",
  "smtp-proto",
  "strum 0.28.0",
@@ -659,6 +662,15 @@ checksum = "52697735bdaac441a29391a9e97102c74c6ef0f9b60a40cf109b1b404e29d2f6"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "atoi"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

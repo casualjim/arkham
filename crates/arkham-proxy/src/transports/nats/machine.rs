@@ -10,7 +10,32 @@
 //! through and are still real secrets inside the agent. Every other byte,
 //! including PUB and HPUB payloads, streams as it arrives.
 //!
-//! No NATS parser crate is used: counted payloads must stream.
+//! Verbs follow the protocol message table. Operation names are case
+//! insensitive, so `SUB` and `sub` are the same command.
+//! <https://docs.nats.io/reference/reference-protocols/nats-protocol>
+//!
+//! | Message | Sent by |
+//! | --- | --- |
+//! | `CONNECT`, `PUB`, `HPUB`, `SUB`, `UNSUB` | client |
+//! | `INFO`, `MSG`, `HMSG`, `+OK`, `-ERR` | server |
+//! | `PING`, `PONG` | both |
+//!
+//! The streaming framer stays. `watermelon-proto` 0.2.1 `StreamDecoder::decode`
+//! returns `ServerOp` only, and it copies each control line and payload into
+//! its `BytesMut` read buffer, refusing a declared length above `MAX_MSG_LEN`
+//! (128 MiB). `ClientOp` is passed to `encode` and `enqueue_write_op` and has
+//! no decoder. `decode_msg`, `decode_hmsg`, and `decode_headers` are private.
+//! Counted payloads here have to stream, so that decoder cannot sit on the relay.
+//!
+//! Delimiter and newline scans use `memchr` 2.8 (`memchr`, `memchr2`) on the
+//! current slice. That crate's finders take at most three needles and have no
+//! "byte not in this set" search, so the four delimiters (space, tab, CR, LF)
+//! are the nearer of two `memchr2` hits, and a run of delimiters is skipped by
+//! a walk. A digit run uses `atoi` 2 `u64::from_radix_10_checked` on the
+//! contiguous bytes already in the slice. A count split across chunks keeps
+//! the `u64` already parsed and scales it; the digit bytes are not stored.
+//! `lexical-core` 1.0 `parse` and `parse_partial` also need one contiguous
+//! slice and report nothing `atoi` does not already return.
 //!
 //! Upstream, delimited lines (INFO, -ERR, +OK, PING, PONG) redact the real
 //! value back to the decoy. MSG and HMSG payloads are counted down and never
@@ -20,6 +45,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use arkham_config::grants::{Grant, NatsAuth, NatsPair};
+use atoi::FromRadix10Checked as _;
 use secrecy::ExposeSecret as _;
 use serde_json::{Map, Value};
 use strum::{EnumIter, EnumString, IntoEnumIterator as _, IntoStaticStr};
@@ -124,6 +150,24 @@ fn is_delimiter(byte: u8) -> bool {
   matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
+/// Nearest space, tab, CR, or LF. `memchr` finds at most three needles, so
+/// this is the nearer of two searches and keeps no buffer of its own.
+fn delimiter_at(haystack: &[u8]) -> Option<usize> {
+  let spaced = memchr::memchr2(b' ', b'\t', haystack);
+  let broken = memchr::memchr2(b'\r', b'\n', haystack);
+  match (spaced, broken) {
+    (Some(left), Some(right)) => Some(left.min(right)),
+    (Some(at), None) | (None, Some(at)) => Some(at),
+    (None, None) => None,
+  }
+}
+
+/// Bytes of a leading delimiter run. `memchr` has no search for a byte
+/// outside a set, so this walks.
+fn leading_delimiters(haystack: &[u8]) -> usize {
+  haystack.iter().position(|byte| !is_delimiter(*byte)).unwrap_or(haystack.len())
+}
+
 /// The last token of a counted head, read as the line streams.
 #[derive(Debug, Default)]
 struct TrailingCount {
@@ -141,24 +185,66 @@ enum Token {
 }
 
 impl TrailingCount {
-  fn push(&mut self, byte: u8) {
-    if is_delimiter(byte) {
-      match self.token {
-        Token::Between => {}
-        Token::Digits(value) => self.last = Some(value),
-        Token::Word => self.last = None,
+  fn push_slice(&mut self, bytes: &[u8]) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+      if rest.first().is_some_and(|byte| is_delimiter(*byte)) {
+        self.close_token();
+        let skip = leading_delimiters(rest);
+        rest = rest.get(skip..).unwrap_or(&[]);
+        continue;
       }
-      self.token = Token::Between;
+      let end = delimiter_at(rest).unwrap_or(rest.len());
+      if let Some(token) = rest.get(..end).filter(|token| !token.is_empty()) {
+        self.absorb(token);
+      }
+      let Some(after) = rest.get(end..) else {
+        return;
+      };
+      rest = after;
+    }
+  }
+
+  fn close_token(&mut self) {
+    match self.token {
+      Token::Between => {}
+      Token::Digits(value) => self.last = Some(value),
+      Token::Word => self.last = None,
+    }
+    self.token = Token::Between;
+  }
+
+  /// `token` holds no delimiter. A finished number stays a `u64`; the digits
+  /// themselves are the caller's slice.
+  fn absorb(&mut self, token: &[u8]) {
+    if matches!(self.token, Token::Word) {
       return;
     }
-    let digit = char::from(byte).to_digit(10).map(u64::from);
-    self.token = match (self.token, digit) {
-      (Token::Between, Some(digit)) => Token::Digits(digit),
-      (Token::Digits(value), Some(digit)) => value
-        .checked_mul(10)
-        .and_then(|value| value.checked_add(digit))
-        .map_or(Token::Word, Token::Digits),
-      (_, None) | (Token::Word, Some(_)) => Token::Word,
+    let (parsed, used) = u64::from_radix_10_checked(token);
+    if used != token.len() {
+      self.token = Token::Word;
+      return;
+    }
+    let Some(parsed) = parsed else {
+      self.token = Token::Word;
+      return;
+    };
+    let prefix = match self.token {
+      Token::Digits(value) => value,
+      Token::Between => 0,
+      Token::Word => return,
+    };
+    let combined = if prefix == 0 {
+      Some(parsed)
+    } else {
+      u32::try_from(used)
+        .ok()
+        .and_then(|exp| 10u64.checked_pow(exp))
+        .and_then(|scale| prefix.checked_mul(scale).and_then(|scaled| scaled.checked_add(parsed)))
+    };
+    self.token = match combined {
+      Some(value) => Token::Digits(value),
+      None => Token::Word,
     };
   }
 }
@@ -229,7 +315,7 @@ impl Framer {
   fn head<'a>(&mut self, mut head: Vec<u8>, input: &mut &'a [u8]) -> Next<'a> {
     let room = self.bound.saturating_sub(head.len());
     let window = input.get(..room.saturating_add(1)).unwrap_or(input);
-    let delimiter = window.iter().position(|byte| is_delimiter(*byte));
+    let delimiter = delimiter_at(window);
     let overflow = delimiter.is_none() && window.len() > room;
     let take = delimiter.unwrap_or_else(|| room.min(input.len()));
     let Some((verb, rest)) = input.split_at_checked(take) else {
@@ -257,16 +343,14 @@ impl Framer {
   }
 
   fn line<'a>(&mut self, framing: Framing, mut count: TrailingCount, input: &mut &'a [u8]) -> Next<'a> {
-    let newline = input.iter().position(|byte| *byte == b'\n');
+    let newline = memchr::memchr(b'\n', input);
     let take = newline.map_or(input.len(), |at| at.saturating_add(1));
     let Some((bytes, rest)) = input.split_at_checked(take) else {
       return Next::Malformed;
     };
     *input = rest;
     if matches!(framing, Framing::Counted) {
-      for byte in bytes {
-        count.push(*byte);
-      }
+      count.push_slice(bytes);
     }
     let end = newline.is_some();
     if !end {
@@ -469,9 +553,12 @@ fn swap_connect(line: &[u8], auth: &NatsAuth) -> Option<Vec<u8>> {
   let body = line.strip_suffix(b"\n")?;
   let body = body.strip_suffix(b"\r").unwrap_or(body);
   let ending = line.get(body.len()..)?;
-  let verb_end = body.iter().position(|byte| is_delimiter(*byte))?;
+  let verb_end = delimiter_at(body)?;
   let (verb, args) = body.split_at_checked(verb_end)?;
-  let json_at = args.iter().position(|byte| !is_delimiter(*byte))?;
+  let json_at = leading_delimiters(args);
+  if json_at == args.len() {
+    return None;
+  }
   let (gap, json) = args.split_at_checked(json_at)?;
   let mut fields: Map<String, Value> = serde_json::from_slice(json).ok()?;
   let pairs = auth_fields(auth);
@@ -672,7 +759,9 @@ pub(crate) mod tests {
   use arkham_config::grants::{Credential, Grant, NatsAuth, NatsScope};
   use pretty_assertions::assert_eq;
 
-  use super::{MAX_COMMAND, Nats};
+  use strum::IntoEnumIterator as _;
+
+  use super::{ClientVerb, MAX_COMMAND, Nats, ServerVerb};
   use crate::transports::engine::{Rewritten, Wire};
 
   const FAKE_PASS: &str = "arkham_fake_nats_pass"; // betterleaks:allow
@@ -694,6 +783,19 @@ pub(crate) mod tests {
       },
       scope: Box::new(scope),
     }]
+  }
+
+  /// The verb tables are the protocol message list.
+  /// <https://docs.nats.io/reference/reference-protocols/nats-protocol>
+  /// says operation names are case insensitive.
+  #[test]
+  fn verbs_match_the_protocol_spec() {
+    let client: Vec<&str> = ClientVerb::iter().map(<&str>::from).collect();
+    assert_eq!(client, ["CONNECT", "PUB", "HPUB", "SUB", "UNSUB", "PING", "PONG"]);
+    let server: Vec<&str> = ServerVerb::iter().map(<&str>::from).collect();
+    assert_eq!(server, ["INFO", "MSG", "HMSG", "+OK", "-ERR", "PING", "PONG"]);
+    assert!(matches!("connect".parse::<ClientVerb>(), Ok(ClientVerb::Connect)));
+    assert!(matches!("hmsg".parse::<ServerVerb>(), Ok(ServerVerb::Hmsg)));
   }
 
   fn user_pass() -> Vec<Grant> {

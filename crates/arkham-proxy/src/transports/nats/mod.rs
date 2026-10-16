@@ -7,7 +7,10 @@
 //! both legs settle TLS before any protocol byte. CONNECT carries the real
 //! values only when the server leg is TLS.
 
-pub(crate) mod machine;
+pub mod machine;
+
+#[cfg(test)]
+pub mod props;
 
 use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
@@ -206,7 +209,7 @@ impl NatsTransport {
     let upstream = &open.scope.upstream;
     let mut tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
     let (down, mut up) = open.pair(trust.is_some());
-    let Some(rest) = server_info(&mut tcp, &mut up, &mut guest).await? else {
+    let Some(rest) = server_info(&mut tcp, &mut up, &mut guest, trust.is_none()).await? else {
       return Ok(());
     };
     if let Some(trust) = trust {
@@ -294,11 +297,29 @@ async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>
   tokio::time::timeout(budget, step).await.unwrap_or(Err(Error::NatsHandshakeTimeout))
 }
 
+/// TLS flags carried on an INFO object. Absent fields are false.
+#[derive(Debug, serde::Deserialize)]
+struct InfoTls {
+  #[serde(default)]
+  tls_required: bool,
+  #[serde(default)]
+  tls_available: bool,
+  #[serde(default)]
+  tls_verify: bool,
+}
+
 /// Forward the server's first line, INFO, through `up` to the guest, and
 /// return the bytes read past its LF. On a `tls://` server leg they belong
 /// to the server's TLS, not to NATS. `None` when the server closes first or
-/// `up` closes the leg.
-pub(crate) async fn server_info<S, G>(server: &mut S, up: &mut Nats, guest: &mut G) -> Result<Option<Vec<u8>>, Error>
+/// `up` closes the leg. `cleartext` is the upstream that will not upgrade:
+/// INFO `tls_required` then closes the session.
+///
+/// # Errors
+///
+/// Returns [`Error::NatsTlsRequired`] when `cleartext` is set and the INFO
+/// object sets `tls_required`. Returns an error when the server read or the
+/// guest write fails.
+pub(crate) async fn server_info<S, G>(server: &mut S, up: &mut Nats, guest: &mut G, cleartext: bool) -> Result<Option<Vec<u8>>, Error>
 where
   S: AsyncRead + Unpin,
   G: AsyncWrite + Unpin,
@@ -309,11 +330,20 @@ where
     let Some(chunk) = buf.get(..n).filter(|chunk| !chunk.is_empty()) else {
       return Ok(None);
     };
-    let newline = chunk.iter().position(|byte| *byte == b'\n');
+    let newline = memchr::memchr(b'\n', chunk);
     let cut = newline.map_or(chunk.len(), |at| at.saturating_add(1));
     let Some((line, rest)) = chunk.split_at_checked(cut) else {
       return Ok(None);
     };
+    if newline.is_some()
+      && cleartext
+      && let Some(info) = info_tls(line).filter(|info| info.tls_required)
+    {
+      return Err(Error::NatsTlsRequired {
+        tls_available: info.tls_available,
+        tls_verify: info.tls_verify,
+      });
+    }
     let (rewritten, hits) = up.feed(line).await;
     log_hits(&hits);
     match rewritten {
@@ -325,6 +355,20 @@ where
       return Ok(Some(rest.to_vec()));
     }
   }
+}
+
+/// INFO's TLS object, when `line` is an INFO command and its JSON parses.
+fn info_tls(line: &[u8]) -> Option<InfoTls> {
+  let verb_end = memchr::memchr2(b' ', b'\t', line)
+    .or_else(|| memchr::memchr2(b'\r', b'\n', line))
+    .unwrap_or(line.len());
+  if !line.get(..verb_end).is_some_and(|verb| verb.eq_ignore_ascii_case(b"INFO")) {
+    return None;
+  }
+  let start = memchr::memchr(b'{', line)?;
+  let json = line.get(start..)?;
+  let mut deserializer = serde_json::Deserializer::from_slice(json);
+  serde::Deserialize::deserialize(&mut deserializer).ok()
 }
 
 /// The guest's first bytes after INFO: the ingress replay, or one read.
@@ -444,12 +488,51 @@ mod tests {
     let mut server = Cursor::new(wire);
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let rest = server_info(&mut server, &mut up, &mut guest).await.unwrap();
+    let rest = server_info(&mut server, &mut up, &mut guest, false).await.unwrap();
     assert_eq!(rest, Some(vec![0x16, 0x03, 0x01]));
     assert_eq!(guest, info);
     let Rewritten::Emit(next) = up.feed(b"+OK\r\n").await.0 else {
       panic!("a line after INFO is emitted");
     };
     assert_eq!(next.as_ref(), b"+OK\r\n");
+  }
+
+  #[tokio::test]
+  async fn cleartext_upstream_closes_when_info_requires_tls() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let info = b"INFO {\"server_id\":\"N1\",\"tls_required\":true,\"tls_available\":true,\"tls_verify\":false}\r\nCONNECT {\"x\":1}\r\n";
+    let mut server = Cursor::new(info.to_vec());
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::Error::NatsTlsRequired {
+          tls_available: true,
+          tls_verify: false
+        }
+      ),
+      "{err}"
+    );
+    assert_eq!(guest, b"");
+  }
+
+  #[tokio::test]
+  async fn cleartext_upstream_forwards_info_when_tls_is_not_required() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let info = b"INFO {\"server_id\":\"N1\",\"tls_required\":false,\"tls_available\":true,\"tls_verify\":true}\r\n";
+    let mut server = Cursor::new(info.to_vec());
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let rest = server_info(&mut server, &mut up, &mut guest, true).await.unwrap();
+    assert_eq!(rest, Some(Vec::new()));
+    assert_eq!(guest, info);
   }
 }

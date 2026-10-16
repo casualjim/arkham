@@ -4,6 +4,9 @@
 //! that use it live in their protocol verticals.
 
 #[cfg(test)]
+pub(crate) mod harness;
+
+#[cfg(test)]
 mod fuzz_props;
 
 pub(crate) use super::http::h2::H2;
