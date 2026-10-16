@@ -1111,8 +1111,8 @@ mod tests {
   #[test]
   fn rule_table_for_a_redis_rule_keys_by_its_env() {
     let mut cfg = cfg_with_db(
-      "redis://app:fake@db.internal:6379/0", // betterleaks:allow
-      "redis://app:real@db.internal:6379/0", // betterleaks:allow
+      "rediss://app:fake@db.internal:6379/0", // betterleaks:allow
+      "rediss://app:real@db.internal:6379/0", // betterleaks:allow
     );
     let entry = || HostTlsCfg {
       client_cert: None,
@@ -1375,8 +1375,8 @@ mod tests {
   #[test]
   fn rule_table_for_an_smtp_rule_keys_by_its_env() {
     let mut cfg = cfg_with_db(
-      "smtp://agent:fake@mail.internal:587",                   // betterleaks:allow
-      "smtp://agent:real@mail.internal:587?starttls=required", // betterleaks:allow
+      "smtps://agent:fake@mail.internal:465", // betterleaks:allow
+      "smtps://agent:real@mail.internal:465", // betterleaks:allow
     );
     let entry = || HostTlsCfg {
       client_cert: None,

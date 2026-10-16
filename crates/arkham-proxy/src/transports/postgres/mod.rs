@@ -176,6 +176,10 @@ impl Transport for PostgresTransport {
       guest_head = buf;
     }
 
+    if guest_tls.is_none() && scope.guest_tls == GuestTlsMode::Mtls {
+      return Err(Error::PostgresGuestPlaintext);
+    }
+
     // The real string states the far end: the dial follows its host and
     // port, not the destination the guest aimed at.
     let mut upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;

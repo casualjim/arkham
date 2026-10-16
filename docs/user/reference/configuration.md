@@ -64,6 +64,8 @@ A rule whose `value` states a `postgres://` connection string is a database rule
 
 The connection strings carry the upstream TLS policy as libpq parameters: `sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; default `prefer`), `sslnegotiation` (`postgres`, default, or `direct`), `sslrootcert` (upstream trust anchor, required for a verifying sslmode), and `sslcert`/`sslkey` (upstream client identity). These parameters belong on database connection strings only; endpoint rules state the same capabilities through `[rules.<label>.tls]`.
 
+The guest chooses its own transport. `guest_tls_mode = mtls` stays legal on `postgres://`. A guest that opens in cleartext is closed before arkham dials upstream, so the real credential is not presented. A guest that opens TLS still has to present a client certificate signed by the arkham CA.
+
 ```toml
 [rules.db]
 env = "DATABASE_URL"
@@ -74,7 +76,7 @@ value = "postgres://app:decoy@db.internal:5432/app"
 
 A rule whose `value` states a `redis://` or `rediss://` connection string is a Redis rule. The rule states the FAKE string in `value` (a proper URL, so the env var holds a URL the client can dial). The REAL string resolves from the secret source under `env`/`fnox_key` into `real`. No `allow` entries: the connection string is the grant, matched on the fake string's port.
 
-`redis://` is cleartext. `rediss://` is TLS. The scheme states the transport; a `sslmode` or `sslnegotiation` query is rejected. The default port is `6379`. The real `rediss://` string may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together (the upstream client certificate). Arkham reads that query and removes it before dialing. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`.
+`redis://` is cleartext. `rediss://` is TLS. The scheme states the transport; a `sslmode` or `sslnegotiation` query is rejected. The default port is `6379`. The real `rediss://` string may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together (the upstream client certificate). Arkham reads that query and removes it before dialing. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`. `mtls` requires a `rediss://` fake. A `redis://` fake with `mtls` is rejected at load, because that guest never presents a client certificate and arkham would still authenticate upstream with the real password.
 
 The wire machine swaps the fake password for the real one on `AUTH` and `HELLO`. When the two strings name different users, the user swaps too.
 
@@ -100,6 +102,8 @@ A rule whose `value` states an `smtp://` or `smtps://` connection string is an S
 
 `starttls=required` is legal only on a real `smtp://` string. AUTH is rewritten only once the upstream leg is TLS: after that upgrade, or on `smtps://` from the first byte. A session that stays cleartext forwards the decoy. Loading a real `smtp://` string with no `starttls` query logs that the decoy is what travels until the upstream leg is TLS. `sslrootcert` (a PEM path, or `system`) and `sslcert`/`sslkey` together belong on `smtps://` or on `smtp://` with `starttls=required`.
 
+`guest_tls_mode = mtls` requires an `smtps://` fake. An `smtp://` fake with `mtls` is rejected at load, including when the real string is `smtps://` or `starttls=required`. A guest on `smtp://` can send `AUTH` before `STARTTLS`, and arkham would authenticate upstream without ever seeing a client certificate. Use `smtps://` when the guest must present one.
+
 `DATA` passes bytes until the terminating dot, and `BDAT n` passes the next `n` octets. Neither payload is buffered. Upstream replies redact an equal-length password and leave the username as the server wrote it. A `334` challenge is not rewritten.
 
 The wire machine rewrites `AUTH PLAIN` (inline or after `334`), `AUTH LOGIN` (two-step, or with the username inline), `AUTH XOAUTH2`, and `AUTH OAUTHBEARER`. `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are relayed unchanged. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name.
@@ -122,7 +126,7 @@ The real submission value in fnox carries the upgrade and the trust anchor, for 
 
 A rule whose `value` states an `ldap://` or `ldaps://` connection string is an LDAP rule. The rule states the FAKE string in `value`. The REAL string resolves from the secret source under `env`/`fnox_key`. No `allow` entries: the connection string is the grant, matched on the fake string's port. The bind DN is the URL user and the simple-bind password is the URL password; both are required, and the string has no path.
 
-`ldap://` is cleartext and may upgrade with StartTLS. `ldaps://` is TLS from the first byte. The scheme states the transport. A `sslmode` or `sslnegotiation` query is rejected. The default port is `389` for `ldap://` and `636` for `ldaps://`. Both schemes may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together. `ldaps://` uses that material on connect. `ldap://` uses it after StartTLS, because the cleartext leg becomes TLS. Arkham reads the query off the real string and does not send it to the directory. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`.
+`ldap://` is cleartext and may upgrade with StartTLS. `ldaps://` is TLS from the first byte. The scheme states the transport. A `sslmode` or `sslnegotiation` query is rejected. The default port is `389` for `ldap://` and `636` for `ldaps://`. Both schemes may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together. `ldaps://` uses that material on connect. `ldap://` uses it after StartTLS, because the cleartext leg becomes TLS. Arkham reads the query off the real string and does not send it to the directory. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`. `mtls` requires an `ldaps://` fake. An `ldap://` fake with `mtls` is rejected at load, including StartTLS, because a guest can bind before the upgrade and arkham would authenticate upstream without a client certificate.
 
 The wire machine swaps the fake simple-bind password for the real one and reframes the BER message, so the two passwords need not be the same length. When the bind DN equals the fake string's DN and the real string names a different DN, the DN swaps too. A bind whose password is not the decoy is forwarded byte-identical. SASL binds are forwarded unchanged.
 
@@ -148,7 +152,7 @@ Per-entry TLS, keyed by the exact `allow` entry string. All keys optional.
 | --- | --- |
 | `client_cert` / `client_key` | Upstream client identity the proxy presents to this entry. Come together. |
 | `root_cert` | Upstream CA bundle trusting this entry's host, additive to webpki roots plus global `root_certs`. |
-| `guest_tls_mode` | `tls` (default) or `mtls`: demand a guest client certificate signed by the arkham CA. |
+| `guest_tls_mode` | `tls` (default) or `mtls`: demand a guest client certificate signed by the arkham CA. `mtls` on a `redis://`, `smtp://`, or `ldap://` fake is rejected at load. Postgres keeps `mtls` and closes a guest that opens in cleartext. |
 | `guest_cert` / `guest_key` | Container-internal path the guest's minted certificate and key mount at. Defaults are under the workspace state directory; set these when the client reads its pair from a fixed location. |
 
 ## `[workspace]`

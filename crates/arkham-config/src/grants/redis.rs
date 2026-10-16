@@ -232,8 +232,9 @@ impl RedisScope {
 ///
 /// # Errors
 ///
-/// Returns an error when either string fails the redis law above, or when
-/// a `tls` row tries to state what only the real string may state.
+/// Returns an error when either string fails the redis law above, when a
+/// `tls` row tries to state what only the real string may state, or when
+/// `guest_tls_mode` is `mtls` on a cleartext `redis://` fake.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value
@@ -259,6 +260,9 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     }
     if tls.root_cert.is_some() {
       return Err(Error::RedisTrust { label: label.to_string() });
+    }
+    if tls.guest_tls_mode == GuestTlsMode::Mtls && !scope.is_downstream_tls {
+      return Err(Error::RedisCleartextMtls { label: label.to_string() });
     }
     scope.guest_tls = tls.guest_tls_mode;
   }
