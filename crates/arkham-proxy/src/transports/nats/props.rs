@@ -257,6 +257,26 @@ proptest! {
     let mut cuts: Vec<usize> = cuts.iter().map(|cut| cut % stream.len()).collect();
     cuts.push(info.len().saturating_add(past_newline));
     let expected = run_nats(NatsLeg::Up, &info, &[]).out;
+    let mut clear_reader = CutPend::new(stream.clone(), &cuts);
+    let mut clear_up = nats_leg(NatsLeg::Up);
+    let mut clear_guest = Vec::new();
+    let err = block_on(server_info(&mut clear_reader, &mut clear_up, &mut clear_guest, true))
+      .expect_err("cleartext INFO with tls_required must close");
+    prop_assert!(
+      matches!(
+        err,
+        crate::Error::NatsTlsRequired {
+          tls_available: false,
+          tls_verify: false
+        }
+      ),
+      "cleartext close was {err}"
+    );
+    prop_assert!(!clear_guest.contains(&b'\n'), "the read that held LF was written on a cleartext close");
+    prop_assert!(
+      !contains_bytes(&clear_guest, NATS_REAL.as_bytes()),
+      "INFO carried the real password to the guest"
+    );
     let mut reader = CutPend::new(stream, &cuts);
     let mut up = nats_leg(NatsLeg::Up);
     let mut guest = Vec::new();

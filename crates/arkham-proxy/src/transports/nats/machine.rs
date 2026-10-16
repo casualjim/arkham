@@ -37,14 +37,14 @@
 //! `lexical-core` 1.0 `parse` and `parse_partial` also need one contiguous
 //! slice and report nothing `atoi` does not already return.
 //!
-//! INFO's `tls_required`, `tls_available`, and `tls_verify` are read while
-//! that line streams. The verb is the framer's first piece, cut by the
-//! delimiter scan above and parsed as a server verb. Only those three bools
-//! are kept: a key fits in 13 bytes, a bool token in 5, and
-//! `serde_json::from_slice::<bool>` parses the token. Strings, numbers,
-//! arrays, and nested objects are skipped, so text inside a value does not
-//! set a flag. The INFO line is not stored. The flags are ready when the
-//! line piece includes LF.
+//! INFO's `tls_required`, `tls_available`, and `tls_verify` come from actson
+//! 2.1.0. The verb is still the framer's first piece. Object bytes go into
+//! `PushJsonFeeder`, and names and bools are taken at depth 1. That crate
+//! keeps the current token in `current_buffer` until the event, and the
+//! feeder queues at most 1024 bytes, so a token stops at [`MAX_COMMAND`].
+//! A cleartext line whose object does not end, and whose `tls_required`
+//! was not true, closes. The INFO line is not stored. The verdict is ready
+//! when the line piece includes LF.
 //!
 //! Upstream, delimited lines (INFO, -ERR, +OK, PING, PONG) redact the real
 //! value back to the decoy. MSG and HMSG payloads are counted down and never
@@ -53,6 +53,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+use actson::feeder::PushJsonFeeder;
+use actson::{JsonEvent, JsonParser};
 use arkham_config::grants::{Grant, NatsAuth, NatsPair};
 use atoi::FromRadix10Checked as _;
 use secrecy::ExposeSecret as _;
@@ -477,11 +479,11 @@ impl Nats {
     })
   }
 
-  /// TLS flags of the INFO line whose LF was just framed, once.
+  /// TLS verdict of the INFO line whose LF was just framed, once.
   ///
-  /// `None` until that LF, and `None` again after the flags are taken.
+  /// `None` until that LF, and `None` again after the verdict is taken.
   /// A line that is not INFO does not become ready.
-  pub(crate) fn take_info_tls(&mut self) -> Option<InfoTls> {
+  pub(crate) fn take_info_tls(&mut self) -> Option<InfoVerdict> {
     match self {
       Self::Up(up) => up.info.ready.take(),
       Self::Down(_) | Self::Closed => None,
@@ -690,326 +692,190 @@ pub(crate) struct InfoTls {
   pub(crate) tls_verify: bool,
 }
 
+/// What a finished INFO line says about TLS on a cleartext upstream.
+#[derive(Debug)]
+pub(crate) enum InfoVerdict {
+  /// The object ended, or `tls_required` was already true.
+  Flags(InfoTls),
+  /// The object did not end, and `tls_required` was not true.
+  Unreadable,
+}
+
 /// Which INFO bool a key names.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum TlsKey {
   Required,
   Available,
   Verify,
 }
 
-/// `tls_available`, the longest of the three keys.
-const TLS_KEY_CAP: usize = 13;
-/// `false`, the longer JSON bool.
-const TLS_BOOL_CAP: usize = 5;
-
-/// Where an INFO object is, while its bytes stream past.
-#[derive(Debug, Default)]
-enum Scan {
-  #[default]
-  SeekObject,
-  SeekKey,
-  Key {
-    raw: [u8; TLS_KEY_CAP],
-    len: usize,
-    drop: bool,
-    escape: bool,
-  },
-  Colon(Option<TlsKey>),
-  Value(Option<TlsKey>),
-  Bool {
-    key: Option<TlsKey>,
-    raw: [u8; TLS_BOOL_CAP],
-    len: usize,
-  },
-  SkipString {
-    escape: bool,
-  },
-  SkipLiteral,
-  Nest {
-    depth: u32,
-    string: bool,
-    escape: bool,
-  },
-  After,
-  Idle,
-}
-
-/// The three TLS flags, and nothing else from the INFO object.
-#[derive(Debug, Default)]
-struct InfoScan {
-  phase: Scan,
+/// actson events for one INFO object.
+///
+/// `current_buffer` holds the open token and the feeder holds unread input.
+/// [`open_len`](Self::open_len) stops that pair at [`MAX_COMMAND`].
+struct InfoParse {
+  parser: JsonParser<PushJsonFeeder>,
+  /// Bytes handed to the feeder.
+  fed: usize,
+  /// [`JsonParser::parsed_bytes`] at the previous event.
+  mark: usize,
+  depth: u32,
+  key: Option<TlsKey>,
   tls: InfoTls,
+  ended: bool,
+  failed: bool,
 }
 
-impl InfoScan {
+impl InfoParse {
+  fn new() -> Self {
+    Self {
+      parser: JsonParser::new(PushJsonFeeder::new()),
+      fed: 0,
+      mark: 0,
+      depth: 0,
+      key: None,
+      tls: InfoTls::default(),
+      ended: false,
+      failed: false,
+    }
+  }
+
   fn push(&mut self, bytes: &[u8]) {
     for &byte in bytes {
-      let mut pending = Some(byte);
-      while let Some(current) = pending {
-        pending = self.step(current);
+      if self.failed {
+        return;
+      }
+      self.drain_while_full();
+      if self.failed || self.open_len() >= MAX_COMMAND {
+        self.failed = true;
+        return;
+      }
+      if self.parser.feeder.push_byte(byte).is_err() {
+        self.failed = true;
+        return;
+      }
+      self.fed = self.fed.saturating_add(1);
+    }
+  }
+
+  fn drain_while_full(&mut self) {
+    while self.parser.feeder.is_full() && !self.failed {
+      let before = self.parser.parsed_bytes();
+      self.step();
+      if self.failed {
+        return;
+      }
+      if self.parser.parsed_bytes() == before && self.parser.feeder.is_full() {
+        self.failed = true;
+        return;
       }
     }
   }
 
-  fn snapshot(&self) -> InfoTls {
-    self.tls
-  }
-
-  fn step(&mut self, byte: u8) -> Option<u8> {
-    let phase = std::mem::replace(&mut self.phase, Scan::Idle);
-    match phase {
-      Scan::SeekObject => self.seek_object(byte),
-      Scan::SeekKey => self.seek_key(byte),
-      Scan::Key { raw, len, drop, escape } => self.key(raw, len, drop, escape, byte),
-      Scan::Colon(key) => self.colon(key, byte),
-      Scan::Value(key) => self.value(key, byte),
-      Scan::Bool { key, raw, len } => self.boolean(key, raw, len, byte),
-      Scan::SkipString { escape } => self.skip_string(escape, byte),
-      Scan::SkipLiteral => self.skip_literal(byte),
-      Scan::Nest { depth, string, escape } => self.nest(depth, string, escape, byte),
-      Scan::After => self.after(byte),
-      Scan::Idle => None,
-    }
-  }
-
-  fn seek_object(&mut self, byte: u8) -> Option<u8> {
-    self.phase = if byte == b'{' {
-      Scan::SeekKey
-    } else if is_json_ws(byte) {
-      Scan::SeekObject
-    } else {
-      Scan::Idle
-    };
-    None
-  }
-
-  fn seek_key(&mut self, byte: u8) -> Option<u8> {
-    self.phase = match byte {
-      b'"' => Scan::Key {
-        raw: [0; TLS_KEY_CAP],
-        len: 0,
-        drop: false,
-        escape: false,
-      },
-      b'}' => Scan::Idle,
-      _ if is_json_ws(byte) || byte == b',' => Scan::SeekKey,
-      _ => Scan::Idle,
-    };
-    None
-  }
-
-  fn key(&mut self, mut raw: [u8; TLS_KEY_CAP], len: usize, drop: bool, escape: bool, byte: u8) -> Option<u8> {
-    if escape {
-      self.phase = Scan::Key {
-        raw,
-        len,
-        drop: true,
-        escape: false,
-      };
-      return None;
-    }
-    if byte == b'\\' {
-      self.phase = Scan::Key {
-        raw,
-        len,
-        drop,
-        escape: true,
-      };
-      return None;
-    }
-    if byte == b'"' {
-      let key = if drop { None } else { tls_key(raw.get(..len).unwrap_or(&[])) };
-      self.phase = Scan::Colon(key);
-      return None;
-    }
-    if drop || len >= TLS_KEY_CAP {
-      self.phase = Scan::Key {
-        raw,
-        len,
-        drop: true,
-        escape: false,
-      };
-      return None;
-    }
-    if let Some(slot) = raw.get_mut(len) {
-      *slot = byte;
-    }
-    self.phase = Scan::Key {
-      raw,
-      len: len.saturating_add(1),
-      drop: false,
-      escape: false,
-    };
-    None
-  }
-
-  fn colon(&mut self, key: Option<TlsKey>, byte: u8) -> Option<u8> {
-    self.phase = match byte {
-      b':' => Scan::Value(key),
-      _ if is_json_ws(byte) => Scan::Colon(key),
-      _ => Scan::Idle,
-    };
-    None
-  }
-
-  fn value(&mut self, key: Option<TlsKey>, byte: u8) -> Option<u8> {
-    self.phase = match byte {
-      b'"' => Scan::SkipString { escape: false },
-      b't' | b'f' => {
-        let mut raw = [0; TLS_BOOL_CAP];
-        if let Some(slot) = raw.get_mut(0) {
-          *slot = byte;
-        }
-        Scan::Bool { key, raw, len: 1 }
+  fn step(&mut self) {
+    match self.parser.next_event() {
+      Ok(Some(JsonEvent::NeedMoreInput) | None) => {}
+      Ok(Some(event)) => {
+        self.mark = self.parser.parsed_bytes();
+        self.on_event(event);
       }
-      b'{' | b'[' => Scan::Nest {
-        depth: 1,
-        string: false,
-        escape: false,
-      },
-      b'n' | b'-' | b'0'..=b'9' => Scan::SkipLiteral,
-      _ if is_json_ws(byte) => Scan::Value(key),
-      _ => Scan::Idle,
-    };
-    None
-  }
-
-  fn boolean(&mut self, key: Option<TlsKey>, mut raw: [u8; TLS_BOOL_CAP], len: usize, byte: u8) -> Option<u8> {
-    if is_json_ws(byte) || matches!(byte, b',' | b'}' | b']') {
-      self.store_bool(key, raw.get(..len).unwrap_or(&[]));
-      self.phase = Scan::After;
-      return Some(byte);
-    }
-    if len >= TLS_BOOL_CAP {
-      self.phase = Scan::SkipLiteral;
-      return None;
-    }
-    if let Some(slot) = raw.get_mut(len) {
-      *slot = byte;
-    }
-    self.phase = Scan::Bool {
-      key,
-      raw,
-      len: len.saturating_add(1),
-    };
-    None
-  }
-
-  fn store_bool(&mut self, key: Option<TlsKey>, token: &[u8]) {
-    let Some(key) = key else {
-      return;
-    };
-    let Ok(value) = serde_json::from_slice::<bool>(token) else {
-      return;
-    };
-    match key {
-      TlsKey::Required => self.tls.tls_required = value,
-      TlsKey::Available => self.tls.tls_available = value,
-      TlsKey::Verify => self.tls.tls_verify = value,
+      Err(_) => self.failed = true,
     }
   }
 
-  fn skip_string(&mut self, escape: bool, byte: u8) -> Option<u8> {
-    self.phase = if escape {
-      Scan::SkipString { escape: false }
-    } else {
-      match byte {
-        b'\\' => Scan::SkipString { escape: true },
-        b'"' => Scan::After,
-        _ => Scan::SkipString { escape: false },
-      }
-    };
-    None
-  }
-
-  fn skip_literal(&mut self, byte: u8) -> Option<u8> {
-    if is_json_ws(byte) {
-      self.phase = Scan::After;
-      return None;
-    }
-    if matches!(byte, b',' | b'}' | b']') {
-      self.phase = Scan::After;
-      return Some(byte);
-    }
-    self.phase = Scan::SkipLiteral;
-    None
-  }
-
-  fn nest(&mut self, depth: u32, string: bool, escape: bool, byte: u8) -> Option<u8> {
-    if string {
-      self.phase = if escape {
-        Scan::Nest {
-          depth,
-          string: true,
-          escape: false,
-        }
-      } else {
-        match byte {
-          b'\\' => Scan::Nest {
-            depth,
-            string: true,
-            escape: true,
-          },
-          b'"' => Scan::Nest {
-            depth,
-            string: false,
-            escape: false,
-          },
-          _ => Scan::Nest {
-            depth,
-            string: true,
-            escape: false,
-          },
-        }
-      };
-      return None;
-    }
-    self.phase = match byte {
-      b'"' => Scan::Nest {
-        depth,
-        string: true,
-        escape: false,
-      },
-      b'{' | b'[' => Scan::Nest {
-        depth: depth.saturating_add(1),
-        string: false,
-        escape: false,
-      },
-      b'}' | b']' => {
-        let depth = depth.saturating_sub(1);
-        if depth == 0 {
-          Scan::After
-        } else {
-          Scan::Nest {
-            depth,
-            string: false,
-            escape: false,
+  fn finish(mut self) -> InfoVerdict {
+    if !self.failed {
+      self.parser.feeder.done();
+      loop {
+        match self.parser.next_event() {
+          Ok(None) => break,
+          Ok(Some(JsonEvent::NeedMoreInput)) | Err(_) => {
+            self.failed = true;
+            break;
+          }
+          Ok(Some(event)) => {
+            self.mark = self.parser.parsed_bytes();
+            self.on_event(event);
+            if self.failed {
+              break;
+            }
           }
         }
       }
-      _ => Scan::Nest {
-        depth,
-        string: false,
-        escape: false,
-      },
-    };
-    None
+    }
+    if self.tls.tls_required || self.ended {
+      InfoVerdict::Flags(self.tls)
+    } else {
+      InfoVerdict::Unreadable
+    }
   }
 
-  fn after(&mut self, byte: u8) -> Option<u8> {
-    self.phase = match byte {
-      b',' => Scan::SeekKey,
-      b'}' => Scan::Idle,
-      _ if is_json_ws(byte) => Scan::After,
-      _ => Scan::Idle,
-    };
-    None
+  /// Parsed bytes of the open token, plus bytes still sitting in the feeder.
+  fn open_len(&self) -> usize {
+    let parsed = self.parser.parsed_bytes();
+    let queued = self.fed.saturating_sub(parsed);
+    parsed.saturating_sub(self.mark).saturating_add(queued)
   }
-}
 
-fn is_json_ws(byte: u8) -> bool {
-  matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+  fn on_event(&mut self, event: JsonEvent) {
+    match event {
+      JsonEvent::StartObject | JsonEvent::StartArray => {
+        self.depth = self.depth.saturating_add(1);
+      }
+      JsonEvent::EndObject | JsonEvent::EndArray => {
+        self.depth = self.depth.saturating_sub(1);
+        if self.depth == 0 && matches!(event, JsonEvent::EndObject) {
+          self.ended = true;
+        }
+      }
+      JsonEvent::FieldName => self.note_name(),
+      JsonEvent::ValueTrue | JsonEvent::ValueFalse => self.note_bool(matches!(event, JsonEvent::ValueTrue)),
+      JsonEvent::ValueString => {
+        self.reject_long_text();
+        self.key = None;
+      }
+      JsonEvent::ValueInt | JsonEvent::ValueFloat | JsonEvent::ValueNull => self.key = None,
+      JsonEvent::NeedMoreInput => {}
+    }
+  }
+
+  fn note_name(&mut self) {
+    if self.depth != 1 {
+      self.key = None;
+      return;
+    }
+    match self.parser.current_str() {
+      Ok(name) if name.len() > MAX_COMMAND => {
+        self.failed = true;
+        self.key = None;
+      }
+      Ok(name) => self.key = tls_key(name.as_bytes()),
+      Err(_) => {
+        self.failed = true;
+        self.key = None;
+      }
+    }
+  }
+
+  fn note_bool(&mut self, value: bool) {
+    if self.depth == 1 {
+      match self.key {
+        Some(TlsKey::Required) => self.tls.tls_required = value,
+        Some(TlsKey::Available) => self.tls.tls_available = value,
+        Some(TlsKey::Verify) => self.tls.tls_verify = value,
+        None => {}
+      }
+    }
+    self.key = None;
+  }
+
+  fn reject_long_text(&mut self) {
+    match self.parser.current_str() {
+      Ok(text) if text.len() > MAX_COMMAND => self.failed = true,
+      Ok(_) => {}
+      Err(_) => self.failed = true,
+    }
+  }
 }
 
 fn tls_key(raw: &[u8]) -> Option<TlsKey> {
@@ -1021,16 +887,15 @@ fn tls_key(raw: &[u8]) -> Option<TlsKey> {
   }
 }
 
-/// Server verb plus the TLS flags of an INFO line in progress.
-#[derive(Debug)]
+/// Server verb plus the TLS verdict of an INFO line in progress.
 struct InfoWatch {
   /// The next line piece is a verb.
   expect_verb: bool,
   /// This command is INFO and its LF has not arrived.
   active: bool,
   /// Set when an INFO line reaches LF. Taken once.
-  ready: Option<InfoTls>,
-  scan: InfoScan,
+  ready: Option<InfoVerdict>,
+  parse: Option<InfoParse>,
 }
 
 impl Default for InfoWatch {
@@ -1039,7 +904,7 @@ impl Default for InfoWatch {
       expect_verb: true,
       active: false,
       ready: None,
-      scan: InfoScan::default(),
+      parse: None,
     }
   }
 }
@@ -1048,16 +913,24 @@ impl InfoWatch {
   fn note(&mut self, bytes: &[u8], end: bool) {
     if self.expect_verb {
       self.expect_verb = false;
-      self.scan = InfoScan::default();
       self.active = is_info_verb(bytes);
-    } else if self.active {
-      self.scan.push(bytes);
+      if self.active {
+        self.parse = Some(InfoParse::new());
+      }
+    } else if self.active
+      && let Some(parse) = self.parse.as_mut()
+    {
+      parse.push(bytes);
     }
     if end {
       if self.active && self.ready.is_none() {
-        self.ready = Some(self.scan.snapshot());
+        self.ready = Some(match self.parse.take() {
+          Some(parse) => parse.finish(),
+          None => InfoVerdict::Unreadable,
+        });
       }
       self.active = false;
+      self.parse = None;
       self.expect_verb = true;
     }
   }

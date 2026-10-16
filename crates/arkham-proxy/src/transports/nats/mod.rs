@@ -302,15 +302,17 @@ async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>
 /// to the server's TLS, not to NATS. `None` when the server closes first or
 /// `up` closes the leg. `cleartext` is the upstream that will not upgrade:
 /// INFO `tls_required` then closes the session. The line may cross reads.
-/// `up` keeps the three TLS flags as those reads stream, and the check runs
-/// once the read that holds the LF has been framed, before that read is
-/// written to the guest.
+/// `up` reads the object with actson as those reads stream, and the check
+/// runs once the read that holds the LF has been framed, before that read
+/// is written to the guest. A line that does not finish an object, and
+/// does not set `tls_required`, closes too.
 ///
 /// # Errors
 ///
 /// Returns [`Error::NatsTlsRequired`] when `cleartext` is set and the INFO
-/// object sets `tls_required`. Returns an error when the server read or the
-/// guest write fails.
+/// object sets `tls_required`. Returns [`Error::NatsInfoUnreadable`] when
+/// `cleartext` is set and the object does not finish without that flag.
+/// Returns an error when the server read or the guest write fails.
 pub(crate) async fn server_info<S, G>(server: &mut S, up: &mut Nats, guest: &mut G, cleartext: bool) -> Result<Option<Vec<u8>>, Error>
 where
   S: AsyncRead + Unpin,
@@ -329,11 +331,17 @@ where
     };
     let (rewritten, hits) = up.feed(line).await;
     log_hits(&hits);
-    if cleartext && let Some(info) = up.take_info_tls().filter(|info| info.tls_required) {
-      return Err(Error::NatsTlsRequired {
-        tls_available: info.tls_available,
-        tls_verify: info.tls_verify,
-      });
+    if cleartext && let Some(verdict) = up.take_info_tls() {
+      match verdict {
+        machine::InfoVerdict::Flags(info) if info.tls_required => {
+          return Err(Error::NatsTlsRequired {
+            tls_available: info.tls_available,
+            tls_verify: info.tls_verify,
+          });
+        }
+        machine::InfoVerdict::Unreadable => return Err(Error::NatsInfoUnreadable),
+        machine::InfoVerdict::Flags(_) => {}
+      }
     }
     match rewritten {
       Rewritten::Close => return Ok(None),
@@ -536,6 +544,45 @@ mod tests {
       "{err}"
     );
     assert_eq!(guest, b"");
+  }
+
+  /// A cleartext INFO that never finishes an object, and never sets the flag, closes.
+  #[tokio::test]
+  async fn cleartext_malformed_info_closes() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let info = b"INFO {\"server_id\":\r\n";
+    let mut server = Cursor::new(info.to_vec());
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    assert!(matches!(err, crate::Error::NatsInfoUnreadable), "{err}");
+  }
+
+  /// `tls_required` was already true when the object broke, so the close names that flag.
+  #[tokio::test]
+  async fn cleartext_broken_info_after_tls_required_closes() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let info = b"INFO {\"tls_required\":true,\r\n";
+    let mut server = Cursor::new(info.to_vec());
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::Error::NatsTlsRequired {
+          tls_available: false,
+          tls_verify: false
+        }
+      ),
+      "{err}"
+    );
   }
 
   /// INFO whose newline is not in the same read as `INFO`. The verb and the

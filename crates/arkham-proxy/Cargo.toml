@@ -8,6 +8,7 @@ repository = "https://github.com/casualjim/arkham"
 publish = false
 
 [dependencies]
+actson = { workspace = true }
 atoi = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }

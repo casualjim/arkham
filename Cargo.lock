@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "actson"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78deb7b1fc041f9faa47b5f4c05a48362c5cbb18308bf7f9641e200f56a26a71"
+dependencies = [
+ "btoi",
+ "num-traits",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -458,6 +469,7 @@ dependencies = [
 name = "arkham-proxy"
 version = "0.3.20"
 dependencies = [
+ "actson",
  "arkham-config",
  "arkham-pki",
  "arkham-plugin",
@@ -1697,6 +1709,15 @@ dependencies = [
  "memchr",
  "regex-automata",
  "serde_core",
+]
+
+[[package]]
+name = "btoi"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b5ab9db53bcda568284df0fd39f6eac24ad6f7ba7ff1168b9e76eba6576b976"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

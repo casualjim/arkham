@@ -363,6 +363,9 @@ pub enum Error {
     /// INFO `tls_verify`.
     tls_verify: bool,
   },
+  /// A cleartext INFO line did not finish an object, and `tls_required` was not true.
+  #[error("nats INFO did not yield tls flags on a cleartext upstream")]
+  NatsInfoUnreadable,
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,
