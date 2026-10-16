@@ -513,6 +513,31 @@ mod tests {
     assert_eq!(guest, info);
   }
 
+  /// `\u005f` is `_`. A cleartext INFO with that spelling of `tls_required` closes.
+  #[tokio::test]
+  async fn cleartext_info_escaped_tls_required_key_closes() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let info = b"INFO {\"tls\\u005frequired\":true,\"tls_available\":true,\"tls_verify\":false}\r\n";
+    let mut server = Cursor::new(info.to_vec());
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::Error::NatsTlsRequired {
+          tls_available: true,
+          tls_verify: false
+        }
+      ),
+      "{err}"
+    );
+    assert_eq!(guest, b"");
+  }
+
   /// INFO whose newline is not in the same read as `INFO`. The verb and the
   /// start of `tls_required` arrive first; the value and the LF arrive next.
   #[tokio::test]
