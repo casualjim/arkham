@@ -997,6 +997,16 @@ mod tests {
   }
 
   #[test]
+  fn redis_mtls_on_a_cleartext_upstream_is_rejected() {
+    assert_mtls_rejected(
+      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",         // betterleaks:allow
+      "redis://app:arkham_real_redis_pass_01@db.internal:6379/0",      // betterleaks:allow
+      &["arkham_fake_redis_pass", "arkham_real_redis_pass_01", "app"], // betterleaks:allow
+      |err| matches!(err, crate::Error::RedisCleartextMtls { .. }),
+    );
+  }
+
+  #[test]
   fn redis_mtls_on_rediss_lands_on_the_scope() {
     let mut cfg = cfg_with_db(
       "rediss://app:arkham_fake_redis_pass@db.internal:6379/0",    // betterleaks:allow
@@ -1091,6 +1101,22 @@ mod tests {
       &["arkham_fake_ldap_pass", "arkham_real_ldap_pass_01", "cn=dir"], // betterleaks:allow
       |err| matches!(err, crate::Error::LdapCleartextMtls { .. }),
     );
+  }
+
+  #[test]
+  fn ldap_mtls_on_a_cleartext_upstream_still_loads() {
+    let mut cfg = cfg_with_db(
+      "ldap://cn%3Ddir:arkham_fake_ldap_pass@ldap.internal:389",     // betterleaks:allow
+      "ldap://cn%3Ddir:arkham_real_ldap_pass_01@ldap.internal:389", // betterleaks:allow
+    );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("ldap starttls with mtls still loads");
+    let Some(Grant::Ldap { scope, .. }) = resolved.grants.first() else {
+      panic!("an ldap rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_downstream_tls);
+    assert!(!scope.is_upstream_tls);
   }
 
   #[test]
@@ -1355,6 +1381,23 @@ mod tests {
       &["arkham_fake_smtp_pass", "arkham_real_smtp_pass_01", "agent"], // betterleaks:allow
       |err| matches!(err, crate::Error::SmtpCleartextMtls { .. }),
     );
+  }
+
+  #[test]
+  fn smtp_mtls_on_starttls_still_loads() {
+    let mut cfg = cfg_with_db(
+      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587",                                 // betterleaks:allow
+      "smtp://agent:arkham_real_smtp_pass_01@mail.internal:587?starttls=required",           // betterleaks:allow
+    );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("smtp starttls with mtls still loads");
+    let Some(Grant::Smtp { scope, .. }) = resolved.grants.first() else {
+      panic!("an smtp rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_downstream_tls);
+    assert!(!scope.is_upstream_tls);
+    assert!(scope.starttls_required);
   }
 
   #[test]

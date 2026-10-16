@@ -351,8 +351,13 @@ mod tests {
     msg
   }
 
-  #[tokio::test]
-  async fn postgres_mtls_plaintext_guest_sends_nothing_upstream() {
+  fn wire(message: &impl pgwire::messages::Message) -> Vec<u8> {
+    let mut buf = bytes::BytesMut::new();
+    message.encode(&mut buf).unwrap();
+    buf.to_vec()
+  }
+
+  async fn assert_opening_sends_nothing(initial: Vec<u8>, close: OpeningClose) {
     install_crypto_provider();
     let ca = CertAuthority::generate().unwrap();
     let spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -398,7 +403,6 @@ mod tests {
     )
     .unwrap();
     let snapshot = state.snapshot();
-    let initial = startup();
     let (guest, _peer) = tokio::io::duplex(64);
     let transport = PostgresTransport::new(&ca).unwrap();
     let result = transport
@@ -420,7 +424,44 @@ mod tests {
     let sent = bytes.load(Ordering::Relaxed);
     spy_task.abort();
     assert_eq!(sent, 0, "plaintext mtls guest sent bytes upstream");
-    let err = result.expect_err("plaintext mtls guest");
-    assert!(matches!(err, crate::Error::PostgresGuestPlaintext), "{err}");
+    match close {
+      OpeningClose::Plaintext => {
+        let err = result.expect_err("plaintext mtls guest");
+        assert!(matches!(err, crate::Error::PostgresGuestPlaintext), "{err}");
+      }
+      OpeningClose::Quiet => {
+        result.expect("sslrequest then non-tls bytes closes before the dial");
+      }
+    }
+  }
+
+  enum OpeningClose {
+    Plaintext,
+    Quiet,
+  }
+
+  #[tokio::test]
+  async fn postgres_mtls_plaintext_guest_sends_nothing_upstream() {
+    assert_opening_sends_nothing(startup(), OpeningClose::Plaintext).await;
+  }
+
+  #[tokio::test]
+  async fn postgres_mtls_gssenc_then_startup_sends_nothing_upstream() {
+    let mut opening = wire(&pgwire::messages::startup::GssEncRequest::new());
+    opening.extend(startup());
+    assert_opening_sends_nothing(opening, OpeningClose::Plaintext).await;
+  }
+
+  #[tokio::test]
+  async fn postgres_mtls_cancel_request_sends_nothing_upstream() {
+    let cancel = pgwire::messages::cancel::CancelRequest::new(7, pgwire::messages::startup::SecretKey::I32(11));
+    assert_opening_sends_nothing(wire(&cancel), OpeningClose::Plaintext).await;
+  }
+
+  #[tokio::test]
+  async fn postgres_mtls_sslrequest_then_plaintext_sends_nothing_upstream() {
+    let mut opening = wire(&pgwire::messages::startup::SslRequest::new());
+    opening.extend(startup());
+    assert_opening_sends_nothing(opening, OpeningClose::Quiet).await;
   }
 }

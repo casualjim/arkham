@@ -204,45 +204,15 @@ async fn redis_tls_without_sni_mints_for_the_grant_host() {
   serve.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn redis_mtls_plaintext_guest_sends_nothing_upstream() {
-  install_crypto_provider();
-  let ca = CertAuthority::generate().unwrap();
-  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
-  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
-  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let stub_port = local_addr(&stub).port();
-  let bundle_dir = tempfile::tempdir().unwrap();
-  let bundle = bundle_dir.path().join("ca.pem");
-  std::fs::write(&bundle, ca.cert_pem()).unwrap();
-  let fake = format!("redis://app:{FAKE}@localhost:{stub_port}/0");
-  let real = format!("rediss://app:{VALUE}@localhost:{stub_port}/0?sslrootcert={}", bundle.display());
-  match super::resolve_mtls_grants("REDIS_URL", &fake, &real) {
-    Err(err) => {
-      assert!(matches!(err.as_ref(), arkham_config::Error::RedisCleartextMtls { .. }), "{err}");
-      let text = err.to_string();
-      assert!(!text.contains(FAKE), "mtls rejection included a credential");
-      assert!(!text.contains(VALUE), "mtls rejection included a credential");
-    }
-    Ok(grants) => {
-      let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
-      let stub_task = tokio::spawn(async move {
-        let (conn, _) = stub.accept().await.unwrap();
-        let mut tls = acceptor.accept(conn).await.unwrap();
-        let mut buf = vec![0u8; 1024];
-        let n = tls.read(&mut buf).await.unwrap();
-        tls.write_all(b"+OK\r\n").await.unwrap();
-        buf[..n].windows(VALUE.len()).any(|window| window == VALUE.as_bytes())
-      });
-      let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
-      stream.write_all(auth_frame(FAKE).as_bytes()).await.unwrap();
-      let _ = stream.read(&mut [0u8; 5]).await;
-      let saw_real = tokio::time::timeout(Duration::from_secs(10), stub_task)
-        .await
-        .expect("upstream authentication exchange")
-        .expect("upstream read");
-      assert!(!saw_real, "plaintext guest with mtls authenticated upstream");
-      proxy.abort();
-    }
-  }
+#[test]
+fn redis_mtls_plaintext_guest_is_rejected_at_load() {
+  let fake = format!("redis://app:{FAKE}@localhost:6379/0");
+  let real = format!("rediss://app:{VALUE}@localhost:6379/0");
+  let Err(err) = super::resolve_mtls_grants("REDIS_URL", &fake, &real) else {
+    panic!("mtls on a cleartext redis fake must be rejected");
+  };
+  assert!(matches!(err.as_ref(), arkham_config::Error::RedisCleartextMtls { .. }), "{err}");
+  let text = err.to_string();
+  assert!(!text.contains(FAKE), "mtls rejection included a credential");
+  assert!(!text.contains(VALUE), "mtls rejection included a credential");
 }
