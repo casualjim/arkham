@@ -496,7 +496,6 @@ dependencies = [
  "rustls 0.23.46",
  "rustls-native-certs",
  "secrecy",
- "serde",
  "serde_json",
  "smtp-proto",
  "strum 0.28.0",
