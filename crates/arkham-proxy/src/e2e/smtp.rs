@@ -615,7 +615,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
     let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
     if matches!(poll, Poll::Ready(Ok(()))) {
       let n = buf.filled().len().saturating_sub(before);
-      this.read.fetch_add(n, Ordering::Relaxed);
+      let _ = this.read.fetch_add(n, Ordering::Relaxed);
     }
     poll
   }
@@ -715,9 +715,8 @@ async fn guest_starttls_auth(proxy_addr: SocketAddr, stub_port: u16, connector: 
   assert!(ready.starts_with("220"), "{ready}");
   let name = ServerName::try_from("localhost".to_string()).unwrap();
   let handshake = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, stream)).await;
-  let mut tls = match handshake {
-    Ok(Ok(tls)) => tls,
-    Ok(Err(_)) | Err(_) => return false,
+  let Ok(Ok(mut tls)) = handshake else {
+    return false;
   };
   if tls.write_all(b"EHLO after\r\n").await.is_err() || tls.flush().await.is_err() {
     return false;
