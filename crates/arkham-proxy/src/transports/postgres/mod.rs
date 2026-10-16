@@ -317,3 +317,106 @@ pub(crate) fn postgres_pair(ctx: &PairCtx<'_>) -> (Postgres, Postgres) {
     Postgres::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream),
   )
 }
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::time::Duration;
+
+  use arkham_config::config::ProxyCfg;
+  use arkham_config::grants::{Credential, Grant, GuestTlsMode, PostgresScope, ResolvedConfig};
+  use arkham_pki::ca::{CertAuthority, install_crypto_provider};
+  use secrecy::SecretString;
+  use tokio::io::AsyncReadExt as _;
+  use tokio::net::TcpListener;
+
+  use super::PostgresTransport;
+  use crate::ProxyState;
+  use crate::identity::CandidateParams;
+  use crate::transports::{ServeStream, Transport as _};
+
+  const FAKE: &str = "arkham_fake_pg_pass"; // betterleaks:allow
+  const VALUE: &str = "arkham_real_pg_pass_01"; // betterleaks:allow
+
+  fn startup() -> Vec<u8> {
+    let mut body = 196_608u32.to_be_bytes().to_vec();
+    body.extend_from_slice(b"user\0app\0database\0stubdb\0\0");
+    let mut msg = u32::try_from(body.len() + 4).unwrap().to_be_bytes().to_vec();
+    msg.extend(body);
+    msg
+  }
+
+  #[tokio::test]
+  async fn postgres_mtls_plaintext_guest_sends_nothing_upstream() {
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+    let spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = spy.local_addr().unwrap().port();
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let recorded = Arc::clone(&bytes);
+    let spy_task = tokio::spawn(async move {
+      let Ok(Ok((mut conn, _))) = tokio::time::timeout(Duration::from_secs(2), spy.accept()).await else {
+        return;
+      };
+      let mut buf = [0u8; 64];
+      if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf)).await {
+        recorded.store(n, Ordering::Relaxed);
+      }
+    });
+    let mut scope = PostgresScope::from_strings(
+      &format!("postgres://app:{FAKE}@localhost:{port}/stubdb"),
+      &format!("postgres://app:{VALUE}@localhost:{port}/stubdb?sslmode=require"),
+    )
+    .unwrap();
+    scope.guest_tls = GuestTlsMode::Mtls;
+    let state = ProxyState::new(
+      ResolvedConfig {
+        proxy: ProxyCfg {
+          listen: "127.0.0.1:0".parse().unwrap(),
+          ca_file: None,
+          ssh_host_key: None,
+          ssh_known_hosts: None,
+          root_certs: Vec::new(),
+          handshake_timeout_secs: 1,
+        },
+        grants: vec![Grant::Postgres {
+          credential: Credential {
+            label: "pg".into(),
+            fake: FAKE.into(),
+            value: SecretString::from(VALUE),
+          },
+          scope: Box::new(scope.clone()),
+        }],
+        plugins: Vec::new(),
+      },
+      &ca,
+    )
+    .unwrap();
+    let snapshot = state.snapshot();
+    let initial = startup();
+    let (guest, _peer) = tokio::io::duplex(64);
+    let transport = PostgresTransport::new(&ca).unwrap();
+    let result = transport
+      .serve(ServeStream {
+        guest,
+        params: CandidateParams {
+          state: &state,
+          snapshot: snapshot.as_ref(),
+          dial_host: "127.0.0.1",
+          port,
+          host: Some("localhost"),
+          raw_host: "localhost",
+          initial: &initial,
+        },
+        scope: &scope,
+      })
+      .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = bytes.load(Ordering::Relaxed);
+    spy_task.abort();
+    assert_eq!(sent, 0, "plaintext mtls guest sent bytes upstream");
+    let err = result.expect_err("plaintext mtls guest");
+    assert!(matches!(err, crate::Error::PostgresGuestPlaintext), "{err}");
+  }
+}

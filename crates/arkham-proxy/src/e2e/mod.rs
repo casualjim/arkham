@@ -33,6 +33,61 @@ fn local_addr(listener: &TcpListener) -> SocketAddr {
   listener.local_addr().expect("listener has an address")
 }
 
+/// Resolve one connection-string rule with `guest_tls_mode = mtls`, the
+/// same path `serve` uses. `Err` is the cleartext-fake rejection.
+fn resolve_mtls_grants(env: &str, fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::Error>> {
+  use std::collections::BTreeMap;
+
+  use arkham_config::config::{AppConfig, HostTlsCfg, IfMissing, ProxyCfg, WorkspaceCfg};
+  use arkham_config::grants::resolve;
+  use secrecy::SecretString;
+
+  let mut tls = BTreeMap::new();
+  tls.insert(
+    env.to_string(),
+    HostTlsCfg {
+      client_cert: None,
+      client_key: None,
+      root_cert: None,
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: None,
+      guest_key: None,
+    },
+  );
+  let mut rules = BTreeMap::new();
+  rules.insert(
+    "t".to_string(),
+    arkham_config::RuleCfg {
+      env: env.to_string(),
+      value: Some(SecretString::from(fake)),
+      real: Some(SecretString::from(real)),
+      fnox_key: None,
+      allow: Vec::new(),
+      pattern: None,
+      registry: None,
+      oauth2: None,
+      ssh: BTreeMap::new(),
+      tls,
+      if_missing: IfMissing::default(),
+    },
+  );
+  let cfg = AppConfig {
+    proxy: ProxyCfg {
+      listen: "127.0.0.1:8080".parse().unwrap(),
+      ca_file: None,
+      ssh_host_key: None,
+      ssh_known_hosts: None,
+      root_certs: Vec::new(),
+      handshake_timeout_secs: 10,
+    },
+    workspace: WorkspaceCfg::default(),
+    rules,
+    plugins: BTreeMap::new(),
+    tools: BTreeMap::new(),
+  };
+  resolve(&cfg).map(|resolved| resolved.grants).map_err(Box::new)
+}
+
 /// Three-byte H2 frame-length prefix (big-endian, capped at 24 bits).
 fn h2_len(len: usize) -> [u8; 3] {
   u32::try_from(len).expect("frame length fits 24 bits").to_be_bytes()[1..4]

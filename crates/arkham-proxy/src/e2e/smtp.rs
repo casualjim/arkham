@@ -562,3 +562,68 @@ async fn smtps_without_sni_mints_for_the_grant_host() {
   assert!(recorded[0].contains(&plain_initial(USER, VALUE)), "{recorded:?}");
   serve.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn smtp_mtls_plaintext_guest_sends_nothing_upstream() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let fake = format!("smtp://agent%40demo.test:{FAKE}@localhost:{stub_port}");
+  let real = format!(
+    "smtps://agent%40demo.test:{VALUE}@localhost:{stub_port}?sslrootcert={}",
+    bundle.display()
+  );
+  let marker = plain_initial(USER, VALUE);
+  match super::resolve_mtls_grants("SMTP_URL", &fake, &real) {
+    Err(err) => {
+      assert!(matches!(err.as_ref(), arkham_config::Error::SmtpCleartextMtls { .. }), "{err}");
+      let text = err.to_string();
+      assert!(!text.contains(FAKE), "mtls rejection included a credential");
+      assert!(!text.contains(VALUE), "mtls rejection included a credential");
+    }
+    Ok(grants) => {
+      let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+      let marker_for_stub = marker.clone();
+      let stub_task = tokio::spawn(async move {
+        let (conn, _) = stub.accept().await.unwrap();
+        let mut tls = acceptor.accept(conn).await.unwrap();
+        write_cmd(&mut tls, "220 mail.demo.test ESMTP\r\n").await;
+        loop {
+          let line = read_reply(&mut tls).await;
+          let upper = line.to_ascii_uppercase();
+          if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+            write_cmd(&mut tls, "250-mail.demo.test\r\n250 AUTH PLAIN LOGIN\r\n").await;
+            continue;
+          }
+          if upper.starts_with("AUTH ") {
+            let saw_real = line.contains(&marker_for_stub);
+            write_cmd(&mut tls, "235 2.7.0 Authentication successful\r\n").await;
+            return saw_real;
+          }
+          write_cmd(&mut tls, "502 5.5.2 unimplemented\r\n").await;
+        }
+      });
+      let mut stream = tunnel(proxy_addr, stub_port).await;
+      let greeting = read_reply(&mut stream).await;
+      assert!(greeting.starts_with("220"), "{greeting}");
+      write_cmd(&mut stream, "EHLO client\r\n").await;
+      let ehlo = read_reply(&mut stream).await;
+      assert!(ehlo.contains("250"), "{ehlo}");
+      write_cmd(&mut stream, &auth_line(USER, FAKE)).await;
+      let ok = read_reply(&mut stream).await;
+      assert!(ok.starts_with("235"), "{ok}");
+      let saw_real = tokio::time::timeout(Duration::from_secs(10), stub_task)
+        .await
+        .expect("upstream authentication exchange")
+        .expect("upstream read");
+      assert!(!saw_real, "plaintext guest with mtls authenticated upstream");
+      proxy.abort();
+    }
+  }
+}

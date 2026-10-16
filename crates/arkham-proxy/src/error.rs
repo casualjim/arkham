@@ -341,6 +341,9 @@ pub enum Error {
     #[source]
     source: rasn::error::EncodeError,
   },
+  /// `guest_tls_mode` is `mtls` and the postgres guest opened in cleartext.
+  #[error("postgres mtls guest sent plaintext")]
+  PostgresGuestPlaintext,
   /// The configured client identity is empty.
   #[error("client identity `{path}` is empty", path = path.display())]
   EmptyClientIdentity {

@@ -264,3 +264,60 @@ async fn ldap_tls_without_sni_mints_for_the_grant_host() {
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   serve.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn ldap_mtls_plaintext_guest_sends_nothing_upstream() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let fake = format!("ldap://{}:{FAKE}@localhost:{stub_port}", user(DN));
+  let real = format!(
+    "ldaps://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}",
+    user(DN),
+    bundle.display()
+  );
+  match super::resolve_mtls_grants("LDAP_URL", &fake, &real) {
+    Err(err) => {
+      assert!(matches!(err.as_ref(), arkham_config::Error::LdapCleartextMtls { .. }), "{err}");
+      let text = err.to_string();
+      assert!(!text.contains(FAKE), "mtls rejection included a credential");
+      assert!(!text.contains(VALUE), "mtls rejection included a credential");
+    }
+    Ok(grants) => {
+      let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+      let stub_task = tokio::spawn(async move {
+        let (conn, _) = stub.accept().await.unwrap();
+        let mut tls = acceptor.accept(conn).await.unwrap();
+        let message = read_message(&mut tls).await;
+        let saw_real = simple_password(&message) == VALUE.as_bytes();
+        let response = LdapMessage::new(
+          message.message_id,
+          ProtocolOp::BindResponse(BindResponse::new(
+            ResultCode::Success,
+            LdapString::from(""),
+            LdapString::from(""),
+            None,
+            None,
+          )),
+        );
+        tls.write_all(&encode(&response)).await.unwrap();
+        saw_real
+      });
+      let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
+      stream.write_all(&encode(&bind_message(1, FAKE))).await.unwrap();
+      let _ = read_message(&mut stream).await;
+      let saw_real = tokio::time::timeout(Duration::from_secs(10), stub_task)
+        .await
+        .expect("upstream authentication exchange")
+        .expect("upstream read");
+      assert!(!saw_real, "plaintext guest with mtls authenticated upstream");
+      proxy.abort();
+    }
+  }
+}

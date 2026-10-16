@@ -831,6 +831,35 @@ mod tests {
     }
   }
 
+  fn mtls_on(cfg: &mut AppConfig) {
+    let mut tls = BTreeMap::new();
+    tls.insert(
+      "DATABASE_URL".to_string(),
+      HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::Mtls,
+        guest_cert: None,
+        guest_key: None,
+      },
+    );
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+  }
+
+  fn assert_mtls_rejected(fake: &str, real: &str, secrets: &[&str], pred: impl Fn(&crate::Error) -> bool) {
+    let mut cfg = cfg_with_db(fake, real);
+    mtls_on(&mut cfg);
+    let Err(err) = resolve(&cfg) else {
+      panic!("mtls on a cleartext fake must be rejected");
+    };
+    assert!(pred(&err), "{err}");
+    let text = err.to_string();
+    for secret in secrets {
+      assert!(!text.contains(secret), "mtls rejection included a credential");
+    }
+  }
+
   /// A resolved postgres scope, through [`resolve`] exactly as serve does.
   fn postgres_scope(fake: &str, real: &str) -> PostgresScope {
     let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
@@ -958,6 +987,31 @@ mod tests {
   }
 
   #[test]
+  fn redis_mtls_on_a_cleartext_fake_is_rejected() {
+    assert_mtls_rejected(
+      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",         // betterleaks:allow
+      "rediss://app:arkham_real_redis_pass_01@db.internal:6379/0",     // betterleaks:allow
+      &["arkham_fake_redis_pass", "arkham_real_redis_pass_01", "app"], // betterleaks:allow
+      |err| matches!(err, crate::Error::RedisCleartextMtls { .. }),
+    );
+  }
+
+  #[test]
+  fn redis_mtls_on_rediss_lands_on_the_scope() {
+    let mut cfg = cfg_with_db(
+      "rediss://app:arkham_fake_redis_pass@db.internal:6379/0",    // betterleaks:allow
+      "rediss://app:arkham_real_redis_pass_01@db.internal:6379/0", // betterleaks:allow
+    );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("rediss fake can demand a client certificate");
+    let Some(Grant::Redis { scope, .. }) = resolved.grants.first() else {
+      panic!("a redis rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(scope.is_downstream_tls);
+  }
+
+  #[test]
   fn ldap_grant_answers_for_ldap_schemes() {
     let grant = redis_grant_like(
       "ldap://cn%3DDirectory%20Manager:fake@ldap.internal:389", // betterleaks:allow
@@ -1027,6 +1081,31 @@ mod tests {
   fn ldap_schemes_are_not_endpoint_grants() {
     "ldap://ldap.internal:389".parse::<EndpointScope>().unwrap_err();
     "ldaps://ldap.internal:636".parse::<EndpointScope>().unwrap_err();
+  }
+
+  #[test]
+  fn ldap_mtls_on_a_cleartext_fake_is_rejected() {
+    assert_mtls_rejected(
+      "ldap://cn%3Ddir:arkham_fake_ldap_pass@ldap.internal:389",     // betterleaks:allow
+      "ldaps://cn%3Ddir:arkham_real_ldap_pass_01@ldap.internal:636", // betterleaks:allow
+      &["arkham_fake_ldap_pass", "arkham_real_ldap_pass_01", "cn=dir"], // betterleaks:allow
+      |err| matches!(err, crate::Error::LdapCleartextMtls { .. }),
+    );
+  }
+
+  #[test]
+  fn ldap_mtls_on_ldaps_lands_on_the_scope() {
+    let mut cfg = cfg_with_db(
+      "ldaps://cn%3Ddir:arkham_fake_ldap_pass@ldap.internal:636",    // betterleaks:allow
+      "ldaps://cn%3Ddir:arkham_real_ldap_pass_01@ldap.internal:636", // betterleaks:allow
+    );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("ldaps fake can demand a client certificate");
+    let Some(Grant::Ldap { scope, .. }) = resolved.grants.first() else {
+      panic!("an ldap rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(scope.is_downstream_tls);
   }
 
   #[test]
@@ -1266,6 +1345,31 @@ mod tests {
   fn smtp_schemes_are_not_endpoint_grants() {
     "smtp://mail.internal:587".parse::<EndpointScope>().unwrap_err();
     "smtps://mail.internal:465".parse::<EndpointScope>().unwrap_err();
+  }
+
+  #[test]
+  fn smtp_mtls_on_a_cleartext_fake_is_rejected() {
+    assert_mtls_rejected(
+      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587",          // betterleaks:allow
+      "smtps://agent:arkham_real_smtp_pass_01@mail.internal:465",      // betterleaks:allow
+      &["arkham_fake_smtp_pass", "arkham_real_smtp_pass_01", "agent"], // betterleaks:allow
+      |err| matches!(err, crate::Error::SmtpCleartextMtls { .. }),
+    );
+  }
+
+  #[test]
+  fn smtp_mtls_on_smtps_lands_on_the_scope() {
+    let mut cfg = cfg_with_db(
+      "smtps://agent:arkham_fake_smtp_pass@mail.internal:465",    // betterleaks:allow
+      "smtps://agent:arkham_real_smtp_pass_01@mail.internal:465", // betterleaks:allow
+    );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("smtps fake can demand a client certificate");
+    let Some(Grant::Smtp { scope, .. }) = resolved.grants.first() else {
+      panic!("an smtp rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(scope.is_downstream_tls);
   }
 
   #[test]
@@ -1545,6 +1649,20 @@ mod tests {
     tls.insert("DATABASE_URL".to_string(), entry());
     cfg.rules.get_mut("t").unwrap().tls = tls;
     let resolved = resolve(&cfg).unwrap();
+    let Some(Grant::Postgres { scope, .. }) = resolved.grants.first() else {
+      panic!("a database rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+  }
+
+  #[test]
+  fn postgres_mtls_stays_when_the_guest_picks_tls() {
+    let mut cfg = cfg_with_db(
+      "postgres://app:arkham_fake_pg_pass@db.internal:5432/main", // betterleaks:allow
+      "postgres://app:arkham_real_pg_pass_01@db.internal:5432/main?sslmode=require", // betterleaks:allow
+    );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("postgres mtls stays, the guest picks the transport");
     let Some(Grant::Postgres { scope, .. }) = resolved.grants.first() else {
       panic!("a database rule");
     };
