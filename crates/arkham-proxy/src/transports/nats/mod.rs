@@ -297,22 +297,14 @@ async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>
   tokio::time::timeout(budget, step).await.unwrap_or(Err(Error::NatsHandshakeTimeout))
 }
 
-/// TLS flags carried on an INFO object. Absent fields are false.
-#[derive(Debug, serde::Deserialize)]
-struct InfoTls {
-  #[serde(default)]
-  tls_required: bool,
-  #[serde(default)]
-  tls_available: bool,
-  #[serde(default)]
-  tls_verify: bool,
-}
-
 /// Forward the server's first line, INFO, through `up` to the guest, and
 /// return the bytes read past its LF. On a `tls://` server leg they belong
 /// to the server's TLS, not to NATS. `None` when the server closes first or
 /// `up` closes the leg. `cleartext` is the upstream that will not upgrade:
-/// INFO `tls_required` then closes the session.
+/// INFO `tls_required` then closes the session. The line may cross reads.
+/// `up` keeps the three TLS flags as those reads stream, and the check runs
+/// once the read that holds the LF has been framed, before that read is
+/// written to the guest.
 ///
 /// # Errors
 ///
@@ -335,17 +327,14 @@ where
     let Some((line, rest)) = chunk.split_at_checked(cut) else {
       return Ok(None);
     };
-    if newline.is_some()
-      && cleartext
-      && let Some(info) = info_tls(line).filter(|info| info.tls_required)
-    {
+    let (rewritten, hits) = up.feed(line).await;
+    log_hits(&hits);
+    if cleartext && let Some(info) = up.take_info_tls().filter(|info| info.tls_required) {
       return Err(Error::NatsTlsRequired {
         tls_available: info.tls_available,
         tls_verify: info.tls_verify,
       });
     }
-    let (rewritten, hits) = up.feed(line).await;
-    log_hits(&hits);
     match rewritten {
       Rewritten::Close => return Ok(None),
       Rewritten::Hold => {}
@@ -355,20 +344,6 @@ where
       return Ok(Some(rest.to_vec()));
     }
   }
-}
-
-/// INFO's TLS object, when `line` is an INFO command and its JSON parses.
-fn info_tls(line: &[u8]) -> Option<InfoTls> {
-  let verb_end = memchr::memchr2(b' ', b'\t', line)
-    .or_else(|| memchr::memchr2(b'\r', b'\n', line))
-    .unwrap_or(line.len());
-  if !line.get(..verb_end).is_some_and(|verb| verb.eq_ignore_ascii_case(b"INFO")) {
-    return None;
-  }
-  let start = memchr::memchr(b'{', line)?;
-  let json = line.get(start..)?;
-  let mut deserializer = serde_json::Deserializer::from_slice(json);
-  serde::Deserialize::deserialize(&mut deserializer).ok()
 }
 
 /// The guest's first bytes after INFO: the ingress replay, or one read.
@@ -410,12 +385,14 @@ where
 #[cfg(test)]
 mod tests {
   use std::io::Cursor;
+  use std::pin::Pin;
+  use std::task::{Context, Poll};
   use std::time::Duration;
 
   use arkham_config::grants::{GuestTlsMode, NatsScope};
   use arkham_pki::ca::CertAuthority;
   use pretty_assertions::assert_eq;
-  use tokio::io::AsyncReadExt as _;
+  use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
 
   use super::{NatsTransport, Open, ServerLeg, nats_pair};
 
@@ -534,5 +511,132 @@ mod tests {
     let rest = server_info(&mut server, &mut up, &mut guest, true).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     assert_eq!(guest, info);
+  }
+
+  /// INFO whose newline is not in the same read as `INFO`. The verb and the
+  /// start of `tls_required` arrive first; the value and the LF arrive next.
+  #[tokio::test]
+  async fn cleartext_info_split_across_reads_closes() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let first: &[u8] = b"INFO {\"server_id\":\"split\",\"tls_req";
+    let second: &[u8] = b"uired\":true,\"tls_available\":true,\"tls_verify\":false}\r\nEXTRA";
+    let parts = [first, second];
+    let mut server = SliceReads { parts: &parts, index: 0 };
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::Error::NatsTlsRequired {
+          tls_available: true,
+          tls_verify: false
+        }
+      ),
+      "{err}"
+    );
+    assert_eq!(guest, first);
+  }
+
+  /// The JSON bool itself crosses the read. Only the five-byte token is kept.
+  #[tokio::test]
+  async fn cleartext_info_bool_split_across_reads_closes() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let first: &[u8] = b"INFO {\"tls_required\":tru";
+    let second: &[u8] = b"e,\"tls_available\":true,\"tls_verify\":false}\r\n";
+    let parts = [first, second];
+    let mut server = SliceReads { parts: &parts, index: 0 };
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::Error::NatsTlsRequired {
+          tls_available: true,
+          tls_verify: false
+        }
+      ),
+      "{err}"
+    );
+    assert_eq!(guest, first);
+  }
+
+  /// The verb itself crosses the read. The framer already holds those bytes
+  /// until the delimiter, and the completing read still closes.
+  #[tokio::test]
+  async fn cleartext_info_verb_split_across_reads_closes() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let first: &[u8] = b"INF";
+    let second: &[u8] = b"O {\"tls_required\":true,\"tls_available\":false,\"tls_verify\":true}\r\nTAIL";
+    let parts = [first, second];
+    let mut server = SliceReads { parts: &parts, index: 0 };
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::Error::NatsTlsRequired {
+          tls_available: false,
+          tls_verify: true
+        }
+      ),
+      "{err}"
+    );
+    assert_eq!(guest, b"");
+  }
+
+  /// A split INFO whose top-level `tls_required` is false is forwarded. Text
+  /// and a nested object that contain the key do not close the session.
+  #[tokio::test]
+  async fn cleartext_info_split_without_tls_required_is_forwarded() {
+    let grants = nats_grants(
+      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
+      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
+    );
+    let line: &[u8] = b"INFO {\"note\":\"see \\\"tls_required\\\":true\",\"tls\":{\"tls_required\":true},\"connect_urls\":[\"nats://example\"],\"tls_required\":false,\"tls_available\":true,\"tls_verify\":true}\r\nEXTRA";
+    let (first, second) = line.split_at(24);
+    let parts = [first, second];
+    let mut server = SliceReads { parts: &parts, index: 0 };
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let rest = server_info(&mut server, &mut up, &mut guest, true).await.unwrap();
+    assert_eq!(rest, Some(b"EXTRA".to_vec()));
+    assert_eq!(guest, &line[..line.len() - b"EXTRA".len()]);
+  }
+
+  /// Yields one slice per read so a command line can cross the read boundary.
+  struct SliceReads<'a> {
+    parts: &'a [&'a [u8]],
+    index: usize,
+  }
+
+  impl AsyncRead for SliceReads<'_> {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+      let this = self.get_mut();
+      let Some(part) = this.parts.get(this.index).copied() else {
+        return Poll::Ready(Ok(()));
+      };
+      let Some(dst) = buf.initialize_unfilled().get_mut(..part.len()) else {
+        return Poll::Ready(Err(std::io::Error::new(
+          std::io::ErrorKind::InvalidInput,
+          "read buffer shorter than the slice",
+        )));
+      };
+      dst.copy_from_slice(part);
+      buf.advance(part.len());
+      this.index = this.index.saturating_add(1);
+      Poll::Ready(Ok(()))
+    }
   }
 }

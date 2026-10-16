@@ -37,6 +37,15 @@
 //! `lexical-core` 1.0 `parse` and `parse_partial` also need one contiguous
 //! slice and report nothing `atoi` does not already return.
 //!
+//! INFO's `tls_required`, `tls_available`, and `tls_verify` are read while
+//! that line streams. The verb is the framer's first piece, cut by the
+//! delimiter scan above and parsed as a server verb. Only those three bools
+//! are kept: a key fits in 13 bytes, a bool token in 5, and
+//! `serde_json::from_slice::<bool>` parses the token. Strings, numbers,
+//! arrays, and nested objects are skipped, so text inside a value does not
+//! set a flag. The INFO line is not stored. The flags are ready when the
+//! line piece includes LF.
+//!
 //! Upstream, delimited lines (INFO, -ERR, +OK, PING, PONG) redact the real
 //! value back to the decoy. MSG and HMSG payloads are counted down and never
 //! rewritten: a payload that carries the real value closes the leg.
@@ -464,7 +473,19 @@ impl Nats {
         pairs,
         held: Vec::new(),
       },
+      info: InfoWatch::default(),
     })
+  }
+
+  /// TLS flags of the INFO line whose LF was just framed, once.
+  ///
+  /// `None` until that LF, and `None` again after the flags are taken.
+  /// A line that is not INFO does not become ready.
+  pub(crate) fn take_info_tls(&mut self) -> Option<InfoTls> {
+    match self {
+      Self::Up(up) => up.info.ready.take(),
+      Self::Down(_) | Self::Closed => None,
+    }
   }
 }
 
@@ -658,6 +679,397 @@ impl Down {
   }
 }
 
+/// TLS flags from one completed INFO object. Absent fields stay false.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InfoTls {
+  /// INFO `tls_required`.
+  pub(crate) tls_required: bool,
+  /// INFO `tls_available`.
+  pub(crate) tls_available: bool,
+  /// INFO `tls_verify`.
+  pub(crate) tls_verify: bool,
+}
+
+/// Which INFO bool a key names.
+#[derive(Debug, Clone, Copy)]
+enum TlsKey {
+  Required,
+  Available,
+  Verify,
+}
+
+/// `tls_available`, the longest of the three keys.
+const TLS_KEY_CAP: usize = 13;
+/// `false`, the longer JSON bool.
+const TLS_BOOL_CAP: usize = 5;
+
+/// Where an INFO object is, while its bytes stream past.
+#[derive(Debug, Default)]
+enum Scan {
+  #[default]
+  SeekObject,
+  SeekKey,
+  Key {
+    raw: [u8; TLS_KEY_CAP],
+    len: usize,
+    drop: bool,
+    escape: bool,
+  },
+  Colon(Option<TlsKey>),
+  Value(Option<TlsKey>),
+  Bool {
+    key: Option<TlsKey>,
+    raw: [u8; TLS_BOOL_CAP],
+    len: usize,
+  },
+  SkipString {
+    escape: bool,
+  },
+  SkipLiteral,
+  Nest {
+    depth: u32,
+    string: bool,
+    escape: bool,
+  },
+  After,
+  Idle,
+}
+
+/// The three TLS flags, and nothing else from the INFO object.
+#[derive(Debug, Default)]
+struct InfoScan {
+  phase: Scan,
+  tls: InfoTls,
+}
+
+impl InfoScan {
+  fn push(&mut self, bytes: &[u8]) {
+    for &byte in bytes {
+      let mut pending = Some(byte);
+      while let Some(current) = pending {
+        pending = self.step(current);
+      }
+    }
+  }
+
+  fn snapshot(&self) -> InfoTls {
+    self.tls
+  }
+
+  fn step(&mut self, byte: u8) -> Option<u8> {
+    let phase = std::mem::replace(&mut self.phase, Scan::Idle);
+    match phase {
+      Scan::SeekObject => self.seek_object(byte),
+      Scan::SeekKey => self.seek_key(byte),
+      Scan::Key { raw, len, drop, escape } => self.key(raw, len, drop, escape, byte),
+      Scan::Colon(key) => self.colon(key, byte),
+      Scan::Value(key) => self.value(key, byte),
+      Scan::Bool { key, raw, len } => self.boolean(key, raw, len, byte),
+      Scan::SkipString { escape } => self.skip_string(escape, byte),
+      Scan::SkipLiteral => self.skip_literal(byte),
+      Scan::Nest { depth, string, escape } => self.nest(depth, string, escape, byte),
+      Scan::After => self.after(byte),
+      Scan::Idle => None,
+    }
+  }
+
+  fn seek_object(&mut self, byte: u8) -> Option<u8> {
+    self.phase = if byte == b'{' {
+      Scan::SeekKey
+    } else if is_json_ws(byte) {
+      Scan::SeekObject
+    } else {
+      Scan::Idle
+    };
+    None
+  }
+
+  fn seek_key(&mut self, byte: u8) -> Option<u8> {
+    self.phase = match byte {
+      b'"' => Scan::Key {
+        raw: [0; TLS_KEY_CAP],
+        len: 0,
+        drop: false,
+        escape: false,
+      },
+      b'}' => Scan::Idle,
+      _ if is_json_ws(byte) || byte == b',' => Scan::SeekKey,
+      _ => Scan::Idle,
+    };
+    None
+  }
+
+  fn key(&mut self, mut raw: [u8; TLS_KEY_CAP], len: usize, drop: bool, escape: bool, byte: u8) -> Option<u8> {
+    if escape {
+      self.phase = Scan::Key {
+        raw,
+        len,
+        drop: true,
+        escape: false,
+      };
+      return None;
+    }
+    if byte == b'\\' {
+      self.phase = Scan::Key {
+        raw,
+        len,
+        drop,
+        escape: true,
+      };
+      return None;
+    }
+    if byte == b'"' {
+      let key = if drop { None } else { tls_key(raw.get(..len).unwrap_or(&[])) };
+      self.phase = Scan::Colon(key);
+      return None;
+    }
+    if drop || len >= TLS_KEY_CAP {
+      self.phase = Scan::Key {
+        raw,
+        len,
+        drop: true,
+        escape: false,
+      };
+      return None;
+    }
+    if let Some(slot) = raw.get_mut(len) {
+      *slot = byte;
+    }
+    self.phase = Scan::Key {
+      raw,
+      len: len.saturating_add(1),
+      drop: false,
+      escape: false,
+    };
+    None
+  }
+
+  fn colon(&mut self, key: Option<TlsKey>, byte: u8) -> Option<u8> {
+    self.phase = match byte {
+      b':' => Scan::Value(key),
+      _ if is_json_ws(byte) => Scan::Colon(key),
+      _ => Scan::Idle,
+    };
+    None
+  }
+
+  fn value(&mut self, key: Option<TlsKey>, byte: u8) -> Option<u8> {
+    self.phase = match byte {
+      b'"' => Scan::SkipString { escape: false },
+      b't' | b'f' => {
+        let mut raw = [0; TLS_BOOL_CAP];
+        if let Some(slot) = raw.get_mut(0) {
+          *slot = byte;
+        }
+        Scan::Bool { key, raw, len: 1 }
+      }
+      b'{' | b'[' => Scan::Nest {
+        depth: 1,
+        string: false,
+        escape: false,
+      },
+      b'n' | b'-' | b'0'..=b'9' => Scan::SkipLiteral,
+      _ if is_json_ws(byte) => Scan::Value(key),
+      _ => Scan::Idle,
+    };
+    None
+  }
+
+  fn boolean(&mut self, key: Option<TlsKey>, mut raw: [u8; TLS_BOOL_CAP], len: usize, byte: u8) -> Option<u8> {
+    if is_json_ws(byte) || matches!(byte, b',' | b'}' | b']') {
+      self.store_bool(key, raw.get(..len).unwrap_or(&[]));
+      self.phase = Scan::After;
+      return Some(byte);
+    }
+    if len >= TLS_BOOL_CAP {
+      self.phase = Scan::SkipLiteral;
+      return None;
+    }
+    if let Some(slot) = raw.get_mut(len) {
+      *slot = byte;
+    }
+    self.phase = Scan::Bool {
+      key,
+      raw,
+      len: len.saturating_add(1),
+    };
+    None
+  }
+
+  fn store_bool(&mut self, key: Option<TlsKey>, token: &[u8]) {
+    let Some(key) = key else {
+      return;
+    };
+    let Ok(value) = serde_json::from_slice::<bool>(token) else {
+      return;
+    };
+    match key {
+      TlsKey::Required => self.tls.tls_required = value,
+      TlsKey::Available => self.tls.tls_available = value,
+      TlsKey::Verify => self.tls.tls_verify = value,
+    }
+  }
+
+  fn skip_string(&mut self, escape: bool, byte: u8) -> Option<u8> {
+    self.phase = if escape {
+      Scan::SkipString { escape: false }
+    } else {
+      match byte {
+        b'\\' => Scan::SkipString { escape: true },
+        b'"' => Scan::After,
+        _ => Scan::SkipString { escape: false },
+      }
+    };
+    None
+  }
+
+  fn skip_literal(&mut self, byte: u8) -> Option<u8> {
+    if is_json_ws(byte) {
+      self.phase = Scan::After;
+      return None;
+    }
+    if matches!(byte, b',' | b'}' | b']') {
+      self.phase = Scan::After;
+      return Some(byte);
+    }
+    self.phase = Scan::SkipLiteral;
+    None
+  }
+
+  fn nest(&mut self, depth: u32, string: bool, escape: bool, byte: u8) -> Option<u8> {
+    if string {
+      self.phase = if escape {
+        Scan::Nest {
+          depth,
+          string: true,
+          escape: false,
+        }
+      } else {
+        match byte {
+          b'\\' => Scan::Nest {
+            depth,
+            string: true,
+            escape: true,
+          },
+          b'"' => Scan::Nest {
+            depth,
+            string: false,
+            escape: false,
+          },
+          _ => Scan::Nest {
+            depth,
+            string: true,
+            escape: false,
+          },
+        }
+      };
+      return None;
+    }
+    self.phase = match byte {
+      b'"' => Scan::Nest {
+        depth,
+        string: true,
+        escape: false,
+      },
+      b'{' | b'[' => Scan::Nest {
+        depth: depth.saturating_add(1),
+        string: false,
+        escape: false,
+      },
+      b'}' | b']' => {
+        let depth = depth.saturating_sub(1);
+        if depth == 0 {
+          Scan::After
+        } else {
+          Scan::Nest {
+            depth,
+            string: false,
+            escape: false,
+          }
+        }
+      }
+      _ => Scan::Nest {
+        depth,
+        string: false,
+        escape: false,
+      },
+    };
+    None
+  }
+
+  fn after(&mut self, byte: u8) -> Option<u8> {
+    self.phase = match byte {
+      b',' => Scan::SeekKey,
+      b'}' => Scan::Idle,
+      _ if is_json_ws(byte) => Scan::After,
+      _ => Scan::Idle,
+    };
+    None
+  }
+}
+
+fn is_json_ws(byte: u8) -> bool {
+  matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn tls_key(raw: &[u8]) -> Option<TlsKey> {
+  match raw {
+    b"tls_required" => Some(TlsKey::Required),
+    b"tls_available" => Some(TlsKey::Available),
+    b"tls_verify" => Some(TlsKey::Verify),
+    _ => None,
+  }
+}
+
+/// Server verb plus the TLS flags of an INFO line in progress.
+#[derive(Debug)]
+struct InfoWatch {
+  /// The next line piece is a verb.
+  expect_verb: bool,
+  /// This command is INFO and its LF has not arrived.
+  active: bool,
+  /// Set when an INFO line reaches LF. Taken once.
+  ready: Option<InfoTls>,
+  scan: InfoScan,
+}
+
+impl Default for InfoWatch {
+  fn default() -> Self {
+    Self {
+      expect_verb: true,
+      active: false,
+      ready: None,
+      scan: InfoScan::default(),
+    }
+  }
+}
+
+impl InfoWatch {
+  fn note(&mut self, bytes: &[u8], end: bool) {
+    if self.expect_verb {
+      self.expect_verb = false;
+      self.scan = InfoScan::default();
+      self.active = is_info_verb(bytes);
+    } else if self.active {
+      self.scan.push(bytes);
+    }
+    if end {
+      if self.active && self.ready.is_none() {
+        self.ready = Some(self.scan.snapshot());
+      }
+      self.active = false;
+      self.expect_verb = true;
+    }
+  }
+}
+
+fn is_info_verb(bytes: &[u8]) -> bool {
+  let Ok(text) = std::str::from_utf8(bytes) else {
+    return false;
+  };
+  matches!(text.parse::<ServerVerb>(), Ok(ServerVerb::Info))
+}
+
 /// Server-to-guest state.
 pub(crate) struct Up {
   framer: Framer,
@@ -665,6 +1077,8 @@ pub(crate) struct Up {
   lines: Raw,
   /// Counted heads and payloads.
   guard: Guard,
+  /// TLS flags from the INFO line, filled as its pieces arrive.
+  info: InfoWatch,
 }
 
 impl Up {
@@ -680,21 +1094,18 @@ impl Up {
       match self.framer.next_piece(&mut input) {
         Next::Spent => return Ok(out),
         Next::Malformed => return Err(CloseLeg),
-        Next::Piece(Piece::Line {
-          framing: Framing::Counted,
-          bytes,
-          ..
-        }) => self.guard.push(&bytes, &mut out)?,
-        Next::Piece(Piece::Line {
-          framing: Framing::Line | Framing::Credential,
-          bytes,
-          end,
-        }) => {
-          if !bytes.is_empty() {
-            redact(&mut self.lines, &bytes, &mut out, hits).await?;
-          }
-          if end {
-            redact(&mut self.lines, &[], &mut out, hits).await?;
+        Next::Piece(Piece::Line { framing, bytes, end }) => {
+          self.info.note(&bytes, end);
+          match framing {
+            Framing::Counted => self.guard.push(&bytes, &mut out)?,
+            Framing::Line | Framing::Credential => {
+              if !bytes.is_empty() {
+                redact(&mut self.lines, &bytes, &mut out, hits).await?;
+              }
+              if end {
+                redact(&mut self.lines, &[], &mut out, hits).await?;
+              }
+            }
           }
         }
         Next::Piece(Piece::Body { bytes, end }) => {
