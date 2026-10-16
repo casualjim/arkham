@@ -1,3 +1,14 @@
+## [0.3.20] - 2026-10-16
+
+### 🐛 Bug Fixes
+
+- *(mtls)* Enforce client certificates for redis, smtp, ldap, and postgres (#55)
+## [0.3.19] - 2026-10-15
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.19 [ci skip]
+- Release
 ## [0.3.18] - 2026-10-15
 
 ### ⚙️ Miscellaneous Tasks
