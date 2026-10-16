@@ -10,6 +10,9 @@
 pub mod machine;
 
 #[cfg(test)]
+pub(crate) mod fixtures;
+
+#[cfg(test)]
 pub mod props;
 
 use std::io::{Error as IoError, ErrorKind};
@@ -404,8 +407,8 @@ mod tests {
 
   use super::{NatsTransport, Open, ServerLeg, nats_pair};
 
+  use super::fixtures::nats_grants;
   use super::machine::Nats;
-  use super::machine::tests::nats_grants;
   use super::server_info;
   use crate::transports::engine::{Rewritten, Wire};
 

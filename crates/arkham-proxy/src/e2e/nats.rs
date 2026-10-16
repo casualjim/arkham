@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::transports::nats::machine::tests::nats_grants;
+use crate::transports::nats::fixtures::nats_grants;
 
 const FAKE: &str = "arkham_fake_nats_pass"; // betterleaks:allow
 const VALUE: &str = "arkham_real_nats_pass_01"; // betterleaks:allow

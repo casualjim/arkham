@@ -1039,35 +1039,20 @@ impl Guard {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-  use arkham_config::grants::{Credential, Grant, NatsAuth, NatsScope};
+mod tests {
+  use arkham_config::grants::Grant;
   use pretty_assertions::assert_eq;
 
   use strum::IntoEnumIterator as _;
 
   use super::{ClientVerb, MAX_COMMAND, Nats, ServerVerb};
   use crate::transports::engine::{Rewritten, Wire};
+  use crate::transports::nats::fixtures::nats_grants;
 
   const FAKE_PASS: &str = "arkham_fake_nats_pass"; // betterleaks:allow
   const REAL_PASS: &str = "real-nats-pass-is-longer"; // betterleaks:allow
   const FAKE_TOKEN: &str = "arkham_fake_nats_token"; // betterleaks:allow
   const REAL_TOKEN: &str = "real-nats-token"; // betterleaks:allow
-
-  pub(crate) fn nats_grants(fake: &str, real: &str) -> Vec<Grant> {
-    let scope = NatsScope::from_strings(fake, real).expect("nats strings");
-    let secret = match &scope.auth {
-      NatsAuth::UserPass { pass, .. } => pass,
-      NatsAuth::Token(token) => token,
-    };
-    vec![Grant::Nats {
-      credential: Credential {
-        label: "nats".into(),
-        fake: secret.fake.clone(),
-        value: secret.real.clone(),
-      },
-      scope: Box::new(scope),
-    }]
-  }
 
   /// The verb tables are the protocol message list.
   /// <https://docs.nats.io/reference/reference-protocols/nats-protocol>

@@ -1,6 +1,10 @@
-//! Shared property-test harness. `block_on` runs one machine feed on a
-//! current-thread runtime. [`run_split_parts`] drains a byte string over
-//! ascending cuts and always finishes with the empty EOF flush, `feed(&[])`.
+//! Shared property-test harness.
+//!
+//! [`block_on`] runs one feed on a current-thread runtime for the synchronous
+//! HTTP, SMTP, and LDAP properties. [`feed_parts`] awaits the same cuts,
+//! including the empty EOF flush `feed(&[])`, on the caller's runtime. NATS
+//! properties call [`feed_parts`] from `#[tokio::test]` and do not build a
+//! runtime.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -39,6 +43,11 @@ pub(crate) fn run_split<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]) -> (V
 
 /// [`run_split`] plus whether any feed returned [`Rewritten::Close`].
 pub(crate) fn run_split_parts<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]) -> (Vec<u8>, usize, bool) {
+  block_on(feed_parts(m, data, splits))
+}
+
+/// [`run_split_parts`] on the caller's runtime. The last feed is `feed(&[])`.
+pub(crate) async fn feed_parts<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]) -> (Vec<u8>, usize, bool) {
   let mut out = Vec::new();
   let mut hits = 0;
   let mut prev = 0;
@@ -47,7 +56,7 @@ pub(crate) fn run_split_parts<M: Wire>(m: &mut M, data: &[u8], splits: &[usize])
     // A relay only calls with non-empty chunks; an empty call is the
     // EOF flush. Skip cuts that would produce an interior empty call.
     if cut > prev {
-      let (rewritten, chunk_hits) = block_on(m.feed(&data[prev..cut]));
+      let (rewritten, chunk_hits) = m.feed(&data[prev..cut]).await;
       closed |= matches!(rewritten, Rewritten::Close);
       out.extend_from_slice(&rewritten.emit_bytes());
       hits += chunk_hits.len();
@@ -55,12 +64,12 @@ pub(crate) fn run_split_parts<M: Wire>(m: &mut M, data: &[u8], splits: &[usize])
     }
   }
   if prev < data.len() {
-    let (rewritten, chunk_hits) = block_on(m.feed(&data[prev..]));
+    let (rewritten, chunk_hits) = m.feed(&data[prev..]).await;
     closed |= matches!(rewritten, Rewritten::Close);
     out.extend_from_slice(&rewritten.emit_bytes());
     hits += chunk_hits.len();
   }
-  let (rewritten, chunk_hits) = block_on(m.feed(&[]));
+  let (rewritten, chunk_hits) = m.feed(&[]).await;
   closed |= matches!(rewritten, Rewritten::Close);
   out.extend_from_slice(&rewritten.emit_bytes());
   hits += chunk_hits.len();
@@ -73,8 +82,8 @@ pub(crate) fn run_split_h2<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]) ->
 }
 
 /// One reply stream. Each poll yields bytes up to the next cut, then
-/// pends once before the following poll. The waker is woken so
-/// [`block_on`] resumes.
+/// pends once before the following poll. The waker is woken so the
+/// runtime resumes.
 pub(crate) struct CutPend {
   pub(crate) data: Vec<u8>,
   pub(crate) cuts: Vec<usize>,

@@ -474,7 +474,7 @@ mod tests {
 
   #[test]
   fn a_nats_grant_routes_to_the_nats_arm_and_only_its_port() {
-    let grants = crate::transports::nats::machine::tests::nats_grants(
+    let grants = crate::transports::nats::fixtures::nats_grants(
       "nats://agent:fake@nats.internal:4222", // betterleaks:allow
       "tls://agent:real@nats.upstream:4222",  // betterleaks:allow
     );
