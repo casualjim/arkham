@@ -1106,7 +1106,7 @@ mod tests {
   #[test]
   fn ldap_mtls_on_a_cleartext_upstream_still_loads() {
     let mut cfg = cfg_with_db(
-      "ldap://cn%3Ddir:arkham_fake_ldap_pass@ldap.internal:389",     // betterleaks:allow
+      "ldap://cn%3Ddir:arkham_fake_ldap_pass@ldap.internal:389",    // betterleaks:allow
       "ldap://cn%3Ddir:arkham_real_ldap_pass_01@ldap.internal:389", // betterleaks:allow
     );
     mtls_on(&mut cfg);
@@ -1386,8 +1386,8 @@ mod tests {
   #[test]
   fn smtp_mtls_on_starttls_still_loads() {
     let mut cfg = cfg_with_db(
-      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587",                                 // betterleaks:allow
-      "smtp://agent:arkham_real_smtp_pass_01@mail.internal:587?starttls=required",           // betterleaks:allow
+      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587", // betterleaks:allow
+      "smtp://agent:arkham_real_smtp_pass_01@mail.internal:587?starttls=required", // betterleaks:allow
     );
     mtls_on(&mut cfg);
     let resolved = resolve(&cfg).expect("smtp starttls with mtls still loads");

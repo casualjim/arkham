@@ -645,8 +645,17 @@ async fn smtp_mtls_starttls_without_a_client_certificate_sends_no_auth_upstream(
   config.enable_sni = false;
   let name = ServerName::try_from("localhost".to_string()).unwrap();
   let handshake = tokio::time::timeout(Duration::from_secs(5), TlsConnector::from(Arc::new(config)).connect(name, stream)).await;
-  let accepted = matches!(handshake, Ok(Ok(_)));
-  assert!(!accepted, "STARTTLS under mtls accepted a guest with no client certificate");
+  // TLS 1.3 can return from `connect` before the server rejects an empty
+  // client certificate. The next read or write is what fails.
+  let refused = match handshake {
+    Ok(Ok(mut tls)) => {
+      let sent = tls.write_all(b"EHLO after\r\n").await;
+      let reply = read_line_or_end(&mut tls).await;
+      sent.is_err() || reply.is_none()
+    }
+    Ok(Err(_)) | Err(_) => true,
+  };
+  assert!(refused, "STARTTLS under mtls accepted a guest with no client certificate");
   drop(stub_task);
   proxy.abort();
   let lines = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
@@ -654,8 +663,5 @@ async fn smtp_mtls_starttls_without_a_client_certificate_sends_no_auth_upstream(
     lines.iter().all(|line| !line.to_ascii_uppercase().starts_with("AUTH")),
     "AUTH reached upstream before a client certificate"
   );
-  assert!(
-    lines.iter().all(|line| !line.contains(VALUE)),
-    "upstream saw the real credential"
-  );
+  assert!(lines.iter().all(|line| !line.contains(VALUE)), "upstream saw the real credential");
 }

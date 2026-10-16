@@ -468,7 +468,9 @@ pub enum Error {
     label: String,
   },
   /// `guest_tls_mode = mtls` on a cleartext `redis://` fake string.
-  #[error("rule `{label}`: mtls requires a rediss:// fake, because a cleartext guest cannot present a client certificate")]
+  #[error(
+    "rule `{label}`: mtls requires a rediss:// fake, because AUTH is rewritten before a cleartext guest can present a client certificate"
+  )]
   RedisCleartextMtls {
     /// Rule label.
     label: String,
@@ -494,8 +496,10 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
-  /// `guest_tls_mode = mtls` on a cleartext `smtp://` fake string.
-  #[error("rule `{label}`: mtls requires an smtps:// fake, because a cleartext guest cannot present a client certificate")]
+  /// `guest_tls_mode = mtls` on an `smtp://` fake whose real string is `smtps://`.
+  #[error(
+    "rule `{label}`: mtls on an smtp:// fake is rejected when the real string is smtps://, because AUTH is rewritten before the guest can present a client certificate"
+  )]
   SmtpCleartextMtls {
     /// Rule label.
     label: String,
@@ -512,8 +516,10 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
-  /// `guest_tls_mode = mtls` on a cleartext `ldap://` fake string.
-  #[error("rule `{label}`: mtls requires an ldaps:// fake, because a cleartext guest cannot present a client certificate")]
+  /// `guest_tls_mode = mtls` on an `ldap://` fake whose real string is `ldaps://`.
+  #[error(
+    "rule `{label}`: mtls on an ldap:// fake is rejected when the real string is ldaps://, because a bind is rewritten before the guest can present a client certificate"
+  )]
   LdapCleartextMtls {
     /// Rule label.
     label: String,

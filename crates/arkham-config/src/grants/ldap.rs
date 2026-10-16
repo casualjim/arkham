@@ -287,7 +287,8 @@ impl LdapScope {
 ///
 /// Returns an error when either string fails the ldap law above, when a
 /// `tls` row tries to state what only the real string may state, or when
-/// `guest_tls_mode` is `mtls` on a cleartext `ldap://` fake.
+/// `guest_tls_mode` is `mtls` on an `ldap://` fake whose real string is
+/// `ldaps://`.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value
@@ -312,7 +313,7 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     if tls.root_cert.is_some() {
       return Err(Error::LdapTrust { label: label.to_string() });
     }
-    if tls.guest_tls_mode == GuestTlsMode::Mtls && !scope.is_downstream_tls {
+    if tls.guest_tls_mode == GuestTlsMode::Mtls && scope.is_upstream_tls && !scope.is_downstream_tls {
       return Err(Error::LdapCleartextMtls { label: label.to_string() });
     }
     scope.guest_tls = tls.guest_tls_mode;

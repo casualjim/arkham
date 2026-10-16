@@ -234,7 +234,9 @@ impl RedisScope {
 ///
 /// Returns an error when either string fails the redis law above, when a
 /// `tls` row tries to state what only the real string may state, or when
-/// `guest_tls_mode` is `mtls` on a cleartext `redis://` fake.
+/// `guest_tls_mode` is `mtls` on a cleartext `redis://` fake. AUTH is
+/// rewritten on a cleartext upstream, so a `redis://` real string is
+/// rejected too.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value
