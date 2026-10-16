@@ -13,7 +13,7 @@ pub mod machine;
 pub(crate) mod fixtures;
 
 #[cfg(test)]
-pub mod props;
+mod props;
 
 use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
@@ -400,7 +400,7 @@ mod tests {
   use std::task::{Context, Poll};
   use std::time::Duration;
 
-  use arkham_config::grants::{GuestTlsMode, NatsScope};
+  use arkham_config::grants::GuestTlsMode;
   use arkham_pki::ca::CertAuthority;
   use pretty_assertions::assert_eq;
   use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
@@ -416,16 +416,12 @@ mod tests {
   async fn mtls_plaintext_guest_closes_without_forwarding() {
     let ca = CertAuthority::generate().expect("ca");
     let transport = NatsTransport::new(&ca).expect("transport");
-    let mut scope = NatsScope::from_strings(
-      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",   // betterleaks:allow
-      "tls://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
-    )
-    .expect("scope");
-    scope.guest_tls = GuestTlsMode::Mtls;
     let grants = nats_grants(
       "nats://agent:arkham_fake_nats_pass@nats.internal:4222",   // betterleaks:allow
       "tls://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
     );
+    let mut scope = grants.first().and_then(|grant| grant.nats(None, 4222)).cloned().expect("scope");
+    scope.guest_tls = GuestTlsMode::Mtls;
     let (down, up) = nats_pair(&grants, "nats.internal", 4222, true);
     let (mut upstream, server) = tokio::io::duplex(256);
     let (guest_peer, guest) = tokio::io::duplex(64);
