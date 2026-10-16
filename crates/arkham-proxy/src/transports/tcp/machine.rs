@@ -40,7 +40,8 @@ impl Raw {
     Self::from_pairs(eligible_pairs(grants, scheme, host, port, dir))
   }
 
-  fn from_pairs(pairs: Vec<CredentialPair>) -> Self {
+  /// Build from pairs the caller already chose. The hold-back is the longest needle minus one.
+  pub(crate) fn from_pairs(pairs: Vec<CredentialPair>) -> Self {
     let tail_size = max_tail_size(&pairs);
     Self {
       pairs,

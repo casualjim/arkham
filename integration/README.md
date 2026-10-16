@@ -45,6 +45,8 @@ Topology:
 | 14 | Same client: StartTLS, then a simple bind with the decoy password | `[rules.ldap_plain]` | the directory accepts the bind. Arkham swapped the decoy for the real password after the upgrade |
 | 15 | `ldapts` simple bind to `ldap:3636` over LDAPS with the decoy password | `[rules.ldap_tls]`: fake `ldaps://` URL; real URL carries `sslrootcert` | same swap on a leg that is TLS from the first byte |
 | 16 | StartTLS and LDAPS binds with a password that is not the decoy | the same two rules | the directory returns `invalidCredentials` (code 49). The password was not swapped, and the error text does not contain the real password |
+| 17 | `nats` client to `nats:4222` with the decoy password: TLS upgrade after INFO, subscribe, publish a payload that carries the decoy, receive it | `[rules.nats]`: fake `nats://` URL; real `tls://` URL carries `sslrootcert` | nats-server accepts the swapped password, and the message comes back with the decoy unchanged |
+| 18 | Same client with a password that is not the decoy | `[rules.nats]` | nats-server returns `Authorization Violation`. The password was not swapped, and the error text does not contain the real password |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -88,6 +90,18 @@ directory at bootstrap and named by `sslrootcert` on both real strings.
 `ldap://` carries that anchor because StartTLS verifies the upstream
 certificate after the upgrade. Scenarios 13–16 are gated on `LDAP_URL`
 and `LDAP_TLS_URL`.
+Scenarios 17 and 18 use the official `nats:2.15.1-alpine` image and the
+`nats` npm package 2.29.3. The server requires TLS: it writes one
+cleartext INFO line, then expects a handshake on the same socket. Its only
+account holds the real password, so a session that authenticates with the
+decoy proves the swap. The tls block sets no `verify`, so the server does
+not ask for a client certificate, and this demo does not present one: the
+proxy's upstream leg has no client identity. `cluster { no_advertise: true }`
+keeps cluster client URLs out of INFO. The real string is `tls://`, which
+is what lets arkham swap: the CONNECT password is replaced only after the
+upstream leg is TLS. Payloads are never rewritten, so the decoy in the
+published message arrives unchanged. Scenarios 17 and 18 are gated on
+`NATS_URL`.
 
 ## Run
 

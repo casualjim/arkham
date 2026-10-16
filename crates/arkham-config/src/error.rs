@@ -9,7 +9,7 @@ use toml::de::Error as TomlError;
 use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 
-use crate::grants::{LdapUriError, Scheme, SmtpUriError};
+use crate::grants::{LdapUriError, NatsUriError, Scheme, SmtpUriError};
 
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -521,6 +521,27 @@ pub enum Error {
     "rule `{label}`: mtls on an ldap:// fake is rejected when the real string is ldaps://, because a bind is rewritten before the guest can present a client certificate"
   )]
   LdapCleartextMtls {
+    /// Rule label.
+    label: String,
+  },
+  /// A NATS connection string, or the pair of them, does not parse.
+  #[error("rule `{label}`: {source}")]
+  NatsScope {
+    /// Rule label.
+    label: String,
+    /// Parse failure.
+    #[source]
+    source: NatsUriError,
+  },
+  /// A NATS rule states its upstream identity outside the connection string.
+  #[error("rule `{label}`: nats states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
+  NatsIdentity {
+    /// Rule label.
+    label: String,
+  },
+  /// A NATS rule states its upstream trust outside the connection string.
+  #[error("rule `{label}`: nats states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
+  NatsTrust {
     /// Rule label.
     label: String,
   },

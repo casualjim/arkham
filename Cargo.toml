@@ -81,9 +81,12 @@ arkham-plugin = { path = "crates/arkham-plugin" }
 arkham-proxy = { path = "crates/arkham-proxy" }
 arkham-tproxy = { path = "crates/arkham-tproxy" }
 arkham-tun = { path = "crates/arkham-tun" }
+
 # One declaration per external dependency so versions cannot drift between
 # crates. rama tracks main deliberately: its 0.5 line is unpublished.
+actson = "2.1.0"
 async-trait = "0.1"
+atoi = "2"
 aya = "0.14"
 aya-build = "0.2"
 aya-obj = "0.3"
@@ -110,6 +113,7 @@ httparse = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+memchr = "2"
 miette = { version = "7", features = ["fancy"] }
 mimalloc = "0.1"
 netlink-packet-core = "0.9"

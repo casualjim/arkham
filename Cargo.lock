@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "actson"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78deb7b1fc041f9faa47b5f4c05a48362c5cbb18308bf7f9641e200f56a26a71"
+dependencies = [
+ "btoi",
+ "num-traits",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -458,10 +469,12 @@ dependencies = [
 name = "arkham-proxy"
 version = "0.3.20"
 dependencies = [
+ "actson",
  "arkham-config",
  "arkham-pki",
  "arkham-plugin",
  "async-trait",
+ "atoi",
  "base64 0.22.1",
  "bytes",
  "dashmap",
@@ -472,6 +485,7 @@ dependencies = [
  "httparse",
  "hyper 1.12.0",
  "hyper-util",
+ "memchr",
  "pgwire",
  "pretty_assertions",
  "proptest",
@@ -484,6 +498,7 @@ dependencies = [
  "secrecy",
  "serde_json",
  "smtp-proto",
+ "strum 0.28.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -658,6 +673,15 @@ checksum = "52697735bdaac441a29391a9e97102c74c6ef0f9b60a40cf109b1b404e29d2f6"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "atoi"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -1684,6 +1708,15 @@ dependencies = [
  "memchr",
  "regex-automata",
  "serde_core",
+]
+
+[[package]]
+name = "btoi"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b5ab9db53bcda568284df0fd39f6eac24ad6f7ba7ff1168b9e76eba6576b976"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

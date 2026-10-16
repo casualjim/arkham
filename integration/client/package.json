@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "ldapts": "9.2.0"
+    "ldapts": "9.2.0",
+    "nats": "2.29.3"
   }
 }

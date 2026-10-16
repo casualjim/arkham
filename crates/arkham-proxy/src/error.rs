@@ -328,6 +328,44 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
+  /// A guest NATS TLS handshake fails.
+  #[error("guest nats TLS: {source}")]
+  GuestNatsTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A server NATS TLS handshake fails.
+  #[error("server nats TLS: {source}")]
+  ServerNatsTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A NATS upstream name cannot become a TLS server name.
+  #[error("nats server name: {source}")]
+  NatsServerName {
+    /// Underlying name failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+  },
+  /// A NATS TLS handshake exceeded the configured budget.
+  #[error("nats handshake timed out")]
+  NatsHandshakeTimeout,
+  /// `guest_tls_mode` is `mtls` and the guest sent plaintext after INFO.
+  #[error("nats mtls guest sent plaintext")]
+  NatsGuestPlaintext,
+  /// The server's INFO set `tls_required` and the upstream is cleartext.
+  #[error("nats server requires tls on a cleartext upstream")]
+  NatsTlsRequired {
+    /// INFO `tls_available`.
+    tls_available: bool,
+    /// INFO `tls_verify`.
+    tls_verify: bool,
+  },
+  /// A cleartext INFO line did not finish an object, and `tls_required` was not true.
+  #[error("nats INFO did not yield tls flags on a cleartext upstream")]
+  NatsInfoUnreadable,
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,
