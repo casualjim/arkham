@@ -25,8 +25,8 @@ use secrecy::SecretString;
 
 use crate::transports::smtp::{GuestLeg, MAX_COMMAND, Smtp, acceptance_reply, plain_guest};
 
-use super::harness::{CutPend, block_on, run_split, run_split_h2, run_split_parts};
 use super::super::amqp::machine::MAX_CREDENTIAL_FRAME;
+use super::harness::{CutPend, block_on, run_split, run_split_h2, run_split_parts};
 use super::{Amqp, Direction, Http, Ldap, Raw, Rewritten, Wire};
 use crate::transports::http::h2::{H2, H2_PREFACE};
 
