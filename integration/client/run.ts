@@ -107,6 +107,10 @@ async function readAll(sock: Socket | TLSSocket): Promise<string> {
 const covered = new Set<string>();
 
 async function once(scheme: string, what: string, fn: () => Promise<boolean>) {
+  if (outOfTime()) {
+    console.error(`FAIL ${what}: out of time`);
+    process.exit(1);
+  }
   stage(`${what} attempt 1`);
   try {
     if (await fn()) {
