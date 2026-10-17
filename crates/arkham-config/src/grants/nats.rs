@@ -813,6 +813,7 @@ impl FromStr for NatsUri {
     };
     let (user, password) = userinfo_parts(entry)?;
     let auth = match password {
+      None if nkey_material(&user) => return Err(NatsUriError::MisplacedSeed),
       None => NatsPlain::Token(user),
       Some(pass) => classify_userinfo(user, pass)?,
     };
@@ -867,7 +868,7 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
   if user == NatsPlain::NKEY_USER {
     return match NatsSeed::from_seed(SecretString::from(pass.clone())) {
       Ok(_) => Ok(NatsPlain::Nkey(pass)),
-      Err(NatsUriError::Seed) => Ok(NatsPlain::UserPass { user, pass }),
+      Err(NatsUriError::Seed) => ordinary_userinfo(user, pass),
       Err(err) => Err(err),
     };
   }
@@ -876,13 +877,30 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
       Ok(plain) => Ok(plain),
       Err(NatsUriError::UserJwt) => match creds_parsed_seed(&pass) {
         Some(err) => Err(err),
-        None => Ok(NatsPlain::UserPass { user, pass }),
+        None => ordinary_userinfo(user, pass),
       },
-      Err(NatsUriError::Seed) => Ok(NatsPlain::UserPass { user, pass }),
+      Err(NatsUriError::Seed) => ordinary_userinfo(user, pass),
       Err(err) => Err(err),
     };
   }
+  ordinary_userinfo(user, pass)
+}
+
+fn ordinary_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriError> {
+  if nkey_material(&user) || pass.split(':').any(nkey_material) {
+    return Err(NatsUriError::MisplacedSeed);
+  }
   Ok(NatsPlain::UserPass { user, pass })
+}
+
+fn nkey_material(text: &str) -> bool {
+  if text.is_empty() {
+    return false;
+  }
+  matches!(
+    NatsSeed::from_seed(SecretString::from(text.to_string())),
+    Ok(_) | Err(NatsUriError::UserSeed)
+  )
 }
 
 fn creds_parsed_seed(password: &str) -> Option<NatsUriError> {
@@ -1625,7 +1643,7 @@ mod tests {
     let case = signed_strings();
     assert_nkey_round_trip(&case);
     assert_user_jwt_round_trip(&case);
-    assert_lone_seed_stays_a_token(&case);
+    assert_lone_userinfo(&case);
     assert_grant_stores_public_material(&case);
     assert_signed_kinds_reject(&case);
   }
@@ -1693,17 +1711,14 @@ mod tests {
     assert!(!shown.contains(&case.real_jwt));
   }
 
-  fn assert_lone_seed_stays_a_token(case: &SignedStrings) {
-    let lone = NatsScope::from_strings(
+  fn assert_lone_userinfo(case: &SignedStrings) {
+    let err = NatsScope::from_strings(
       &format!("nats://{}@nats.internal:4222", case.fake_seed),
       &format!("nats://{}@nats.upstream:4222", case.real_seed),
     )
-    .expect("lone userinfo");
-    let NatsAuth::Token(token) = &lone.auth else {
-      panic!("a lone seed is a token");
-    };
-    assert_eq!(token.fake, case.fake_seed);
-    assert_eq!(token.real.expose_secret(), case.real_seed);
+    .expect_err("lone seed");
+    assert!(matches!(err, NatsUriError::MisplacedSeed), "{err}");
+    hides(&err, &[case.fake_seed.as_str(), case.real_seed.as_str()]);
     for name in ["nkey", "creds"] {
       let token = NatsScope::from_strings(
         &format!("nats://{name}@nats.internal:4222"),
