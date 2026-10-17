@@ -94,7 +94,9 @@ impl NatsUserinfo {
 ///
 /// [`Self::NKEY_USER`] and [`Self::CREDS_USER`] are the username spellings.
 /// A username with one of those spellings is that kind only when the
-/// password parses as that kind. Any other password is [`Self::UserPass`].
+/// password parses as that kind. A `creds` password whose user seed parses
+/// is rejected when the jwt is missing or bad. Any other password is
+/// [`Self::UserPass`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatsPlain {
   /// CONNECT `user` and `pass`. `pass` may be empty.
@@ -870,22 +872,35 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
   if user == NatsPlain::CREDS_USER {
     return match plain_creds(&pass) {
       Ok(plain) => Ok(plain),
-      Err(NatsUriError::UserJwt) if creds_seed_parsed(&pass) => Err(NatsUriError::UserJwt),
-      Err(NatsUriError::UserJwt | NatsUriError::Seed) => Ok(NatsPlain::UserPass { user, pass }),
+      Err(NatsUriError::UserJwt) => match creds_parsed_seed(&pass) {
+        Some(err) => Err(err),
+        None => Ok(NatsPlain::UserPass { user, pass }),
+      },
+      Err(NatsUriError::Seed) => Ok(NatsPlain::UserPass { user, pass }),
       Err(err) => Err(err),
     };
   }
   Ok(NatsPlain::UserPass { user, pass })
 }
 
-fn creds_seed_parsed(password: &str) -> bool {
-  let Some((seed, _)) = password.split_once(':') else {
-    return false;
+/// The seed half of a creds password, or the whole password when it has no colon.
+///
+/// `Some` when that text is a real nkey. A user seed fails as [`NatsUriError::UserJwt`]
+/// so the raw seed is not sent upstream as a password. A non-user seed fails as
+/// [`NatsUriError::UserSeed`].
+fn creds_parsed_seed(password: &str) -> Option<NatsUriError> {
+  let seed = match password.split_once(':') {
+    Some((seed, _)) => seed,
+    None => password,
   };
   if seed.is_empty() {
-    return false;
+    return None;
   }
-  NatsSeed::from_seed(SecretString::from(seed.to_string())).is_ok()
+  match NatsSeed::from_seed(SecretString::from(seed.to_string())) {
+    Ok(_) => Some(NatsUriError::UserJwt),
+    Err(NatsUriError::UserSeed) => Some(NatsUriError::UserSeed),
+    Err(_) => None,
+  }
 }
 
 fn plain_creds(password: &str) -> Result<NatsPlain, NatsUriError> {
@@ -1195,6 +1210,18 @@ mod tests {
       Err(err) => err,
     };
     assert!(matches!(err, NatsUriError::UserJwt), "{err}");
+    hides(&err, &[seed.as_str()]);
+  }
+
+  #[test]
+  fn creds_account_seed_without_a_jwt_is_rejected() {
+    let seed = nkeys::KeyPair::new_account().seed().expect("account seed");
+    let uri = format!("nats://creds:{seed}@nats.internal:4222");
+    let err = match NatsScope::from_strings(&uri, &uri) {
+      Ok(_scope) => panic!("an account seed with no jwt was accepted"),
+      Err(err) => err,
+    };
+    assert!(matches!(err, NatsUriError::UserSeed), "{err}");
     hides(&err, &[seed.as_str()]);
   }
 
@@ -1665,7 +1692,7 @@ mod tests {
       (
         format!("nats://creds:{}@nats.internal:4222", case.fake_seed),
         case.real_creds.clone(),
-        NatsUriError::AuthKindMismatch,
+        NatsUriError::UserJwt,
       ),
       (
         format!("nats://creds:{account_seed}:{}@nats.internal:4222", case.fake_jwt),
