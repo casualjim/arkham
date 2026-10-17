@@ -781,6 +781,10 @@ pub enum NatsUriError {
   /// The JWT `sub` and the seed's public key differ.
   #[error("bad connection string: user jwt sub does not match the nkey seed")]
   JwtSeedMismatch,
+  /// An nkey seed is a user, a password, a token, or a password segment
+  /// other than the `nkey` password or the `creds` seed half.
+  #[error("bad connection string: nkey seed is outside the nkey or creds field")]
+  MisplacedSeed,
 }
 
 /// One parsed NATS string. Callers only ever see [`NatsScope`].
@@ -1216,6 +1220,84 @@ mod tests {
     };
     assert!(matches!(err, NatsUriError::UserSeed), "{err}");
     hides(&err, &[seed.as_str()]);
+  }
+
+  #[test]
+  fn creds_jwt_then_seed_is_rejected() {
+    let (seed, public) = user_material();
+    let jwt = user_jwt(&public, br#"{"alg":"ed25519-nkey","typ":"JWT"}"#);
+    let uri = format!("nats://creds:{jwt}:{seed}@nats.internal:4222");
+    let err = match NatsScope::from_strings(&uri, &uri) {
+      Ok(_scope) => panic!("a jwt then a seed was accepted"),
+      Err(err) => err,
+    };
+    assert!(matches!(err, NatsUriError::MisplacedSeed), "{err}");
+    hides(&err, &[seed.as_str(), jwt.as_str()]);
+  }
+
+  #[test]
+  fn seed_as_token_is_rejected() {
+    let (seed, _public) = user_material();
+    let uri = format!("nats://{seed}@nats.internal:4222");
+    let err = match NatsScope::from_strings(&uri, &uri) {
+      Ok(_scope) => panic!("a seed token was accepted"),
+      Err(err) => err,
+    };
+    assert!(matches!(err, NatsUriError::MisplacedSeed), "{err}");
+    hides(&err, &[seed.as_str()]);
+  }
+
+  #[test]
+  fn seed_in_other_userinfo_positions_is_rejected() {
+    let (seed, _public) = user_material();
+    let account = nkeys::KeyPair::new_account().seed().expect("account seed");
+    let operator = nkeys::KeyPair::new_operator().seed().expect("operator seed");
+    let cases = [
+      (
+        "username",
+        format!("nats://{seed}:ordinary-pass@nats.internal:4222"),
+        vec![seed.as_str()],
+      ),
+      ("password", format!("nats://agent:{seed}@nats.internal:4222"), vec![seed.as_str()]),
+      (
+        "account password",
+        format!("nats://agent:{account}@nats.internal:4222"),
+        vec![account.as_str()],
+      ),
+      (
+        "account token",
+        format!("nats://{account}@nats.internal:4222"),
+        vec![account.as_str()],
+      ),
+      (
+        "operator token",
+        format!("nats://{operator}@nats.internal:4222"),
+        vec![operator.as_str()],
+      ),
+      (
+        "nkey segment",
+        format!("nats://nkey:not-a-seed:{seed}@nats.internal:4222"),
+        vec![seed.as_str()],
+      ),
+      (
+        "real password",
+        format!("tls://agent:{seed}@nats.upstream:4222"),
+        vec![seed.as_str()],
+      ),
+    ];
+    for (label, uri, secrets) in cases {
+      let fake = if label == "real password" {
+        "nats://agent:ordinary-pass@nats.internal:4222".to_string()
+      } else {
+        uri.clone()
+      };
+      let err = match NatsScope::from_strings(&fake, &uri) {
+        Ok(_scope) => panic!("{label} was accepted"),
+        Err(err) => err,
+      };
+      assert!(matches!(err, NatsUriError::MisplacedSeed), "{label}: {err}");
+      hides(&err, &secrets);
+    }
   }
 
   #[test]
