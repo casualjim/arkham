@@ -668,4 +668,76 @@ mod tests {
       .any(|(elapsed, reset)| *elapsed >= Duration::from_millis(200) || !*reset);
     assert!(!slow, "idle abort RST waited on the capture loop: {samples:?}");
   }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  #[ignore = "needs root + ARKHAM_TEST_TUN=1 (mutates host routes)"]
+  async fn tun_live_idle_clean_close_fin_is_prompt() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    if !live_enabled() {
+      return;
+    }
+    let _live = LIVE_LOCK.lock().await;
+
+    let stub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let device = make_tun("arkhamf0", Ipv4Addr::new(10, 98, 81, 1));
+    let nl = netlink().unwrap();
+    let idx = link_index(&nl, "arkhamf0").await.unwrap();
+    let guest_route = RoutePlan {
+      dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
+      via: None,
+      oif: idx,
+    };
+    add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
+    let _routes = RouteGuard::new(vec![Undo::DelRoute {
+      table: TABLE_MAIN,
+      plan: guest_route,
+    }]);
+    let state = test_state(Vec::new(), Some(FWMARK));
+    let loop_task = tokio::spawn(run_loop(
+      device,
+      Ipv4Addr::new(10, 98, 81, 1),
+      v4([127, 0, 0, 1], 53),
+      Some(v4([127, 0, 0, 1], stub_port)),
+      state,
+    ));
+
+    let mut samples = Vec::new();
+    for _step in 0..4u8 {
+      let accept = stub.accept();
+      let mut guest = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(v4([198, 51, 100, 7], stub_port)),
+      )
+      .await
+      .unwrap()
+      .unwrap();
+      guest.set_nodelay(true).unwrap();
+      let (server, _) = tokio::time::timeout(Duration::from_secs(10), accept).await.unwrap().unwrap();
+      let mut server = server;
+      server.set_nodelay(true).unwrap();
+
+      guest.write_all(b"ping").await.unwrap();
+      let mut opened = [0u8; 4];
+      tokio::time::timeout(Duration::from_secs(10), server.read_exact(&mut opened))
+        .await
+        .unwrap()
+        .unwrap();
+      assert_eq!(&opened, b"ping");
+
+      tokio::time::sleep(Duration::from_millis(300)).await;
+      let started = std::time::Instant::now();
+      server.shutdown().await.unwrap();
+      let mut buf = [0u8; 8];
+      let read = tokio::time::timeout(Duration::from_millis(1500), guest.read(&mut buf)).await;
+      let elapsed = started.elapsed();
+      let fin = matches!(read, Ok(Ok(0)));
+      samples.push((elapsed, fin));
+    }
+    loop_task.abort();
+    let _ = loop_task.await;
+    let slow = samples.iter().any(|(elapsed, fin)| *elapsed >= Duration::from_millis(200) || !*fin);
+    assert!(!slow, "idle clean close FIN waited on the capture loop: {samples:?}");
+  }
 }
