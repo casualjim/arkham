@@ -87,7 +87,30 @@ impl AsyncWrite for ChanStream {
     Poll::Ready(Ok(()))
   }
 
-  fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    let Some(tx) = self.tx.as_mut() else {
+      return Poll::Ready(Ok(()));
+    };
+    match Pin::new(tx).poll_ready(cx) {
+      Poll::Ready(Ok(())) => {}
+      Poll::Ready(Err(_)) => {
+        self.tx = None;
+        self.wake.notify_one();
+        return Poll::Ready(Ok(()));
+      }
+      Poll::Pending => {
+        self.wake.notify_one();
+        return Poll::Pending;
+      }
+    }
+    let Some(tx) = self.tx.as_mut() else {
+      return Poll::Ready(Ok(()));
+    };
+    if Pin::new(tx).start_send(TaskMsg::Fin).is_err() {
+      self.tx = None;
+      self.wake.notify_one();
+      return Poll::Ready(Ok(()));
+    }
     self.tx = None;
     self.wake.notify_one();
     Poll::Ready(Ok(()))
@@ -109,6 +132,7 @@ mod tests {
     stream.write_all(b"hello").await.unwrap();
     match loop_rx.recv().await.unwrap() {
       TaskMsg::Data(data) => assert_eq!(data, b"hello"),
+      TaskMsg::Fin => panic!("unexpected fin"),
       TaskMsg::Abort => panic!("unexpected abort"),
     }
     // Guest → task direction.
@@ -125,10 +149,10 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn shutdown_wakes_the_capture_loop() {
+  async fn shutdown_queues_a_guest_fin() {
     use tokio::io::AsyncWriteExt as _;
     let (_guest_tx, task_rx) = mpsc::channel::<Vec<u8>>(8);
-    let (task_tx, _loop_rx) = mpsc::channel::<TaskMsg>(8);
+    let (task_tx, mut loop_rx) = mpsc::channel::<TaskMsg>(8);
     let wake = Arc::new(Notify::new());
     let mut stream = ChanStream::new(task_rx, task_tx, Arc::clone(&wake));
     let notified = wake.notified();
@@ -136,5 +160,12 @@ mod tests {
     tokio::time::timeout(std::time::Duration::from_millis(50), notified)
       .await
       .expect("shutdown wakes the capture loop");
+    match loop_rx.try_recv() {
+      Ok(TaskMsg::Fin) => {}
+      Ok(TaskMsg::Data(_)) => panic!("shutdown queued data"),
+      Ok(TaskMsg::Abort) => panic!("shutdown queued abort"),
+      Err(mpsc::error::TryRecvError::Empty) => panic!("shutdown queued nothing"),
+      Err(mpsc::error::TryRecvError::Disconnected) => panic!("shutdown closed the channel"),
+    }
   }
 }

@@ -245,9 +245,11 @@ async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, 
   let result = serve_transparent_stream(guest, &state, &snapshot, &dial_host, port, &dial_host).await;
   if result.is_err() {
     let _ = abort_tx.try_send(TaskMsg::Abort);
+    drop(abort_tx);
+    wake.notify_one();
+  } else {
+    drop(abort_tx);
   }
-  drop(abort_tx);
-  wake.notify_one();
 }
 
 #[cfg(test)]
