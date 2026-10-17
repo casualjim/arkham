@@ -47,10 +47,14 @@ Topology:
 | 16 | StartTLS and LDAPS binds with a password that is not the decoy | the same two rules | the directory returns `invalidCredentials` (code 49). The password was not swapped, and the error text does not contain the real password |
 | 17 | `nats` client to `nats:4222` with the decoy password: TLS upgrade after INFO, subscribe, publish a payload that carries the decoy, receive it | `[rules.nats]`: fake `nats://` URL; real `tls://` URL carries `sslrootcert` | nats-server accepts the swapped password, and the message comes back with the decoy unchanged |
 | 18 | Same client with a password that is not the decoy | `[rules.nats]` | nats-server returns `Authorization Violation`. The password was not swapped, and the error text does not contain the real password |
-| 19 | `amqplib` (AMQP 0-9-1) to `amqp:5672` with the decoy user and password: open, declare a queue, publish with a confirm, read the message back | `[rules.amqp_plain]`: fake `amqp://` URL; the real URL is `amqps://` and carries `sslrootcert` | RabbitMQ accepts the swapped user and password on its TLS port 5671 and the message comes back |
-| 20 | `rhea` (AMQP 1.0) to `amqp:5672` with the decoy: SASL `PLAIN`, then `open` | `[rules.amqp_plain]` | the broker sends `open`, which it never does after a refused login |
-| 21 | Both clients to `amqp:5671` over TLS with the decoy | `[rules.amqp_tls]`: fake `amqps://` URL; real URL carries `sslrootcert` | same swaps on a guest leg that is TLS from the first byte |
-| 22 | Both clients on both rules with a password that is not the decoy | the same two rules | 0-9-1 gets `ACCESS_REFUSED` and 1.0 gets a failed SASL outcome (`amqp:unauthorized-access`). The password was not swapped, and the error text does not contain the real password |
+| 19 | `nkeyAuthenticator` to `nats:4222` with the decoy user seed: subscribe and publish | `[rules.nats_nkey]`: `nats://nkey:<user-seed>@nats:4222`; the real string is the same form on `tls://` | nats-server accepts the session, which is the proof the proxy signed the nonce with the real seed. The client never sends that seed |
+| 20 | Same client with a user seed that is not the decoy | `[rules.nats_nkey]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
+| 21 | `credsAuthenticator` to `nats-jwt:4222` with the decoy seed and the decoy user JWT | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4222`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
+| 22 | Same client with a user JWT that is not the decoy | `[rules.nats_jwt]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
+| 23 | `amqplib` (AMQP 0-9-1) to `amqp:5672` with the decoy user and password: open, declare a queue, publish with a confirm, read the message back | `[rules.amqp_plain]`: fake `amqp://` URL; the real URL is `amqps://` and carries `sslrootcert` | RabbitMQ accepts the swapped user and password on its TLS port 5671 and the message comes back |
+| 24 | `rhea` (AMQP 1.0) to `amqp:5672` with the decoy: SASL `PLAIN`, then `open` | `[rules.amqp_plain]` | the broker sends `open`, which it never does after a refused login |
+| 25 | Both clients to `amqp:5671` over TLS with the decoy | `[rules.amqp_tls]`: fake `amqps://` URL; real URL carries `sslrootcert` | same swaps on a guest leg that is TLS from the first byte |
+| 26 | Both clients on both rules with a password that is not the decoy | the same two rules | 0-9-1 gets `ACCESS_REFUSED` and 1.0 gets a failed SASL outcome (`amqp:unauthorized-access`). The password was not swapped, and the error text does not contain the real password |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -105,8 +109,17 @@ keeps cluster client URLs out of INFO. The real string is `tls://`, which
 is what lets arkham swap: the CONNECT password is replaced only after the
 upstream leg is TLS. Payloads are never rewritten, so the decoy in the
 published message arrives unchanged. Scenarios 17 and 18 are gated on
-`NATS_URL`.
-Scenarios 19–22 use the official `rabbitmq` 4.3.6 Alpine image (pinned
+`NATS_URL`. Scenarios 19 and 20 use the same server, with a user nkey
+added beside the password user. `integration/gen-nats.sh` mints the
+seeds with `nkeys` and writes `integration/out`, which is gitignored.
+Scenarios 21 and 22 use a second `nats:2.15.1-alpine` service in
+operator mode. The account JWT is preloaded under `resolver: MEMORY`,
+so the server checks the user JWT. The client uses `nkeyAuthenticator`
+and `credsAuthenticator` from the `nats` package 2.29.3. Scenarios 19
+and 20 are gated on `NATS_NKEY_URL`. Scenarios 21 and 22 are gated on
+`NATS_JWT_URL`. `credsAuthenticator` puts `nkey` on the CONNECT next
+to `jwt`. A user-JWT rule forwards a CONNECT that contains `nkey`.
+Scenarios 23–26 use the official `rabbitmq` 4.3.6 Alpine image (pinned
 by its manifest-list digest), `amqplib` 2.2.0, and `rhea` 3.0.5. The
 proxy is the only code we wrote on that path. The broker's one user is
 `svc` with the real password; the client holds the user `agent` and the
@@ -124,7 +137,7 @@ decoy password. Those checks run inside the container and do not pass
 through the proxy. Both real strings are `amqps://` because arkham writes
 the real password only to a TLS upstream. The cleartext-upstream case,
 where the decoy is forwarded, is the in-process test
-`amqp_cleartext_start_ok_forwards_the_decoy`. Scenarios 19–22 are gated
+`amqp_cleartext_start_ok_forwards_the_decoy`. Scenarios 23–26 are gated
 on `AMQP_URL` and `AMQP_TLS_URL`.
 
 ## Run
