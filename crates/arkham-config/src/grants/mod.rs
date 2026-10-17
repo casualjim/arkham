@@ -16,8 +16,8 @@ pub use amqp::{AmqpLeg, AmqpScope, AmqpUriError};
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
-  NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsPair, NatsScope, NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream,
-  NatsUriError, Nkey, UserJwt,
+  AuthField, AuthSign, FieldPresence, NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsField, NatsPair, NatsScope,
+  NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
 };
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
