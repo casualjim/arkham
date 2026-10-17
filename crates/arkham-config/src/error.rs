@@ -9,7 +9,7 @@ use toml::de::Error as TomlError;
 use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 
-use crate::grants::{LdapUriError, NatsUriError, Scheme, SmtpUriError};
+use crate::grants::{AmqpUriError, LdapUriError, NatsUriError, Scheme, SmtpUriError};
 
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +162,15 @@ pub enum Error {
     /// Parse failure.
     #[source]
     source: LdapUriError,
+  },
+  /// An AMQP connection string does not parse.
+  #[error("rule `{label}`: {source}")]
+  AmqpScope {
+    /// Rule label.
+    label: String,
+    /// Parse failure.
+    #[source]
+    source: AmqpUriError,
   },
   /// A connection-string rule names a scheme no vertical owns.
   #[error("rule `{label}`: scheme `{scheme:?}` owns no connection-string grant")]
@@ -542,6 +551,24 @@ pub enum Error {
   /// A NATS rule states its upstream trust outside the connection string.
   #[error("rule `{label}`: nats states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
   NatsTrust {
+    /// Rule label.
+    label: String,
+  },
+  /// An AMQP rule states its upstream identity outside the connection string.
+  #[error("rule `{label}`: amqp states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
+  AmqpIdentity {
+    /// Rule label.
+    label: String,
+  },
+  /// An AMQP rule states its upstream trust outside the connection string.
+  #[error("rule `{label}`: amqp states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
+  AmqpTrust {
+    /// Rule label.
+    label: String,
+  },
+  /// `guest_tls_mode = mtls` on a cleartext `amqp://` fake string.
+  #[error("rule `{label}`: mtls requires an amqps:// fake, because a cleartext guest cannot present a client certificate")]
+  AmqpCleartextMtls {
     /// Rule label.
     label: String,
   },

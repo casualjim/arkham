@@ -5,6 +5,7 @@
 //! strategies, and the picker (identity.rs) routes one stream to one
 //! strategy in one place.
 
+pub mod amqp;
 pub mod engine;
 pub mod http;
 pub mod ldap;

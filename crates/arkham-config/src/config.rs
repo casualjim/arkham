@@ -421,6 +421,10 @@ impl RuleCfg {
       Some(Scheme::Ldap)
     } else if NatsUriScheme::of(value).is_some() {
       Some(Scheme::Nats)
+    } else if value.starts_with("amqps://") {
+      Some(Scheme::Amqps)
+    } else if value.starts_with("amqp://") {
+      Some(Scheme::Amqp)
     } else {
       None
     }

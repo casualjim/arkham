@@ -9,7 +9,9 @@
 //! `match` on the picked protocol in the crate; every arm lives in its
 //! vertical under `transports/`.
 
-use arkham_config::grants::{Grant, LdapScope, NatsScope, PostgresScope, RedisScope, ResolvedConfig, Scheme, SmtpScope, SshScope};
+use arkham_config::grants::{
+  AmqpScope, Grant, LdapScope, NatsScope, PostgresScope, RedisScope, ResolvedConfig, Scheme, SmtpScope, SshScope,
+};
 use rama::tls::client::{ClientHello, ClientHelloHandshakePrefix, parse_client_hello_handshake_prefix};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
@@ -71,6 +73,7 @@ pub(crate) enum Expect<'a> {
   /// A `nats://` or `tls://` scope: NATS framing after a cleartext INFO, or
   /// TLS first when the real string asks for `handshake_first`.
   Nats(&'a NatsScope),
+  Amqp(&'a AmqpScope),
   /// An `ssh://` scope: the guest leg terminates here against a decoy key.
   Ssh(&'a SshScope),
   Splice,
@@ -94,6 +97,7 @@ impl PartialEq for Expect<'_> {
       (Expect::Smtp(a), Expect::Smtp(b)) => std::ptr::eq(*a, *b),
       (Expect::Ldap(a), Expect::Ldap(b)) => std::ptr::eq(*a, *b),
       (Expect::Nats(a), Expect::Nats(b)) => std::ptr::eq(*a, *b),
+      (Expect::Amqp(a), Expect::Amqp(b)) => std::ptr::eq(*a, *b),
       (Expect::Ssh(a), Expect::Ssh(b)) => std::ptr::eq(*a, *b),
       (Expect::Tls, Expect::Tls) | (Expect::Plain, Expect::Plain) | (Expect::Raw, Expect::Raw) | (Expect::Splice, Expect::Splice) => true,
       _ => false,
@@ -119,6 +123,9 @@ pub(crate) fn expect<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> 
   }
   if let Some(scope) = grants.iter().find_map(|grant| grant.nats(host, port)) {
     return Expect::Nats(scope);
+  }
+  if let Some(scope) = grants.iter().find_map(|grant| grant.amqp(host, port)) {
+    return Expect::Amqp(scope);
   }
   if let Some(scope) = grants.iter().find_map(|grant| grant.ssh(host, port)) {
     return Expect::Ssh(scope);
@@ -171,6 +178,7 @@ impl<'a> Expect<'a> {
       Expect::Ldap(scope) => state.ldap.serve(ServeStream { guest, params, scope }).await,
       // Declared NATS: INFO stays cleartext unless the real string asks for TLS first.
       Expect::Nats(scope) => state.nats.serve(ServeStream { guest, params, scope }).await,
+      Expect::Amqp(scope) => state.amqp.serve(ServeStream { guest, params, scope }).await,
       // Declared ssh: the guest leg terminates here against a decoy key.
       Expect::Ssh(scope) => state.ssh.serve(ServeStream { guest, params, scope }).await,
     }

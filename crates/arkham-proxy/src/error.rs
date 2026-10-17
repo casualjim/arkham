@@ -335,6 +335,13 @@ pub enum Error {
     #[source]
     source: IoError,
   },
+  /// A guest AMQP TLS handshake fails.
+  #[error("guest amqp TLS: {source}")]
+  GuestAmqpTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
   /// A server NATS TLS handshake fails.
   #[error("server nats TLS: {source}")]
   ServerNatsTls {
@@ -342,9 +349,23 @@ pub enum Error {
     #[source]
     source: IoError,
   },
+  /// A server AMQP TLS handshake fails.
+  #[error("server amqp TLS: {source}")]
+  ServerAmqpTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
   /// A NATS upstream name cannot become a TLS server name.
   #[error("nats server name: {source}")]
   NatsServerName {
+    /// Underlying name failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+  },
+  /// An AMQP upstream name cannot become a TLS server name.
+  #[error("amqp server name: {source}")]
+  AmqpServerName {
     /// Underlying name failure.
     #[source]
     source: Box<dyn StdError + Send + Sync>,
@@ -366,6 +387,9 @@ pub enum Error {
   /// A cleartext INFO line did not finish an object, and `tls_required` was not true.
   #[error("nats INFO did not yield tls flags on a cleartext upstream")]
   NatsInfoUnreadable,
+  /// An AMQP TLS handshake exceeded the configured budget.
+  #[error("amqp handshake timed out")]
+  AmqpHandshakeTimeout,
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,
