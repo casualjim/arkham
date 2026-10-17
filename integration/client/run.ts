@@ -2,8 +2,9 @@
 // takes every connection. The client knows nothing about the proxy:
 // it just talks to api by hostname. It holds ONLY the fake token; every
 // passing scenario proves arkham swapped it for the real one (and redacted
-// replies). Hard bounds everywhere: 5s per network await, 20s per scenario,
-// 90s for the whole run. NATS scenarios run once. The first failure ends the run.
+// replies). Hard bounds everywhere: 5s per network await, 20s per scenario
+// except the NATS scenarios, which run once, and 90s for the whole run.
+// The first failure ends the run.
 import { spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
