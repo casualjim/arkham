@@ -16,8 +16,8 @@ pub use amqp::{AmqpLeg, AmqpScope, AmqpUriError};
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
-  AuthField, AuthSign, FieldPresence, NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsField, NatsPair, NatsScope,
-  NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
+  AuthField, AuthSign, FieldPresence, NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsField, NatsPair, NatsPlain,
+  NatsScope, NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
 };
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
@@ -871,6 +871,7 @@ mod tests {
         env: "DATABASE_URL".into(),
         value: Some(SecretString::from(fake)),
         real: Some(SecretString::from(real)),
+        generated: false,
         fnox_key: None,
         allow: vec![],
         pattern: None,
@@ -1690,6 +1691,7 @@ mod tests {
         env: "T".into(),
         value: Some(SecretString::from("value")),
         real: None,
+        generated: false,
         fnox_key: None,
         allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
         pattern: None,
@@ -1724,6 +1726,7 @@ mod tests {
         env: env.to_string(),
         value: Some(SecretString::from(value)),
         real: None,
+        generated: false,
         fnox_key: None,
         allow: allow.into_iter().map(str::to_string).collect(),
         pattern: None,
@@ -2102,6 +2105,7 @@ mod tests {
         env: "T".into(),
         value: None,
         real: None,
+        generated: false,
         fnox_key: None,
         allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
         pattern: None,
