@@ -16,7 +16,6 @@ const MAX_TCP_CONNS: usize = 256;
 const CHANNEL_CAP: usize = 32;
 const RELAY_BUF: usize = 16384;
 
-/// Task → loop messages: stream bytes, a graceful FIN, or abort (RST the guest, e.g. dial failed).
 pub(crate) enum TaskMsg {
   Data(Vec<u8>),
   Fin,

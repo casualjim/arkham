@@ -94,9 +94,7 @@ impl NatsUserinfo {
 ///
 /// [`Self::NKEY_USER`] and [`Self::CREDS_USER`] are the username spellings.
 /// A username with one of those spellings is that kind only when the
-/// password parses as that kind. A real nkey in a `creds` password is
-/// rejected unless it is a user seed paired with its user jwt. Any other
-/// password is [`Self::UserPass`].
+/// password parses as that kind. Any other password is [`Self::UserPass`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatsPlain {
   /// CONNECT `user` and `pass`. `pass` may be empty.
