@@ -94,9 +94,9 @@ impl NatsUserinfo {
 ///
 /// [`Self::NKEY_USER`] and [`Self::CREDS_USER`] are the username spellings.
 /// A username with one of those spellings is that kind only when the
-/// password parses as that kind. A `creds` password whose user seed parses
-/// is rejected when the jwt is missing or bad. Any other password is
-/// [`Self::UserPass`].
+/// password parses as that kind. A real nkey in a `creds` password is
+/// rejected unless it is a user seed paired with its user jwt. Any other
+/// password is [`Self::UserPass`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatsPlain {
   /// CONNECT `user` and `pass`. `pass` may be empty.
@@ -883,11 +883,6 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
   Ok(NatsPlain::UserPass { user, pass })
 }
 
-/// The seed half of a creds password, or the whole password when it has no colon.
-///
-/// `Some` when that text is a real nkey. A user seed fails as [`NatsUriError::UserJwt`]
-/// so the raw seed is not sent upstream as a password. A non-user seed fails as
-/// [`NatsUriError::UserSeed`].
 fn creds_parsed_seed(password: &str) -> Option<NatsUriError> {
   let seed = match password.split_once(':') {
     Some((seed, _)) => seed,
